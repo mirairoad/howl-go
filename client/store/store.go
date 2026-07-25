@@ -118,7 +118,7 @@ func (s *Store) Restore(sn Snapshot) {
 	s.nextID = sn.NextID
 	s.items = append(s.items[:0], sn.Items...)
 	s.mu.Unlock()
-	Notify()
+	s.publish()
 }
 
 func (s *Store) List() []Todo { return s.Snapshot().Items }
@@ -135,7 +135,7 @@ func (s *Store) Add(text string) Todo {
 	t := Todo{ID: s.nextID, Text: text}
 	s.items = append(s.items, t)
 	s.mu.Unlock()
-	Notify()
+	s.publish()
 	return t
 }
 
@@ -148,7 +148,7 @@ func (s *Store) Del(id int) {
 		}
 	}
 	s.mu.Unlock()
-	Notify()
+	s.publish()
 }
 
 // Apply runs one op. Server and client call this same method.

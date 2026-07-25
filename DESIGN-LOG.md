@@ -308,7 +308,61 @@ be told about it twice.
 
 ---
 
-## 10. Bugs worth remembering
+## 10. Reactivity: signals, computed, effects, watch
+
+`Subscribe` was coarse — one callback, re-run on any mutation. Replaced with
+fine-grained dependency tracking in `client/signal`:
+
+```go
+Todos     = signal.WithEq([]Todo(nil), sameTodos)          // signal
+TodoCount = signal.DeriveEq(func() int { … })              // computed
+stopEffect = signal.Effect(repaint)                        // auto-tracked
+stopWatch  = signal.Watch(store.TodoCount.Get, func(now, before int) { … })
+```
+
+### Why there is no dependency array
+
+React needs `useEffect(fn, [a, b, c])` because **JavaScript cannot observe
+reads** — React has no way to know what the function looked at, so you declare
+it, and a wrong declaration is the classic stale-closure bug.
+
+Here reads *are* observable: while an effect runs it is installed as the current
+computation, and every `Signal.Get()` registers the edge both ways. So the
+dependency list cannot be wrong, because there isn't one. `WatchAny(cb, srcs…)`
+exists for when you want sources named explicitly, but `Effect` is the
+idiomatic form.
+
+Re-running an effect **detaches all old dependencies first**, so a conditional
+branch that stops reading a signal stops being woken by it — without that, a
+branch leaks a permanent subscription.
+
+`Watch` runs its callback inside `Untrack`, or signals read by the callback
+would silently become dependencies of the watcher.
+
+### Equality is what makes it fine-grained
+
+- `Of[T comparable]` — skips notification when the value is unchanged.
+- `WithEq` — for slices/maps, where `==` does not compile. `Todos` uses it, so
+  re-hydrating identical data wakes nothing.
+- `DeriveEq` — a recompute that yields the same value stops there, so a
+  mutation that leaves a count alone does not repaint things that only read it.
+
+**Measured:** hydrate → `count changed 0 -> 2`; Go click → `2 -> 3`; Go delete
+→ `3 -> 2`. Three away-and-back navigations then one add produced **exactly
+one** log line — leaked effects would have produced four. Those same three
+remounts produced **zero** change logs, because re-hydrating identical data hits
+the equality guard.
+
+### Server safety
+
+Signals are package-level, which would be a data race if server request
+handlers wrote them. They do not: `(*Store).publish` mirrors into the signals
+only when the receiver is the browser's instance. The server's `Store` is a
+different pointer, so concurrent requests never touch shared globals.
+
+---
+
+## 11. Bugs worth remembering
 
 - `(window.requestIdleCallback ?? setTimeout)(fn, 1)` throws — the second arg is
   `IdleRequestOptions`, not a delay, and it must stay bound to `window`. It
@@ -334,7 +388,7 @@ be told about it twice.
 
 ---
 
-## 11. Open questions
+## 12. Open questions
 
 - **TinyGo** — would it bring 1.63 MB gzipped down to the 200–800 KB range, and
   does templ's generated code survive its reflection limits?

@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"howl-go/client/dom"
+	"howl-go/client/signal"
 	"howl-go/client/store"
 	"howl-go/client/ui"
 )
@@ -66,7 +67,7 @@ func Page() templ.Component {
 		var templ_7745c5c3_Var2 string
 		templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d item(s) in server memory", len(store.TodosFrom(ctx))))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `client/pages/todos/index.templ`, Line: 34, Col: 105}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `client/pages/todos/index.templ`, Line: 35, Col: 105}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var2))
 		if templ_7745c5c3_Err != nil {
@@ -88,7 +89,7 @@ func Page() templ.Component {
 // were thrown away, and every visit adds another one.
 // ---------------------------------------------------------------------------
 
-var cancelSub func()
+var stopEffect, stopWatch func()
 
 func Mount() {
 	root := dom.Root()
@@ -107,9 +108,17 @@ func Mount() {
 		root.Query("[data-todo-input]").SetValue("")
 	})
 
-	// Mutations notify subscribers, so no handler needs to know how to repaint.
-	// This is the only place that does.
-	cancelSub = store.Subscribe(repaint)
+	// repaint reads store.Todos inside itself, so the effect discovers that
+	// dependency by running — there is no list of values to declare. This is the
+	// difference from useEffect(fn, [deps]): reads here are observable, so the
+	// dependency list cannot be wrong.
+	stopEffect = signal.Effect(repaint)
+
+	// A watcher on one derived value. Fires only on a transition, with both
+	// values — and not on the initial run.
+	stopWatch = signal.Watch(store.TodoCount.Get, func(now, before int) {
+		dom.Log("[todos] count changed", before, "->", now)
+	})
 
 	// Hydrate from the server, then render from the local store.
 	go func() {
@@ -124,19 +133,23 @@ func Mount() {
 			dom.Warn("[todos] decode failed:", err.Error())
 			return
 		}
-		store.Client().Restore(sn) // Restore notifies, which repaints
-		dom.Log("[todos] hydrated", len(sn.Items), "items — subscribers:", store.Watchers())
+		store.Client().Restore(sn) // publishes to the signal, which repaints
+		dom.Log("[todos] hydrated", len(sn.Items), "items")
 	}()
 
-	dom.Log("[todos] mounted — subscribers:", store.Watchers())
+	dom.Log("[todos] mounted")
 }
 
 func Unmount() {
-	if cancelSub != nil {
-		cancelSub()
-		cancelSub = nil
+	// Every reactive registration made in Mount is released here. An effect that
+	// outlives its DOM keeps firing against nodes that were thrown away.
+	for _, stop := range []func(){stopEffect, stopWatch} {
+		if stop != nil {
+			stop()
+		}
 	}
-	dom.Log("[todos] unmounted — subscribers:", store.Watchers())
+	stopEffect, stopWatch = nil, nil
+	dom.Log("[todos] unmounted")
 }
 
 // mutate applies an op locally for an instant repaint, then tells the server.
@@ -159,7 +172,9 @@ func repaint() {
 	if !root.Query("#todo-list").Valid() {
 		return // page already swapped away
 	}
-	items := store.Client().List()
+	// Read through the signal, not the store: that is what registers this
+	// effect as a dependent.
+	items := store.Todos.Get()
 
 	var sb strings.Builder
 	if err := ui.TodoList(items).Render(context.Background(), &sb); err != nil {
@@ -169,7 +184,7 @@ func repaint() {
 	// Rendered by the same templ component the server uses, inside the browser.
 	root.Query("#todo-list").SetHTML(sb.String())
 	root.Query("[data-todo-count]").SetText(countText(len(items)))
-	root.Query("[data-watchers]").SetText("subscribers: " + itoa(store.Watchers()))
+	root.Query("[data-watchers]").SetText("computed count: " + itoa(store.TodoCount.Get()))
 
 	// Delete buttons are re-created on every repaint, so rebind each time.
 	for _, btn := range root.QueryAll("[data-del]") {

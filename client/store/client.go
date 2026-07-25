@@ -1,88 +1,48 @@
 package store
 
-import "sync"
+import "howl-go/client/signal"
 
-// The browser's store instance.
+// The browser's store, exposed reactively.
 //
 // On the server a Store is per-process and read through the request context —
-// two requests must never see each other's state. In the browser there is
-// exactly one user and one tab, so a package-level instance is the right shape:
-// any Mount, Unmount or click handler can reach it without threading it
-// through a component tree.
-//
-// The server also links this variable; it simply never touches it, because
-// server code always goes through the context.
+// two requests must never see each other's state. In the browser there is one
+// user and one tab, so package-level signals are the right shape: any Mount,
+// Unmount or event handler can read them, and anything derived from them
+// updates itself.
 var client = New()
 
-// Client is the browser-side store. Call it from Mount, Unmount, or any event
-// handler to read or mutate state.
+// Client is the browser-side store. Mutating it publishes to the signals below.
 func Client() *Store { return client }
 
-// ---------------------------------------------------------------------------
-// Subscriptions
-//
-// A mutation has to reach the DOM somehow. Rather than have every caller
-// remember to re-render, a Store notifies its subscribers — which is precisely
-// why Unmount exists: a page that subscribes on mount must unsubscribe when it
-// leaves, or the callback fires against a DOM that is gone.
-// ---------------------------------------------------------------------------
+var (
+	// Todos is the reactive list. Slices are not comparable, so it carries an
+	// explicit equality test — without one, a re-hydrate that changed nothing
+	// would still wake every dependent.
+	Todos = signal.WithEq([]Todo(nil), sameTodos)
 
-type subscriber struct {
-	id int
-	fn func()
-}
+	// TodoCount is derived. DeriveEq means a mutation that leaves the count
+	// alone — editing an item's text, say — does not wake anything that only
+	// reads the count.
+	TodoCount = signal.DeriveEq(func() int { return len(Todos.Get()) })
+)
 
-type subs struct {
-	mu    sync.Mutex
-	next  int
-	items []subscriber
-}
-
-var watchers subs
-
-// Subscribe registers fn to run after every mutation. The returned function
-// cancels it, and calling it twice is safe.
-func Subscribe(fn func()) (cancel func()) {
-	watchers.mu.Lock()
-	watchers.next++
-	id := watchers.next
-	watchers.items = append(watchers.items, subscriber{id: id, fn: fn})
-	watchers.mu.Unlock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			watchers.mu.Lock()
-			defer watchers.mu.Unlock()
-			for i, s := range watchers.items {
-				if s.id == id {
-					watchers.items = append(watchers.items[:i], watchers.items[i+1:]...)
-					return
-				}
-			}
-		})
+func sameTodos(a, b []Todo) bool {
+	if len(a) != len(b) {
+		return false
 	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
-// Notify runs every subscriber. Callbacks are copied out from under the lock so
-// a subscriber may cancel itself, or subscribe again, without deadlocking.
-func Notify() {
-	watchers.mu.Lock()
-	fns := make([]func(), 0, len(watchers.items))
-	for _, s := range watchers.items {
-		fns = append(fns, s.fn)
+// publish mirrors a mutation into the signals. Only the browser's instance does
+// this: the server's Store is a different pointer, so concurrent requests never
+// write these package-level variables.
+func (s *Store) publish() {
+	if s == client {
+		Todos.Set(s.List())
 	}
-	watchers.mu.Unlock()
-
-	for _, fn := range fns {
-		fn()
-	}
-}
-
-// Watchers reports how many subscriptions are live — used by the demo page to
-// make a leaked subscription visible instead of silent.
-func Watchers() int {
-	watchers.mu.Lock()
-	defer watchers.mu.Unlock()
-	return len(watchers.items)
 }
