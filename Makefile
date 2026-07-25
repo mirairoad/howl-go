@@ -1,28 +1,25 @@
-.PHONY: all routes wasm run static clean
+.PHONY: all core toy www clean
 
-all: routes wasm
-	go build -o howl-go .
+APPS := examples/toy_app www
 
-# Crawl client/pages and regenerate the route table.
-routes:
-	go run ./tools/fsroutes
-	go tool templ generate
+all: core toy www
 
-# Compile the templ views to WebAssembly so routes render client-side.
-wasm: routes
-	GOOS=js GOARCH=wasm go build -o client/public/views.wasm ./wasm
-	install -m 644 "$$(go env GOROOT)/lib/wasm/wasm_exec.js" client/public/wasm_exec.js
+core:
+	go build ./core/...
 
-run: all
-	./howl-go
+toy:
+	$(MAKE) -C examples/toy_app
 
-# Simulate an overseas client: every server round-trip costs 240ms.
-slow: all
-	LATENCY=240ms ./howl-go
+www:
+	$(MAKE) -C www
 
-static: all
-	./howl-go -static ./dist
+# Run one or the other; they bind the same port by default.
+run-toy: toy
+	./examples/toy_app/toy_app
+
+run-www: www
+	./www/www
 
 clean:
-	rm -f howl-go client/public/views.wasm client/public/wasm_exec.js
-	rm -rf dist
+	$(MAKE) -C examples/toy_app clean
+	$(MAKE) -C www clean

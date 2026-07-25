@@ -1,0 +1,79 @@
+package metrics
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"github.com/mirairoad/howl-go/core/dom"
+	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
+	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
+)
+
+// Head is merged into the document <head>. It owns this route's title and can
+// carry anything else the page needs — meta, canonical, preload — which is why
+// it beats a title string. Reserved name: it never becomes the page component.
+templ Head() {
+	<title>Metrics-and-more</title>
+	<meta name="description" content="Per-region throughput, filtered and sorted in the browser."/>
+	<link rel="canonical" href="https://example.com/dashboard/metrics"/>
+}
+
+templ Page() {
+	<div class="row">
+		<h2>Metrics</h2>
+		<span class="pill cold">filter/sort · 0 RTT · no framework</span>
+	</div>
+	@ui.Island("table-tools", "{}") {
+		<div class="controls">
+			<input data-filter placeholder="filter rows… (0 RTT per keystroke)" autocomplete="off"/>
+			<button class="tab" data-sort="value">sort: value</button>
+		</div>
+	}
+	<table class="tbl">
+		<tbody data-rows>
+			for _, r := range store.MetricsFrom(ctx).Rows {
+				<tr data-name={ r.Name } data-value={ fmt.Sprint(r.Value) }>
+					<td>{ r.Name }</td>
+					<td class="num">{ ui.Commas(r.Value) }</td>
+				</tr>
+			}
+		</tbody>
+	</table>
+}
+
+// Mount is this page's lifecycle hook — templ itself has none, since a
+// component renders once to a writer and is finished. It runs after the markup
+// is in the DOM, on the cold load and again after every client-side navigation
+// here. Reserved name, like Head.
+//
+// No syscall/js in sight, so this file still compiles for the server, where
+// Mount is dead code that is never called.
+func Mount() {
+	rows := dom.Root().QueryAll("[data-rows] tr")
+	dom.Log("[metrics] mounted — rows in DOM:", len(rows))
+
+	// net/http in wasm IS the browser's fetch(). No htmx, no JS glue, and the
+	// response decodes into ordinary Go structs. It must run in a goroutine:
+	// blocking the JS callback deadlocks the scheduler, because the fetch can
+	// only resolve once control returns to the event loop.
+	go func() {
+		res, err := http.Get("/api/metrics")
+		if err != nil {
+			dom.Warn("[metrics] fetch failed:", err.Error())
+			return
+		}
+		defer res.Body.Close()
+
+		var payload store.Metrics
+		if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+			dom.Warn("[metrics] decode failed:", err.Error())
+			return
+		}
+		total := 0
+		for _, r := range payload.Rows {
+			total += r.Value
+		}
+		dom.Log("[metrics] fetched from Go in the browser —", len(payload.Rows), "regions, total", total)
+	}()
+}

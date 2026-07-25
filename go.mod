@@ -1,4 +1,4 @@
-module howl-go
+module github.com/mirairoad/howl-go
 
 go 1.25.0
 
@@ -14,6 +14,7 @@ require (
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/natefinch/atomic v1.0.1 // indirect
+	github.com/yuin/goldmark v1.8.4 // indirect
 	golang.org/x/mod v0.26.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect

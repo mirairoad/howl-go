@@ -1,0 +1,15 @@
+package dashboard
+
+import (
+	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
+	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
+)
+
+
+templ Page() {
+	<div class="row">
+		<h2>Overview</h2>
+		<span class="pill cold">same component · server, static or wasm</span>
+	</div>
+	@ui.StatCards(store.MetricsFrom(ctx).Cards)
+}

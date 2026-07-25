@@ -1,0 +1,27 @@
+package about
+
+import "github.com/mirairoad/howl-go/examples/toy_app/client/store"
+
+
+templ Page() {
+	<section class="page">
+		<h1>How the routing works</h1>
+		<pre class="code"><code>{ tree }</code></pre>
+		<ul class="bullets">
+			<li><b>Reserved names, not underscores.</b> Go ignores every file starting with <code>_</code>, so <code>_layout.templ</code> would compile to a file the compiler never sees.</li>
+			<li><b>Folders are packages.</b> <code>dashboard/metrics/index.templ</code> is <code>package metrics</code>; the generated table imports it under a collision-proof alias.</li>
+			<li><b>Layouts compose at build time.</b> A page package never imports its parent, so there is no cycle with the generated table.</li>
+			<li><b>Behaviour is in the file name.</b> <code>index.client.templ</code> is also rendered in the browser; <code>article_id.dyn.templ</code> becomes <code>/blog/{ "{article_id}" }</code>. Suffixes, not prefixes — a leading underscore would hide the file from Go entirely.</li>
+		</ul>
+		<p class="hint">Running on { store.MetaFrom(ctx).GoVersion }.</p>
+	</section>
+}
+
+const tree = `client/pages/
+  app.templ                     document shell (not a route)
+  index.templ                   /
+  about/index.templ             /about
+  todos/index.templ             /todos
+  dashboard/layout.templ        wraps /dashboard and below
+  dashboard/index.templ         /dashboard
+  dashboard/metrics/index.templ /dashboard/metrics`

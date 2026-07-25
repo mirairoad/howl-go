@@ -1,0 +1,51 @@
+package pages
+
+import "github.com/mirairoad/howl-go/www/client/pages/docs"
+
+templ Head() {
+	<title>howl-go — one component tree, three runtimes</title>
+	<meta name="description" content="Go and templ rendering on the server, to static files, and inside the browser via WebAssembly."/>
+}
+
+templ Page() {
+	<article class="prose">
+		<h1>One component tree, three runtimes</h1>
+		<p class="lede">
+			A <code>templ.Component</code> is just <code>Render(ctx, io.Writer)</code>.
+			It cannot tell whether the writer is an HTTP response, a file, or a
+			<code>strings.Builder</code> inside WebAssembly — so the same component
+			serves all three, with no branching.
+		</p>
+		<div class="cards">
+			<article class="card">
+				<h3>Server</h3>
+				<p>Real HTML on first paint. Crawlable, works with JavaScript disabled.</p>
+			</article>
+			<article class="card">
+				<h3>Browser</h3>
+				<p>Mark a route <code>.client</code> and wasm renders it locally — zero bytes over the wire.</p>
+			</article>
+			<article class="card">
+				<h3>Disk</h3>
+				<p><code>-static ./dist</code> writes every static route out as a file.</p>
+			</article>
+		</div>
+		<h2>No Node anywhere</h2>
+		<p>
+			One Go module. The route table is generated from the directory tree, the
+			client runtime is ~7 KB, and the only build steps are
+			<code>fsroutes</code> and <code>templ generate</code>.
+		</p>
+		<h2>Start here</h2>
+		<ul class="toc">
+			for _, d := range docs.Index {
+				<li>
+					<a href={ templ.SafeURL("/docs/" + d.Slug) }>{ d.Title }</a>
+					if d.Blurb != "" {
+						<p>{ d.Blurb }</p>
+					}
+				</li>
+			}
+		</ul>
+	</article>
+}

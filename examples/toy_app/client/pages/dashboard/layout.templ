@@ -1,0 +1,22 @@
+package dashboard
+
+import (
+	"github.com/mirairoad/howl-go/core/router"
+	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
+)
+
+// layout.templ wraps /dashboard and everything below it. The tab bar is built
+// from the route table, so adding dashboard/reports/index.templ makes a tab
+// appear with no edit here.
+templ Layout() {
+	<section class="page">
+		<h1>Dashboard <small>routes generated from the filesystem</small></h1>
+		<nav class="tabs">
+			@ui.Tab("/dashboard", "Overview")
+			for _, r := range router.Children(router.Routes(ctx), "/dashboard") {
+				@ui.Tab(r.Pattern, r.Label)
+			}
+		</nav>
+		{ children... }
+	</section>
+}

@@ -1,0 +1,68 @@
+package pages
+
+import (
+	"github.com/mirairoad/howl-go/core/router"
+	"github.com/mirairoad/howl-go/www/client/pages/docs"
+)
+
+// app.templ is the document shell: reserved name, never a route. Rendered only
+// for cold requests — SPA fragments get the page and its layouts, not this.
+templ App(title, head string) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ title }</title>
+			<link rel="stylesheet" href="/static/app.css"/>
+			@templ.JSONScript("howl-wasm-routes", router.NeedsWasm(router.Routes(ctx)))
+			<script src="/static/app.js" type="module"></script>
+			<!--page-head-->
+			@templ.Raw(head)
+			<!--/page-head-->
+		</head>
+		<body>
+			<header class="topbar">
+				<a class="brand" href="/">howl<span>-go</span></a>
+				<nav>
+					for _, r := range router.Nav(router.Routes(ctx)) {
+						if r.Pattern != "/" {
+							@navLink(r.Pattern, r.Label)
+						}
+					}
+				</nav>
+				<a class="ghlink" href="https://github.com/mirairoad/howl-go" data-no-spa>GitHub ↗</a>
+			</header>
+			<div class="shell">
+				<aside class="sidebar">
+					<p class="side-title">Documentation</p>
+					<ol>
+						for _, d := range docs.Index {
+							@navLink("/docs/"+d.Slug, d.Title)
+						}
+					</ol>
+				</aside>
+				<main id="outlet" data-route={ router.Current(ctx) }>
+					{ children... }
+				</main>
+			</div>
+			<footer class="foot"><span id="nav-log">cold load (SSR)</span></footer>
+		</body>
+	</html>
+}
+
+templ navLink(href, label string) {
+	if router.Current(ctx) == href {
+		<a href={ templ.SafeURL(href) } class="active" aria-current="page">{ label }</a>
+	} else {
+		<a href={ templ.SafeURL(href) }>{ label }</a>
+	}
+}
+
+templ NotFound(path string) {
+	<article class="prose">
+		<h1>404</h1>
+		<p>No page at <code>{ path }</code>.</p>
+		<p><a href="/docs">Back to the documentation</a></p>
+	</article>
+}

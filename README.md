@@ -1,195 +1,72 @@
 # howl-go
 
-A spike answering one question: how far can Go + templ go toward an SPA, and
-where does that actually break?
+Go + templ rendering the same components on the server, into static files, and
+inside the browser via WebAssembly. One Go module, no Node, no npm, no client
+framework.
 
-One Go module. No Node, no npm, no client framework. The same components render
-on the server, into static files, and inside the browser via WebAssembly.
+**Full documentation: run `make run-www` and open http://localhost:9001** — the
+docs site is itself built with the framework, from the Markdown in `www/docs/`.
 
 ## Layout
 
 ```
-main.go                    server: mux from the generated table, SSR/fragment switch
-tools/fsroutes/            build-time crawler -> client/pages/fsroutes_gen.go
-client/router/             Route model, layout composition, ctx  (leaf)
-client/dom/                browser API; real for wasm, no-ops elsewhere
-client/store/              domain types + state, zero server deps (leaf)
-client/ui/                 components shared across pages        (leaf)
-client/public/             css, js, generated wasm               (embedded)
-client/pages/              the route tree — see below
-wasm/main.go               browser entrypoint: GOOS=js GOARCH=wasm
+core/                 the framework
+  app/                server runtime: SSR/SPA switch, mux, static export, gzip
+  router/             Route model, layout composition, context
+  signal/             fine-grained reactivity: signal, computed, effect, watch
+  dom/                browser API — real for wasm, no-ops elsewhere
+  runtime/app.js      client runtime: router, prefetch, head merge, hydration
+  cmd/fsroutes/       directory tree -> generated route table
+  cmd/mddocs/         Markdown -> templ pages
+
+examples/toy_app/     kitchen sink: dashboard, blog, local-first todos
+www/                  the documentation site
+  docs/*.md           the documentation source
 ```
 
-### Filesystem routing
-
-```
-client/pages/
-  app.templ                      document shell — reserved, never a route
-  index.templ                    /
-  about/index.templ              /about
-  blog/index.templ               /blog
-  blog/article_id.dyn.templ      /blog/{article_id}
-  todos/index.templ              /todos
-  dashboard/layout.templ         wraps /dashboard and everything below
-  dashboard/index.templ          /dashboard
-  dashboard/metrics/index.templ  /dashboard/metrics
-  dashboard/settings/index.templ /dashboard/settings
-```
-
-`make routes` runs `tools/fsroutes`, which walks the tree and writes
-`client/pages/fsroutes_gen.go`. The mux, the layout chain, the static export and
-the wasm renderer all read that one generated table. Adding a page is adding a
-file.
-
-Every `.templ` is a route except two reserved basenames — `layout.templ` and
-`app.templ`. A route's component is whichever zero-argument `templ Name()` the
-file declares first, so files sharing a directory just name their components
-differently.
-
-**Behaviour is encoded in dot-separated modifiers on the file name:**
-
-| file | route | meaning |
-|---|---|---|
-| `index.templ` | `/dir` | server-rendered |
-| `index.client.templ` | `/dir` | also rendered in the browser by wasm |
-| `article_id.dyn.templ` | `/dir/{article_id}` | path parameter |
-| `article_id.dyn.client.templ` | `/dir/{article_id}` | both, either order |
-
-An unknown modifier is a hard error (`unknown modifier "cleint"`), because a
-silently ignored typo is a route that quietly loses a capability.
-
-Modifiers are **suffixes, not prefixes**, and this is forced: Go ignores every
-file whose name starts with `_`, so `_index.templ` generates `_index_templ.go`
-and the package then reports *"no Go files"*. Brackets fail for a related
-reason — Go rejects `[` and `{` in file names (*invalid input file name*) and
-in import paths (*malformed import path: invalid char*). Dots are legal in
-both, so dots carry the convention.
-
-One directive comment remains, for the one thing neither the file name nor the
-file contents can express:
+`core` knows nothing about either app. An application supplies a route table, a
+document shell and its own static files:
 
 ```go
-//howl:route /custom  // override the derived pattern entirely
+a := app.New(app.Config{
+    Routes:   pages.FsClientRoutes(),   // generated from client/pages/
+    Shell:    pages.App,                // its app.templ
+    NotFound: pages.NotFound,
+    Public:   public,                   // its own css; app.js comes from core
+    Data:     data,                     // context for every render
+})
+log.Fatal(a.Listen(a.Mux()))
 ```
 
-### `func Mount()` — the lifecycle templ does not have
-
-templ has no lifecycle. A component is `Render(ctx, io.Writer)`: it runs once,
-writes a string, and is finished. There is no mount, no effect, no re-render.
-So "do something on first paint" lives outside the component — in Go:
-
-```go
-// in client/pages/dashboard/metrics/index.client.templ, beside Page and Head
-func Mount() {
-    rows := dom.Root().QueryAll("[data-rows] tr")
-    dom.Log("[metrics] mounted — rows in DOM:", len(rows))
-
-    go func() {                          // net/http in wasm IS fetch()
-        res, err := http.Get("/api/metrics")
-        …
-        dom.Log("fetched", len(payload.Rows), "regions")
-    }()
-}
-```
-
-It lives in the page's own `.templ`, next to `Page` and `Head`. That works
-because it touches the DOM through `client/dom` rather than `syscall/js`
-directly — a page's generated Go is compiled for **both** targets, so importing
-`syscall/js` there would break the server build. The platform split lives in
-`client/dom` instead, once: `dom_js.go` is the real implementation, `dom_stub.go`
-is no-ops for every other GOOS. `Mount` is a plain `func()`, so it needs no
-build tag and sits in the same generated table the server uses, where it is
-simply never called.
-
-`Mount` runs after the markup is in the DOM, on the cold load and again after
-every client-side navigation to that route. Verified in the console, both paths:
-
-```
-[metrics] mounted — rows in DOM: 8
-[metrics] fetched from Go in the browser — 8 regions, total 315001
-```
-
-**You do not need htmx or JS `fetch` for this.** Go's wasm `net/http` transport
-is the browser's Fetch API, so `http.Get` works from the page. It must run in a
-goroutine: blocking the JS callback deadlocks the Go scheduler, because the
-fetch can only resolve once control returns to the event loop.
-
-Three levels, pick by need:
-
-| need | mechanism | language |
-|---|---|---|
-| DOM behaviour on an element | `data-island` + `register()` | JS, ~10 lines |
-| page lifecycle, typed data, HTTP | `func Mount()` in the page's `.templ` | Go |
-| server-owned markup on demand | fragment endpoint returning templ | Go |
-
-### `templ Head()`
-
-A page may declare a reserved `Head` component. Its output is merged into the
-document `<head>`, so a route owns its title *and* whatever else it needs:
-
-```templ
-templ Head() {
-	<title>Metrics-and-more</title>
-	<meta name="description" content="Per-region throughput, filtered in the browser."/>
-	<link rel="canonical" href="https://example.com/dashboard/metrics"/>
-}
-```
-
-Rules that fall out of making this work properly:
-
-- **Exactly one `<title>` in the document.** The server pulls the `<title>` out
-  of the head fragment and the shell emits it in one place. Two title elements
-  and the browser silently keeps the first — the page would lose to the shell.
-- **A fragment has no `<head>`.** SPA responses ship the page's head in an inert
-  `<template data-head>`, and `applyHead()` merges it. Without that, every
-  navigation after the first would keep the initial page's title and canonical.
-- **Page tags are removed on leaving.** Server-rendered head tags sit between
-  `<!--page-head-->` markers and are tagged `data-page-head` once at boot, so
-  swapping never touches the shell's own stylesheet and script. Verified:
-  navigating metrics → settings drops the `meta`/`link` rather than stacking them.
-- **The wasm renderer emits the same wire shape**, so one client code path
-  handles both.
-
-`Route.Label` is separate and is nav/tab text only, derived from the file or
-directory name. Header navigation is **derived, not declared** —
-`router.Nav()` returns the top-level static routes, so `/about` gets a link
-while `/dashboard/metrics` (reached through its layout's tabs) and
-`/blog/{article_id}` (no single URL) do not.
-
-Path parameters arrive as `router.Param(ctx, "article_id")`.
-Layouts compose at build time: a page package never imports its parent, so
-there is no cycle with the generated table that imports every page package.
-Domain types live in `client/store` for the same reason — if they sat in
-`pages`, a page importing them would close the loop.
-
-`client/` is what reaches the browser. `pages` and `store` are ordinary Go
-packages compiled into *both* binaries — the server renders them and the wasm
-build renders them, from one source. `client/public` is embedded with
-`//go:embed client/public` and served under the `/static/` URL prefix, which
-stays fixed as a public contract regardless of on-disk layout.
-
-## Running it
+## Running
 
 ```bash
-make run      # http://localhost:9000
-make slow     # same + LATENCY=240ms per request (simulates Sydney -> us-east-1)
-make static   # render routes to ./dist and exit
+make            # build core, both apps
+make run-www    # the documentation site   -> :9001
+make run-toy    # the example app          -> :9000
 ```
 
-`make` regenerates the route table and the wasm renderer first. Plain `go run .` works, but without
-`make wasm` there is no `client/public/views.wasm`, so the client silently falls
-back to server-rendered fragments — a round-trip per navigation, with nothing
-telling you why. Use `make run`.
+Per app: `make -C examples/toy_app slow` adds `LATENCY=240ms` to every request,
+which is roughly Sydney to us-east-1 — the whole point of the wasm renderer.
+`make -C www static` writes every route to `www/dist`.
 
-**Seeing ~240ms on every request from `go run .`?** `LATENCY` is set in your
-environment — `echo $LATENCY`. `make run` does not set it.
+Each app's `Makefile` runs the same three steps: generate the route table,
+`templ generate`, build. `www` adds a Markdown step before them.
 
-After editing a `.templ`: `go tool templ generate`. The CLI is a `tool` directive
-in `go.mod`, so nothing is installed globally, and `client/pages/*_templ.go` is
-committed generated source — CI needs only the Go toolchain.
+## Documentation
 
-Editing `client/public/app.js` needs a rebuild: it is embedded in the binary, so
-a running server keeps serving the old copy until you `make`.
+| | |
+|---|---|
+| [Getting started](www/docs/01-getting-started.md) | the smallest app |
+| [Routing](www/docs/02-routing.md) | filesystem routes, modifiers, layouts |
+| [Rendering](www/docs/03-rendering.md) | SSR, SPA, wasm, static — one component |
+| [Lifecycle](www/docs/04-lifecycle.md) | `Mount` / `Unmount`, fetching from Go |
+| [Reactivity](www/docs/05-reactivity.md) | signals, computed, effects, watch |
+| [Navigation](www/docs/06-navigation.md) | prefetch on intent, scroll, progress |
+| [Constraints](www/docs/07-constraints.md) | what the Go toolchain refuses |
+
+[DESIGN-LOG.md](DESIGN-LOG.md) records how this was arrived at — the React
+detour and why it was deleted, every measurement, and the bugs worth remembering.
 
 ## The core trick
 

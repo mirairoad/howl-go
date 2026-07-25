@@ -1,0 +1,91 @@
+// Package ui holds components shared across page packages. It is a leaf so
+// every page directory can import it; the generated route table imports the
+// page directories, so anything they share must live below them.
+package ui
+
+import (
+	"fmt"
+
+	"github.com/mirairoad/howl-go/core/router"
+	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
+)
+
+// Island marks a subtree for client-side hydration. Children are the
+// server-rendered markup; props is the JSON handed to the client component.
+templ Island(name, props string) {
+	<div data-island={ name } data-props={ props }>
+		{ children... }
+	</div>
+}
+
+// NavLink highlights itself from the active path in context, so no page has to
+// pass its own route down.
+templ NavLink(href, label string) {
+	if router.Under(ctx, href) && href != "/" || router.Current(ctx) == href {
+		<a href={ templ.SafeURL(href) } class="active" aria-current="page">{ label }</a>
+	} else {
+		<a href={ templ.SafeURL(href) }>{ label }</a>
+	}
+}
+
+// Tab is NavLink for the dashboard's inner chrome.
+templ Tab(href, label string) {
+	if router.Current(ctx) == href {
+		<a href={ templ.SafeURL(href) } class="tab active">{ label }</a>
+	} else {
+		<a href={ templ.SafeURL(href) } class="tab">{ label }</a>
+	}
+}
+
+templ StatCards(cards []store.Card) {
+	<div class="grid">
+		for _, c := range cards {
+			<article class="card stat">
+				<h3>{ c.Label }</h3>
+				<b>{ c.Value }</b>
+				<em class={ DeltaClass(c.Delta) }>{ DeltaText(c.Delta) }</em>
+			</article>
+		}
+	</div>
+}
+
+// TodoList is rendered by the server on first paint and by the wasm build after
+// every local mutation. One component, both runtimes.
+templ TodoList(items []store.Todo) {
+	for _, t := range items {
+		@TodoItem(t)
+	}
+}
+
+templ TodoItem(t store.Todo) {
+	<li data-id={ fmt.Sprint(t.ID) }>
+		<span>{ t.Text }</span>
+		<button class="del" data-del={ fmt.Sprint(t.ID) } aria-label="delete">×</button>
+	</li>
+}
+
+func DeltaClass(d float64) string {
+	if d >= 0 {
+		return "up"
+	}
+	return "down"
+}
+
+func DeltaText(d float64) string {
+	if d >= 0 {
+		return fmt.Sprintf("▲ %.1f%%", d)
+	}
+	return fmt.Sprintf("▼ %.1f%%", -d)
+}
+
+func Commas(n int) string {
+	s := fmt.Sprint(n)
+	out := ""
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out += ","
+		}
+		out += string(c)
+	}
+	return out
+}
