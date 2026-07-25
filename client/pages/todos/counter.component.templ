@@ -1,0 +1,33 @@
+package todos
+
+import "howl-go/client/store"
+
+// A *.component.templ is colocated markup, never a route. This one is the
+// mount point for Go-driven behaviour: the server renders it, and the page's
+// Mount wires it up by querying these data- attributes.
+templ Counter(items []store.Todo) {
+	<div class="row" data-counter>
+		<button class="chip" data-add>add from Go</button>
+		<span class="pill cold" data-todo-count>{ countText(len(items)) }</span>
+		<span class="pill warm" data-watchers>subscribers: —</span>
+	</div>
+}
+
+func countText(n int) string {
+	if n == 1 {
+		return "1 item in the store"
+	}
+	return itoa(n) + " items in the store"
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}

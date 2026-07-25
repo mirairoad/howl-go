@@ -1,0 +1,24 @@
+package blog
+
+import "howl-go/client/store"
+
+templ Page() {
+	<section class="page">
+		<h1>Blog</h1>
+		<p class="lede">
+			This listing is <code>blog/index.templ</code>. Each entry links to
+			<code>blog/article_id.dyn.templ</code> — one file serving every article.
+		</p>
+		<ul class="todos">
+			for _, a := range store.Articles() {
+				<li>
+					<span>
+						<a href={ templ.SafeURL("/blog/" + a.ID) }>{ a.Title }</a>
+						<br/>
+						<small class="hint">{ a.Blurb }</small>
+					</span>
+				</li>
+			}
+		</ul>
+	</section>
+}

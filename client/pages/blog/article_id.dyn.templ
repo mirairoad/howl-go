@@ -1,0 +1,30 @@
+package blog
+
+import (
+	"howl-go/client/router"
+	"howl-go/client/store"
+)
+
+// article_id.dyn.templ -> /blog/{article_id}. The ".dyn" suffix marks the
+// segment as a parameter; brackets are impossible because Go rejects "[" in
+// both file names and import paths. The value arrives through the same context
+// every other page reads from.
+//
+templ Article() {
+	{{ a, ok := store.ArticleByID(router.Param(ctx, "article_id")) }}
+	<section class="page">
+		if ok {
+			<p class="hint"><a href="/blog">← Blog</a></p>
+			<h1>{ a.Title }</h1>
+			<p class="lede">{ a.Blurb }</p>
+			<p>{ a.Body }</p>
+			<p class="hint">
+				Matched <code>/blog/{ "{article_id}" }</code> with
+				<code>article_id = { a.ID }</code>.
+			</p>
+		} else {
+			<h1>404</h1>
+			<p class="lede">No article <code>{ router.Param(ctx, "article_id") }</code>.</p>
+		}
+	</section>
+}

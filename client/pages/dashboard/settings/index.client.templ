@@ -1,0 +1,19 @@
+package settings
+
+import (
+	"howl-go/client/store"
+	"howl-go/client/ui"
+)
+
+
+templ Page() {
+	<div class="row">
+		<h2>Settings</h2>
+		<span class="pill cold">pure client state · 0 RTT</span>
+	</div>
+	<p class="hint">Served from <code>{ store.MetaFrom(ctx).Region }</code>. The toggle never contacts the server.</p>
+	@ui.Island("toggle", `{"label":"dark mode"}`) {
+		<label class="toggle"><input type="checkbox" checked data-toggle/> dark mode</label>
+		<p class="hint" data-toggle-out>value: true</p>
+	}
+}
