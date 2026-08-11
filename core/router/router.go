@@ -6,6 +6,7 @@ package router
 
 import (
 	"context"
+	"html"
 	"io"
 	"regexp"
 	"strings"
@@ -47,6 +48,12 @@ var titleTag = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 // title is returned separately because the shell must emit exactly one <title>
 // element: two in a document and the browser keeps the first, which would make
 // a page's own title silently lose to the fallback.
+//
+// The returned title is plain text, not markup: it is unescaped here because it
+// was extracted from rendered HTML, and every consumer escapes for its own
+// context — templ for `<title>{ title }</title>`, html.EscapeString for the
+// fragment, percent-encoding for the X-Title header. Returning it still escaped
+// would double-escape the shell's title, so `A & B` reads as `A &amp;amp; B`.
 func (r Route) HeadParts(ctx context.Context, fallback string) (title, rest string) {
 	if r.Head == nil {
 		return fallback, ""
@@ -55,13 +62,13 @@ func (r Route) HeadParts(ctx context.Context, fallback string) (title, rest stri
 	if err := r.Head().Render(ctx, &sb); err != nil {
 		return fallback, ""
 	}
-	html := sb.String()
+	rendered := sb.String()
 	title = fallback
-	if m := titleTag.FindStringSubmatch(html); m != nil {
-		title = strings.TrimSpace(m[1])
-		html = titleTag.ReplaceAllString(html, "")
+	if m := titleTag.FindStringSubmatch(rendered); m != nil {
+		title = html.UnescapeString(strings.TrimSpace(m[1]))
+		rendered = titleTag.ReplaceAllString(rendered, "")
 	}
-	return title, strings.TrimSpace(html)
+	return title, strings.TrimSpace(rendered)
 }
 
 // Component composes the layout chain around the page. Layouts receive the

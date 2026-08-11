@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log"
@@ -81,14 +82,18 @@ func (a *App) Render(w http.ResponseWriter, r *http.Request, rt router.Route, c 
 	// A fragment has no <head>, so the page's head travels with it in an inert
 	// <template> for the client to merge.
 	if r.Header.Get("X-Partial") == "1" {
-		// Percent-encoded, not raw: fetch() decodes response headers as
-		// ISO-8859-1, so a UTF-8 em dash arrives at the client as "â€”". The
-		// client mirrors this with decodeURIComponent.
+		// The title travels in the body, not the header. A header is bytes, and
+		// fetch() decodes response headers as ISO-8859-1, so a UTF-8 em dash
+		// would surface as "â€”"; the body is decoded as UTF-8 per Content-Type.
+		// This also matches the wasm renderer, which has always emitted <title>
+		// inside the head template — one wire shape, one merge path.
+		//
+		// X-Title stays as a fallback for a client that has the body but wants
+		// the title without parsing it (the prefetch cache). Percent-encoded for
+		// the same ISO-8859-1 reason, and decoded by the client.
 		w.Header().Set("X-Title", url.PathEscape(title))
 		w.Header().Set("Vary", "X-Partial")
-		if head != "" {
-			fmt.Fprintf(w, "<template data-head>%s</template>", head)
-		}
+		fmt.Fprintf(w, "<template data-head><title>%s</title>%s</template>", html.EscapeString(title), head)
 		if err := c.Render(ctx, w); err != nil {
 			log.Printf("render fragment %s: %v", r.URL.Path, err)
 		}

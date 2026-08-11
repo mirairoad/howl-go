@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"html"
 	"strings"
 	"syscall/js"
 
@@ -77,9 +78,8 @@ func render(_ js.Value, args []js.Value) any {
 	var sb strings.Builder
 	// Same wire shape as the server's fragment: the page's head rides along in
 	// an inert <template> so the client merges it the one way.
-	if title, head := rt.HeadParts(ctx, rt.Label); head != "" || title != rt.Label {
-		sb.WriteString("<template data-head><title>" + title + "</title>" + head + "</template>")
-	}
+	title, head := rt.HeadParts(ctx, rt.Label)
+	sb.WriteString("<template data-head><title>" + html.EscapeString(title) + "</title>" + head + "</template>")
 	if err := rt.Component().Render(ctx, &sb); err != nil {
 		return "<p class=\"hint\">render error: " + err.Error() + "</p>"
 	}
