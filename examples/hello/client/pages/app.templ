@@ -1,0 +1,29 @@
+package pages
+
+import "github.com/mirairoad/howl-go/core/router"
+
+templ App(title, head string) {
+	<!doctype html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ title }</title>
+			<link rel="stylesheet" href="/static/app.css"/>
+			@templ.JSONScript("howl-wasm-routes", router.NeedsWasm(router.Routes(ctx)))
+			<script src="/static/app.js" type="module"></script>
+			<!--page-head-->
+			@templ.Raw(head)
+			<!--/page-head-->
+		</head>
+		<body>
+			<header><a href="/">howl-go</a></header>
+			<main id="outlet" data-route={ router.Current(ctx) }>{ children... }</main>
+		</body>
+	</html>
+}
+
+templ NotFound(path string) {
+	<h1>Not found</h1>
+	<p>No page at <code>{ path }</code>.</p>
+}

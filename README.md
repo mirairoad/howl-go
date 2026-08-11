@@ -50,6 +50,37 @@ Per app: `make -C examples/toy_app slow` adds `LATENCY=240ms` to every request,
 which is roughly Sydney to us-east-1 — the whole point of the wasm renderer.
 `make -C www static` writes every route to `www/dist`.
 
+## Use it from another module
+
+howl-go is a normal Go module. Applications import the packages under `core/`;
+the example applications are reference code, not framework dependencies.
+
+```bash
+go mod init example.com/myapp
+go get github.com/mirairoad/howl-go@v0.1.0
+go get -tool github.com/a-h/templ/cmd/templ@v0.3.1020
+```
+
+```go
+import (
+    "github.com/mirairoad/howl-go/core/app"
+    "github.com/mirairoad/howl-go/core/router"
+)
+```
+
+Generate the route table and templ Go source before building:
+
+```bash
+go run github.com/mirairoad/howl-go/core/cmd/fsroutes@v0.1.0 \
+  -module example.com/myapp/client/pages
+go tool templ generate
+go build .
+```
+
+The consuming module needs its own templ tool declaration; tool directives do
+not propagate from dependencies. See [`examples/hello`](examples/hello) for a
+complete standalone module that imports the tagged framework release.
+
 Each app's `Makefile` runs the same three steps: generate the route table,
 `templ generate`, build. `www` adds a Markdown step before them.
 

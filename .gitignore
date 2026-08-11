@@ -3,3 +3,5 @@ client/public/views.wasm
 client/public/wasm_exec.js
 dist/
 howl-go
+examples/hello/hello
+examples/hello/howl-hello

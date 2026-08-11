@@ -5,8 +5,13 @@ howl-go renders the same templ components on the server, into static files, and 
 ## Install
 
 ```bash
-go get github.com/mirairoad/howl-go
+go mod init example.com/myapp
+go get github.com/mirairoad/howl-go@v0.1.0
+go get -tool github.com/a-h/templ/cmd/templ@v0.3.1020
 ```
+
+The tool command matters: a dependency's `tool` directives do not propagate
+into the consuming module.
 
 ## The smallest app
 
@@ -44,7 +49,7 @@ log.Fatal(a.Listen(a.Mux()))
 ## Build
 
 ```bash
-go run github.com/mirairoad/howl-go/core/cmd/fsroutes -module your.module/client/pages
+go run github.com/mirairoad/howl-go/core/cmd/fsroutes@v0.1.0 -module your.module/client/pages
 go tool templ generate
 go build .
 ```

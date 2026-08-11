@@ -523,8 +523,12 @@ addEventListener("popstate", (e) => {
 
 hydrate(document);
 
-// On a cold load the wasm binary is still downloading when the DOM is ready,
-// so the mount hook has to wait for it rather than run inline with hydrate().
-if (typeof loadWasm === "function") {
+// Only routes marked client or declaring a lifecycle hook need Go in the
+// browser. Server-only applications publish an empty WASM_ROUTES list and must
+// not pay for (or 404 on) wasm_exec.js and views.wasm.
+//
+// On a qualifying cold load the binary may still be downloading when the DOM
+// is ready, so the mount hook waits for the shared promise.
+if (wasmCandidate(location.pathname)) {
   loadWasm().then(() => runMount(location.pathname.replace(/(.)\/$/, "$1")));
 }
