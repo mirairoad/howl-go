@@ -149,6 +149,19 @@ function renderLocally(url) {
 // 200-800ms of head start — more than a Sydney->us-east RTT.
 // ---------------------------------------------------------------------------
 
+// Header values are bytes, and fetch() surfaces them decoded as ISO-8859-1 —
+// a raw UTF-8 title would read back as "Overview â€” Guard". The server
+// percent-encodes X-Title; undo that here.
+function headerTitle(res) {
+  const raw = res.headers.get("X-Title");
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw; // malformed escape — a wrong title beats a thrown navigation
+  }
+}
+
 const CACHE = new Map(); // url -> {html, title}
 const INFLIGHT = new Map();
 const FRESH_MS = 15000;
@@ -157,7 +170,7 @@ function prefetch(url) {
   if (CACHE.has(url) || INFLIGHT.has(url)) return INFLIGHT.get(url);
   const p = fetch(url, { headers: { "X-Partial": "1" }, credentials: "same-origin" })
     .then(async (res) => {
-      const entry = { html: await res.text(), title: res.headers.get("X-Title"), at: performance.now() };
+      const entry = { html: await res.text(), title: headerTitle(res), at: performance.now() };
       CACHE.set(url, entry);
       return entry;
     })

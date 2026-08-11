@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,7 +81,10 @@ func (a *App) Render(w http.ResponseWriter, r *http.Request, rt router.Route, c 
 	// A fragment has no <head>, so the page's head travels with it in an inert
 	// <template> for the client to merge.
 	if r.Header.Get("X-Partial") == "1" {
-		w.Header().Set("X-Title", title)
+		// Percent-encoded, not raw: fetch() decodes response headers as
+		// ISO-8859-1, so a UTF-8 em dash arrives at the client as "â€”". The
+		// client mirrors this with decodeURIComponent.
+		w.Header().Set("X-Title", url.PathEscape(title))
 		w.Header().Set("Vary", "X-Partial")
 		if head != "" {
 			fmt.Fprintf(w, "<template data-head>%s</template>", head)
