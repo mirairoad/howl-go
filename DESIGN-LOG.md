@@ -383,12 +383,65 @@ different pointer, so concurrent requests never touch shared globals.
   overview with **200**. A table lookup cannot do that.
 - `//go:embed` bakes `app.js` into the binary — editing it does nothing until
   rebuild.
+- **A header is bytes, and `fetch()` decodes response headers as ISO-8859-1.**
+  The SPA title travelled in `X-Title`, so `Routing — howl-go` reached the
+  client as `Routing â€" howl-go`. Cold loads were fine, which made it read as
+  a formatting quirk rather than an encoding bug. The title now rides in the
+  fragment body, decoded as UTF-8 per `Content-Type`; `X-Title` survives
+  percent-encoded for the prefetch cache. The wasm renderer had emitted
+  `<title>` inside `<template data-head>` all along — the comment in `app.js`
+  claimed both paths shared a wire shape that they did not.
+- **Escaping twice is escaping wrong.** `HeadParts` pulled the title out of
+  *rendered* HTML and returned it still escaped; the shell then rendered it
+  through templ, which escaped it again, so `A & B` displayed as `A &amp;amp;
+  B`. Unescape once at extraction and let each consumer escape for its own
+  context — templ, `html.EscapeString`, percent-encoding.
 - Verifying build isolation with `strings` gave 93 false hits. `go list -deps`
   is the authoritative check.
 
 ---
 
-## 12. Open questions
+## 12. Motion is not the framework's decision
+
+The router called `startViewTransition` on every navigation, purely because the
+API existed. Nobody had chosen that animation: with no `::view-transition` rules
+anywhere in the repo, what shipped was the browser's default cross-fade, applied
+to every app built on the framework, with no way to turn it off short of not
+using the router.
+
+Two things were wrong with it beyond taste. `prefers-reduced-motion` was never
+consulted — the API does not honour that query for you, so a user who had asked
+their OS for less motion got the fade anyway. And the transition animated the
+*root* snapshot, meaning the header and sidebar cross-faded along with the page
+content that had actually changed.
+
+Motion is now declared where the rest of the page's presentation is declared:
+
+```html
+<a href="/x" data-transition-slide-left>
+<html data-transition-fade-up>
+<a href="/y" data-transition-none>
+```
+
+Nearest declaration wins, so a document-wide default stays overridable per link,
+and `-none` exists precisely to opt out of an inherited one. Back and forward
+replay the transition with its direction flipped, because a history stack whose
+animation only moves one way feels broken.
+
+The runtime's whole job is to resolve a *name*. It reaches CSS twice — as a
+view transition `type`, and as `data-howl-transition` on `<html>` for browsers
+that shipped view transitions before types — and the styling lives in an opt-in
+stylesheet that names `#outlet` so the outlet animates alone and persistent
+chrome stays put. Reduced motion is checked before any of it and starts no
+transition at all: neutralising the animation in CSS would still pay for the
+snapshot.
+
+The default is now **off**. A framework that animates unless told not to has
+made a design choice on behalf of every application built on it.
+
+---
+
+## 13. Open questions
 
 - **TinyGo** — would it bring 1.63 MB gzipped down to the 200–800 KB range, and
   does templ's generated code survive its reflection limits?

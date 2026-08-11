@@ -1,6 +1,6 @@
 # Navigation and prefetching
 
-The client runtime (`core/runtime/app.js`, ~7 KB gzipped) intercepts same-origin links, swaps `#outlet`, and calls `pushState`. Any failure degrades to `location.href` — a plain multi-page app.
+The client runtime (`core/runtime/app.js`, ~8 KB gzipped) intercepts same-origin links, swaps `#outlet`, and calls `pushState`. Any failure degrades to `location.href` — a plain multi-page app.
 
 ## Prefetch on intent
 

@@ -12,6 +12,6 @@ var Index = []Entry{
 	{Slug: "rendering", Title: "Rendering", Blurb: "A templ.Component is just Render(ctx, io.Writer). It cannot tell whether the writer is an HTTP response, a file, or a strings.Builder inside WebAssembly. Eve…"},
 	{Slug: "lifecycle", Title: "Lifecycle", Blurb: "templ has no lifecycle and cannot have one: a component renders once to a writer and is finished. There is no mount, no effect, no re-render. So \"do somethin…"},
 	{Slug: "reactivity", Title: "Reactivity", Blurb: "core/signal is fine-grained reactivity in the shape Vue's ref/computed/watch and Preact's signals popularised."},
-	{Slug: "navigation", Title: "Navigation and prefetching", Blurb: "The client runtime (core/runtime/app.js, ~7 KB gzipped) intercepts same-origin links, swaps #outlet, and calls pushState. Any failure degrades to location.hr…"},
+	{Slug: "navigation", Title: "Navigation and prefetching", Blurb: "The client runtime (core/runtime/app.js, ~8 KB gzipped) intercepts same-origin links, swaps #outlet, and calls pushState. Any failure degrades to location.hr…"},
 	{Slug: "constraints", Title: "Toolchain constraints", Blurb: "Several conventions from JavaScript frameworks cannot be ported to Go. These were verified, not assumed, and they explain why howl-go's naming looks the way …"},
 }

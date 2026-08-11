@@ -93,7 +93,7 @@ Each app's `Makefile` runs the same three steps: generate the route table,
 | [Rendering](www/docs/03-rendering.md) | SSR, SPA, wasm, static — one component |
 | [Lifecycle](www/docs/04-lifecycle.md) | `Mount` / `Unmount`, fetching from Go |
 | [Reactivity](www/docs/05-reactivity.md) | signals, computed, effects, watch |
-| [Navigation](www/docs/06-navigation.md) | prefetch on intent, scroll, progress |
+| [Navigation](www/docs/06-navigation.md) | prefetch on intent, transitions, scroll |
 | [Constraints](www/docs/07-constraints.md) | what the Go toolchain refuses |
 
 [DESIGN-LOG.md](DESIGN-LOG.md) records how this was arrived at — the React
@@ -127,11 +127,19 @@ buffer. That is why every mode below coexists with no branching in components:
 | fragment API | `TodoItem(t).Render(ctx, w)` | one `<li>` |
 | **wasm** | `route.Component().Render(ctx, &sb)` | HTML, in the browser |
 
-## Client (`client/public/app.js`, ~15 KB raw / 4.6 KB gzipped)
+## Client (`core/runtime/app.js`, ~23 KB raw / 8.3 KB gzipped)
 
 - **Router** — intercepts same-origin `<a>` clicks, swaps `#outlet.innerHTML`,
-  `pushState`. View Transitions when available; any failure degrades to
-  `location.href`, i.e. a plain MPA.
+  `pushState`. Any failure degrades to `location.href`, i.e. a plain MPA.
+- **Transitions are declared, not assumed.** `data-transition-slide-left` on a
+  link, or on `<html>` for every navigation; `data-transition-none` opts back
+  out. Nearest declaration wins, back/forward plays it reversed, and nothing
+  animates unless asked — an unstyled browser cross-fade on every navigation is
+  a design decision the framework has no business making. `prefers-reduced-
+  motion` overrides all of it: the View Transitions API does not honour that
+  query itself, and suppressing the animation in CSS still pays for the
+  snapshot, so no transition is started at all. Styling lives in the opt-in
+  `/static/transitions.css` (1.6 KB gzipped), tuned through custom properties.
 - **Two separate questions, deliberately.** `spaTarget(a)` decides whether the
   router handles a click; `shouldPrefetch(url)` decides whether to warm it.
   Conflating them is a nasty bug: a link you decline to *prefetch* is still a
