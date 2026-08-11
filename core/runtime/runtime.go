@@ -9,7 +9,7 @@ import (
 	"io/fs"
 )
 
-//go:embed app.js
+//go:embed app.js transitions.css
 var files embed.FS
 
 // Assets is the framework's static files, served under /static/.

@@ -1,0 +1,122 @@
+/* ---------------------------------------------------------------------------
+ * howl-go navigation transitions — opt-in.
+ *
+ *   <link rel="stylesheet" href="/static/transitions.css"/>
+ *
+ * The runtime only names the transition; this file is what makes it visible.
+ * Nothing here applies until a `data-transition-*` attribute asks for it, and
+ * the runtime never sets one on a user who requested reduced motion.
+ *
+ *   data-transition-fade                     opacity only
+ *   data-transition-fade-left|right|up|down  opacity plus a short drift
+ *   data-transition-slide-left|right|up|down the page moves out of the way
+ *   data-transition-none                     opt back out of an inherited default
+ *
+ * Put it on a link for one navigation, or on <html> for all of them.
+ *
+ * Every value below is a custom property, so overriding the feel is a variable
+ * away and does not need this file forked:
+ *
+ *   :root { --howl-duration: 320ms; --howl-slide: 100%; }
+ *
+ * An application that ships its own static/transitions.css replaces this one
+ * outright — the app's static FS is layered over the framework's.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  --howl-duration: 220ms;
+  --howl-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --howl-drift: 24px; /* fade-<dir> travel */
+  --howl-slide: 40%; /* slide-<dir> travel */
+}
+
+/* Animate the outlet, not the document. Naming an element pulls it out of its
+ * ancestors' snapshots, so #outlet animates alone and the surrounding chrome —
+ * header, sidebar, anything persistent — stays put instead of sliding with it.
+ * That is almost always what a nav transition is meant to look like. */
+#outlet {
+  view-transition-name: howl-outlet;
+}
+
+/* The root pair still exists (it is now everything except the outlet). It has
+ * not changed, so its default cross-fade is invisible work — turn it off. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+}
+
+/* Old and new are stacked in the same place during the transition. Without
+ * this the outgoing page is painted over the incoming one for the whole
+ * duration and the movement reads as a flicker. */
+::view-transition-old(howl-outlet),
+::view-transition-new(howl-outlet) {
+  animation-duration: var(--howl-duration);
+  animation-timing-function: var(--howl-ease);
+  animation-fill-mode: both;
+  mix-blend-mode: normal;
+}
+
+@keyframes howl-leave {
+  to {
+    opacity: 0;
+    transform: translate(var(--howl-leave-x, 0), var(--howl-leave-y, 0));
+  }
+}
+
+@keyframes howl-enter {
+  from {
+    opacity: 0;
+    transform: translate(var(--howl-enter-x, 0), var(--howl-enter-y, 0));
+  }
+}
+
+html[data-howl-transition]::view-transition-old(howl-outlet) {
+  animation-name: howl-leave;
+}
+
+html[data-howl-transition]::view-transition-new(howl-outlet) {
+  animation-name: howl-enter;
+}
+
+/* Direction reads as travel: `slide-left` sends the outgoing page off to the
+ * left and brings the incoming one in from the right, the way a forward step
+ * moves on a phone. The runtime flips this for back/forward navigation. */
+html[data-howl-transition$="-left"] {
+  --howl-leave-x: calc(-1 * var(--howl-travel));
+  --howl-enter-x: var(--howl-travel);
+}
+
+html[data-howl-transition$="-right"] {
+  --howl-leave-x: var(--howl-travel);
+  --howl-enter-x: calc(-1 * var(--howl-travel));
+}
+
+html[data-howl-transition$="-up"] {
+  --howl-leave-y: calc(-1 * var(--howl-travel));
+  --howl-enter-y: var(--howl-travel);
+}
+
+html[data-howl-transition$="-down"] {
+  --howl-leave-y: var(--howl-travel);
+  --howl-enter-y: calc(-1 * var(--howl-travel));
+}
+
+/* The only difference between the two styles is how far they move. */
+html[data-howl-transition^="fade"] {
+  --howl-travel: var(--howl-drift);
+}
+
+html[data-howl-transition^="slide"] {
+  --howl-travel: var(--howl-slide);
+}
+
+/* Belt and braces. The runtime already declines to start a transition under a
+ * reduced-motion request, so this only matters if an application drives one
+ * itself — but a stylesheet that animates in that case would be a bug. */
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+}

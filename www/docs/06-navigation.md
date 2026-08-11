@@ -24,6 +24,36 @@ Conflating them is a nasty bug: a link you decline to *prefetch* is still a link
 
 The restore must run *inside* the swap callback. `startViewTransition` defers that callback, so scrolling outside it targets the old DOM and the browser clamps the offset to 0.
 
+## Transitions
+
+Declared in markup, styled in CSS. Nothing animates unless something asks for it.
+
+```html
+<a href="/x" data-transition-slide-left>   <!-- one link            -->
+<html data-transition-fade-up>             <!-- every navigation    -->
+<a href="/y" data-transition-none>         <!-- opt this one out    -->
+```
+
+The style is `fade` or `slide`, the direction is `left`, `right`, `up` or `down`, and the direction may be omitted (`data-transition-fade`). The nearest declaration wins, so a default on `<html>` stays overridable per link. Back and forward play the same transition reversed — `slide-left` out, `slide-right` back.
+
+Two things reach CSS: a view transition `type`, and `data-howl-transition` on `<html>` for browsers that shipped view transitions before types. Both name the same string.
+
+```css
+html[data-howl-transition="slide-left"]::view-transition-old(howl-outlet) { … }
+```
+
+`/static/transitions.css` is an opt-in stylesheet implementing the four directions on `#outlet` alone, so persistent chrome does not slide with the page. It is tuned by variable, not by forking:
+
+```css
+:root { --howl-duration: 320ms; --howl-slide: 100%; }
+```
+
+An app that serves its own `static/transitions.css` replaces the framework's outright.
+
+**`prefers-reduced-motion` wins over every declaration above.** The API does not honour that media query on its own, so the runtime checks it and starts no transition at all — a stylesheet that only neutralises the animation still pays for the snapshot.
+
+Firefox has no View Transitions API; it swaps instantly and everything else behaves identically.
+
 ## Progress
 
 A bar appears only after 500 ms. One that flashes on every fast navigation reads as jank; one that never appears makes a slow link feel broken.

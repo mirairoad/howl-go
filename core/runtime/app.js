@@ -386,7 +386,87 @@ function applyHead(html) {
   }
 }
 
-function applyFragment(url, entry, push, restore) {
+// ---------------------------------------------------------------------------
+// View transitions. Declared in markup, styled in CSS, resolved here.
+//
+//   <a href="/x" data-transition-slide-left>   slide, per link
+//   <html data-transition-fade>                a default for every navigation
+//   <a href="/y" data-transition-none>         opt this one link back out
+//
+// Nearest declaration wins, so a global default on <html> is overridable per
+// link. Nothing animates unless something asks for it: an unstyled browser
+// default fade on every navigation is the framework making a design decision
+// it has no business making.
+//
+// The name reaches CSS two ways — `types` for browsers that have it, and a
+// data attribute on <html> for those that shipped view transitions first.
+// ---------------------------------------------------------------------------
+
+const REDUCE_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
+const OPPOSITE = { left: "right", right: "left", up: "down", down: "up" };
+const PREFIX = "data-transition-";
+
+const VT_TYPES = (() => {
+  try {
+    return CSS.supports("selector(:active-view-transition-type(x))");
+  } catch {
+    return false;
+  }
+})();
+
+// "data-transition-slide-left" -> "slide-left". First one wins; declaring two
+// on one element is a typo, not a composition.
+function transitionOn(el) {
+  for (const { name } of el.attributes) {
+    if (name.startsWith(PREFIX)) return name.slice(PREFIX.length);
+  }
+  return null;
+}
+
+function resolveTransition(el) {
+  // A reduced-motion request is not a preference to weigh against the author's
+  // — it wins outright, which is why this is checked before anything else.
+  if (REDUCE_MOTION.matches) return null;
+  for (let n = el; n; n = n.parentElement) {
+    const t = transitionOn(n);
+    if (t) return t === "none" ? null : t;
+  }
+  return null;
+}
+
+// Back should undo what forward did, or the history stack feels like it only
+// moves one way. Only the direction flips; the style stays put.
+function reverse(name) {
+  if (!name) return name;
+  const cut = name.lastIndexOf("-");
+  const dir = cut < 0 ? "" : name.slice(cut + 1);
+  return OPPOSITE[dir] ? name.slice(0, cut + 1) + OPPOSITE[dir] : name;
+}
+
+function runTransition(name, swap) {
+  if (!name || !document.startViewTransition) return swap();
+
+  const root = document.documentElement;
+  root.dataset.howlTransition = name;
+  // Only clear what we set: a navigation that starts mid-transition has already
+  // overwritten this, and clearing it then would strip the live one's styling.
+  const clear = () => {
+    if (root.dataset.howlTransition === name) delete root.dataset.howlTransition;
+  };
+
+  try {
+    const vt = VT_TYPES
+      ? document.startViewTransition({ update: swap, types: [name] })
+      : document.startViewTransition(swap);
+    vt.updateCallbackDone.catch(swap);
+    vt.finished.then(clear, clear);
+  } catch {
+    clear();
+    swap();
+  }
+}
+
+function applyFragment(url, entry, push, restore, transition) {
   // Record the outgoing page's scroll on ITS history entry before pushing the
   // new one, otherwise the offset lands on the wrong entry.
   if (push) {
@@ -399,6 +479,7 @@ function applyFragment(url, entry, push, restore) {
   // silently leave the old DOM on screen — so always have a fallback path, and
   // guard against running the swap twice.
   let done = false;
+
   const swap = () => {
     if (done) return;
     done = true;
@@ -415,22 +496,12 @@ function applyFragment(url, entry, push, restore) {
     // and the browser clamps the offset to 0.
     window.scrollTo(0, restore ?? 0);
   };
-  if (document.startViewTransition) {
-    try {
-      const vt = document.startViewTransition(swap);
-      vt.updateCallbackDone.catch(swap);
-      vt.finished?.catch(() => {});
-    } catch {
-      swap();
-    }
-  } else {
-    swap();
-  }
+  runTransition(transition, swap);
   if (entry.title && !/<title/i.test(entry.html)) document.title = entry.title;
   markActive();
 }
 
-async function navigate(url, { push = true, restore = 0 } = {}) {
+async function navigate(url, { push = true, restore = 0, transition = null } = {}) {
   const mine = ++seq;
   const t0 = performance.now();
 
@@ -439,7 +510,7 @@ async function navigate(url, { push = true, restore = 0 } = {}) {
   if (wasmCandidate(url)) {
     const local = renderLocally(url);
     if (local) {
-      applyFragment(url, local, push, restore);
+      applyFragment(url, local, push, restore, transition);
       navLog && (navLog.textContent =
         `wasm render → ${url} · ${(performance.now() - t0).toFixed(1)} ms · 0 bytes · server not contacted`);
       return;
@@ -449,7 +520,7 @@ async function navigate(url, { push = true, restore = 0 } = {}) {
   // Cache hit: render now, no network on the critical path.
   const hit = CACHE.get(url);
   if (hit) {
-    applyFragment(url, hit, push, restore);
+    applyFragment(url, hit, push, restore, transition);
     const age = performance.now() - hit.at;
     navLog && (navLog.textContent =
       `precached nav → ${url} · ${(performance.now() - t0).toFixed(1)} ms · 0 RTT` +
@@ -467,7 +538,10 @@ async function navigate(url, { push = true, restore = 0 } = {}) {
       if (busy) {
         navLog && (navLog.textContent = `precached nav → ${url} · 0 RTT · revalidation deferred (input focused)`);
       } else if (fresh && seq === mine && location.pathname + location.search === url && fresh.html !== hit.html) {
-        applyFragment(url, fresh, false, window.scrollY);
+        // Deliberately untransitioned: this is a background refresh of the page
+        // the user is already looking at, and animating it would read as a
+        // navigation they did not perform.
+        applyFragment(url, fresh, false, window.scrollY, null);
         navLog && (navLog.textContent = `precached nav → ${url} · 0 RTT · revalidated in background`);
       }
     }
@@ -480,7 +554,7 @@ async function navigate(url, { push = true, restore = 0 } = {}) {
     const entry = await prefetch(url);
     if (seq !== mine) return; // a newer navigation won the race
     if (!entry) throw new Error("fetch failed");
-    applyFragment(url, entry, push, restore);
+    applyFragment(url, entry, push, restore, transition);
     navLog && (navLog.textContent =
       `cold nav → ${url} · fragment ${entry.html.length} B · ${Math.round(performance.now() - t0)} ms (paid the RTT)`);
   } catch {
@@ -518,19 +592,23 @@ function markActive() {
 document.addEventListener("click", (e) => {
   if (e.defaultPrevented || e.button !== 0) return;
   if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-  const href = spaTarget(e.target.closest("a[href]"));
+  const a = e.target.closest("a[href]");
+  const href = spaTarget(a);
   if (!href) return;
   e.preventDefault();
   if (new URL(href, location.origin).href === location.href) return;
   cancelIntent();
-  navigate(href);
+  navigate(href, { transition: resolveTransition(a) });
 });
 
 addEventListener("popstate", (e) => {
   cancelIntent();
+  // No link to read the intent from, so a back/forward step takes the document
+  // default — played backwards.
   navigate(location.pathname + location.search, {
     push: false,
     restore: e.state?.scroll ?? 0,
+    transition: reverse(resolveTransition(document.documentElement)),
   });
 });
 

@@ -9,11 +9,12 @@ import (
 // for cold requests — SPA fragments get the page and its layouts, not this.
 templ App(title, head string) {
 	<!DOCTYPE html>
-	<html lang="en">
+	<html lang="en" data-transition-fade-up>
 		<head>
 			<meta charset="utf-8"/>
 			<meta name="viewport" content="width=device-width, initial-scale=1"/>
 			<title>{ title }</title>
+			<link rel="stylesheet" href="/static/transitions.css"/>
 			<link rel="stylesheet" href="/static/app.css"/>
 			@templ.JSONScript("howl-wasm-routes", router.NeedsWasm(router.Routes(ctx)))
 			<script src="/static/app.js" type="module"></script>
