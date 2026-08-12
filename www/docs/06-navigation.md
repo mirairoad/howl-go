@@ -12,6 +12,63 @@ The delay is the whole point. Firing on the first `pointerover` means a mouse cr
 
 Nothing is warmed on page load. Prefetching is skipped under `navigator.connection.saveData` or a 2G `effectiveType`, and per link with `data-no-prefetch`.
 
+## Navigating from code
+
+A link is not always the right control. `window.howl` is the client runtime's whole public API:
+
+```js
+howl.navigate("/dashboard");                    // same path a click takes
+howl.navigate("/", { replace: true });          // no new history entry
+howl.navigate("/reports", { transition: "slide-left", scroll: 0 });
+howl.prefetch("/reports/2024");                 // warm it now
+howl.island("counter", (el, props) => { … });   // register an island
+```
+
+From Go — in `Mount`, in a click handler, anywhere the wasm build runs:
+
+```go
+import "github.com/mirairoad/howl-go/core/dom"
+
+dom.Navigate("/dashboard")
+dom.Navigate("/", dom.Replace())                       // after a login
+dom.Navigate("/reports", dom.Transition("slide-left"))
+dom.Prefetch("/reports/2024")
+```
+
+`Replace` is for the navigation that should not be in the back stack: submitting a form, finishing a login, correcting a URL. Before the runtime is up, `dom.Navigate` falls back to a full page load rather than doing nothing.
+
+A programmatic navigation into a `.client` route also starts the wasm download if it has not begun. Hovering a link warms it for a mouse user; a keyboard user, a tap and a `navigate()` call all arrive without a `pointerover` ever firing.
+
+## Islands are the application's, not the framework's
+
+`app.js` ships the registry; your app ships the islands.
+
+```html
+<script src="/static/app.js" type="module"></script>
+<script src="/static/islands.js" type="module"></script>
+```
+
+```js
+// static/islands.js
+howl.island("counter", (el, props) => { … });
+```
+
+A registration that arrives after boot hydrates immediately, so load order does not matter. Islands *outside* `#outlet` keep their state across navigation; islands *inside* re-hydrate. That boundary is the SSR/SPA seam.
+
+## What the shell publishes
+
+The client hardcodes no route prefix and no endpoint. The shell hands it everything, derived from the same generated table the server uses:
+
+```templ
+@templ.JSONScript("howl-client", router.ClientConfig(ctx))
+```
+
+```json
+{ "wasm": ["/dashboard", "/todos"], "data": "/api/metrics" }
+```
+
+`wasm` comes from `router.NeedsWasm` — every `.client` route and every route with a lifecycle hook. `data` is `Config.ClientData`, fetched once before the first local render and handed to the renderer. Leave it empty and no fetch happens at all; a failed fetch logs a warning and the renderer still starts.
+
 ## Two separate questions
 
 `spaTarget(a)` decides whether the router handles a click. `shouldPrefetch(url)` decides whether to warm it.

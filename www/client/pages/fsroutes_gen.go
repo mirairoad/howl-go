@@ -7,25 +7,29 @@ import (
 	"github.com/mirairoad/howl-go/core/router"
 	p0 "github.com/mirairoad/howl-go/www/client/pages/docs"
 	p1 "github.com/mirairoad/howl-go/www/client/pages/docs/constraints"
-	p2 "github.com/mirairoad/howl-go/www/client/pages/docs/getting-started"
-	p3 "github.com/mirairoad/howl-go/www/client/pages/docs/lifecycle"
-	p4 "github.com/mirairoad/howl-go/www/client/pages/docs/navigation"
-	p5 "github.com/mirairoad/howl-go/www/client/pages/docs/reactivity"
-	p6 "github.com/mirairoad/howl-go/www/client/pages/docs/rendering"
-	p7 "github.com/mirairoad/howl-go/www/client/pages/docs/routing"
+	p2 "github.com/mirairoad/howl-go/www/client/pages/docs/dev"
+	p3 "github.com/mirairoad/howl-go/www/client/pages/docs/getting-started"
+	p4 "github.com/mirairoad/howl-go/www/client/pages/docs/http"
+	p5 "github.com/mirairoad/howl-go/www/client/pages/docs/lifecycle"
+	p6 "github.com/mirairoad/howl-go/www/client/pages/docs/navigation"
+	p7 "github.com/mirairoad/howl-go/www/client/pages/docs/reactivity"
+	p8 "github.com/mirairoad/howl-go/www/client/pages/docs/rendering"
+	p9 "github.com/mirairoad/howl-go/www/client/pages/docs/routing"
 )
 
 // FsClientRoutes is the route table derived from the page tree.
 func FsClientRoutes() []router.Route {
 	return []router.Route{
-		{Pattern: "/", Label: "Home", Page: Page, Head: Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs", Label: "Docs", Page: p0.Page, Head: p0.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs/constraints", Label: "Constraints", Page: p1.Page, Head: p1.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs/getting-started", Label: "Getting-started", Page: p2.Page, Head: p2.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs/lifecycle", Label: "Lifecycle", Page: p3.Page, Head: p3.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs/navigation", Label: "Navigation", Page: p4.Page, Head: p4.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs/reactivity", Label: "Reactivity", Page: p5.Page, Head: p5.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs/rendering", Label: "Rendering", Page: p6.Page, Head: p6.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
-		{Pattern: "/docs/routing", Label: "Routing", Page: p7.Page, Head: p7.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
+		{Pattern: "/", Label: "Home", Page: Page, Head: Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs", Label: "Docs", Page: p0.Page, Head: p0.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/constraints", Label: "Constraints", Page: p1.Page, Head: p1.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/dev", Label: "Dev", Page: p2.Page, Head: p2.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/getting-started", Label: "Getting-started", Page: p3.Page, Head: p3.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/http", Label: "Http", Page: p4.Page, Head: p4.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/lifecycle", Label: "Lifecycle", Page: p5.Page, Head: p5.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/navigation", Label: "Navigation", Page: p6.Page, Head: p6.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/reactivity", Label: "Reactivity", Page: p7.Page, Head: p7.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/rendering", Label: "Rendering", Page: p8.Page, Head: p8.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/routing", Label: "Routing", Page: p9.Page, Head: p9.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
 	}
 }

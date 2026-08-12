@@ -22,6 +22,8 @@
 //	index.client.templ          also renderable in the browser by the wasm build
 //	article_id.dyn.templ        /{article_id} — a path parameter
 //	article_id.dyn.client.templ both, in either order
+//	print.bare.templ            skips the layout chain, keeps the document shell
+//	embed.raw.templ             skips both: the page's markup is the whole reply
 //
 // Modifiers are suffixes, not prefixes, because Go ignores every file whose
 // name begins with "_": `_index.templ` compiles to `_index_templ.go`, and the
@@ -72,6 +74,8 @@ type route struct {
 	Mount     bool
 	Unmount   bool
 	Client    bool
+	Bare      bool   // no layout chain
+	Raw       bool   // no layout chain, no document shell
 	File      string // relative to pagesDir, for logging
 	Dir       string // directory relative to pagesDir; "" for root
 	Component string // the templ func declared in that file
@@ -211,6 +215,8 @@ func crawl(pagesDir, modulePath string) ([]route, string, error) {
 			Mount:     mountRe.Match(src),
 			Unmount:   unmountRe.Match(src),
 			Client:    mods["client"],
+			Bare:      mods["bare"] || mods["raw"],
+			Raw:       mods["raw"],
 			File:      relFile,
 			Dir:       rel,
 			Component: comp,
@@ -259,6 +265,9 @@ func crawl(pagesDir, modulePath string) ([]route, string, error) {
 	// layout.templ at each level. Mirrors howl's discoverEngineChain; app.templ
 	// is the document, applied separately, so it is not a stop condition.
 	for i, r := range routes {
+		if r.Bare {
+			continue // .bare / .raw: the chain is dropped at generation time
+		}
 		var chain []string
 		for dir := r.Dir; ; {
 			if _, err := os.Stat(filepath.Join(pagesDir, dir, layoutFile)); err == nil {
@@ -288,7 +297,14 @@ func crawl(pagesDir, modulePath string) ([]route, string, error) {
 // knownMods are the behaviours a file name may declare. Anything else is a
 // typo, and a silently ignored typo here means a route that quietly loses a
 // capability — so it is an error.
-var knownMods = map[string]bool{"dyn": true, "client": true}
+//
+//	dyn     the segment is a {parameter}
+//	client  the wasm build renders this route in the browser
+//	bare    no layout chain (howl's skipInheritedLayouts)
+//	raw     no layout chain and no document shell (howl's skipAppWrapper)
+var knownMods = map[string]bool{"dyn": true, "client": true, "bare": true, "raw": true}
+
+var modList = "dyn, client, bare, raw"
 
 // parseBase splits "article_id.dyn.client" into the stem and its modifiers.
 func parseBase(base string) (string, map[string]bool, error) {
@@ -296,7 +312,7 @@ func parseBase(base string) (string, map[string]bool, error) {
 	mods := map[string]bool{}
 	for _, m := range parts[1:] {
 		if !knownMods[m] {
-			return "", nil, fmt.Errorf("unknown modifier %q (known: dyn, client)", m)
+			return "", nil, fmt.Errorf("unknown modifier %q (known: %s)", m, modList)
 		}
 		mods[m] = true
 	}
@@ -393,9 +409,9 @@ func render(routes []route, rootPkg, pagesDir, routerPkg string) ([]byte, error)
 			}
 			return name
 		}
-		fmt.Fprintf(&b, "\t\t{Pattern: %q, Label: %q, Page: %s, Head: %s, Mount: %s, Unmount: %s, Layouts: %s, Client: %t},\n",
+		fmt.Fprintf(&b, "\t\t{Pattern: %q, Label: %q, Page: %s, Head: %s, Mount: %s, Unmount: %s, Layouts: %s, Client: %t, Raw: %t},\n",
 			r.Pattern, r.Label, page, qual("Head", r.Head), qual("Mount", r.Mount),
-			qual("Unmount", r.Unmount), layouts, r.Client)
+			qual("Unmount", r.Unmount), layouts, r.Client, r.Raw)
 	}
 	fmt.Fprintf(&b, "\t}\n}\n")
 

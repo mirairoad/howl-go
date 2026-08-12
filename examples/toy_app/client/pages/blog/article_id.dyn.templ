@@ -23,6 +23,9 @@ templ Article() {
 				<code>article_id = { a.ID }</code>.
 			</p>
 		} else {
+			// The markup says 404; without this the response would say 200 — a
+			// soft 404, which crawlers and uptime checks both read as a page.
+			{{ router.NotFound(ctx) }}
 			<h1>404</h1>
 			<p class="lede">No article <code>{ router.Param(ctx, "article_id") }</code>.</p>
 		}

@@ -33,8 +33,14 @@ Behaviour is encoded in dot-separated suffixes on the file name:
 | `index.client.templ` | `/dir` | also rendered in the browser by wasm |
 | `article_id.dyn.templ` | `/dir/{article_id}` | path parameter |
 | `article_id.dyn.client.templ` | `/dir/{article_id}` | both, either order |
+| `print.bare.templ` | `/dir/print` | no layouts, keeps the document shell |
+| `embed.raw.templ` | `/dir/embed` | no layouts, no shell — the page is the whole reply |
 
 An unknown modifier is a hard error — a silently ignored typo is a route that quietly loses a capability.
+
+`.bare` drops the layout chain at generation time, so it costs nothing at runtime: the route simply has no layouts. Use it for a print view or a checkout step that should not inherit the app chrome.
+
+`.raw` drops the shell as well. The response is the component's markup and nothing else — no `<html>`, no `<head>`, no title merging. That is what you want for an embed, an email preview, or a fragment fetched by something that is not this framework's client runtime.
 
 Read a parameter with `router.Param(ctx, "article_id")`.
 

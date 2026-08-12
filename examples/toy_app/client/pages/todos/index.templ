@@ -1,15 +1,13 @@
 package todos
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/mirairoad/howl-go/core/dom"
+	apiclient "github.com/mirairoad/howl-go/examples/toy_app/client/api"
 	"github.com/mirairoad/howl-go/core/signal"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
@@ -77,15 +75,9 @@ func Mount() {
 
 	// Hydrate from the server, then render from the local store.
 	go func() {
-		res, err := http.Get("/api/todos")
+		sn, err := apiclient.New("").Todos(context.Background())
 		if err != nil {
 			dom.Warn("[todos] hydrate failed:", err.Error())
-			return
-		}
-		defer res.Body.Close()
-		var sn store.Snapshot
-		if err := json.NewDecoder(res.Body).Decode(&sn); err != nil {
-			dom.Warn("[todos] decode failed:", err.Error())
 			return
 		}
 		store.Client().Restore(sn) // publishes to the signal, which repaints
@@ -112,13 +104,9 @@ func Unmount() {
 func mutate(op store.Op) {
 	store.Client().Apply(op)
 	go func() {
-		body, _ := json.Marshal([]store.Op{op})
-		res, err := http.Post("/api/todos/sync", "application/json", bytes.NewReader(body))
-		if err != nil {
+		if _, err := apiclient.New("").SyncTodos(context.Background(), []store.Op{op}); err != nil {
 			dom.Warn("[todos] sync deferred:", err.Error())
-			return
 		}
-		res.Body.Close()
 	}()
 }
 

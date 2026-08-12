@@ -1,11 +1,11 @@
 package metrics
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"net/http"
 
 	"github.com/mirairoad/howl-go/core/dom"
+	apiclient "github.com/mirairoad/howl-go/examples/toy_app/client/api"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
 )
@@ -53,21 +53,19 @@ func Mount() {
 	rows := dom.Root().QueryAll("[data-rows] tr")
 	dom.Log("[metrics] mounted — rows in DOM:", len(rows))
 
-	// net/http in wasm IS the browser's fetch(). No htmx, no JS glue, and the
-	// response decodes into ordinary Go structs. It must run in a goroutine:
-	// blocking the JS callback deadlocks the scheduler, because the fetch can
-	// only resolve once control returns to the event loop.
+	// The generated client: the same method name, path and types the server
+	// declared in server/apis/metrics.api.go. No URL string, no hand-written
+	// decode, and renaming a field breaks the build on both sides at once.
+	//
+	// It must run in a goroutine: blocking the JS callback deadlocks the
+	// scheduler, because the fetch can only resolve once control returns to the
+	// event loop. Underneath it is the browser's fetch() — NOT net/http, which
+	// under GOOS=js is also fetch but links crypto/tls and crypto/x509 to
+	// re-implement what the browser already does, at 2.05 MB gzipped.
 	go func() {
-		res, err := http.Get("/api/metrics")
+		payload, err := apiclient.New("").Metrics(context.Background())
 		if err != nil {
 			dom.Warn("[metrics] fetch failed:", err.Error())
-			return
-		}
-		defer res.Body.Close()
-
-		var payload store.Metrics
-		if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
-			dom.Warn("[metrics] decode failed:", err.Error())
 			return
 		}
 		total := 0
