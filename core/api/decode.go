@@ -141,6 +141,12 @@ func setField(target reflect.Value, raw string) error {
 	return nil
 }
 
+// reflectType is the instantiated type behind a type parameter.
+func reflectType[T any]() reflect.Type {
+	var zero T
+	return reflect.TypeOf(&zero).Elem()
+}
+
 // typeName is the Go name of a type parameter, for the generated client and the
 // OpenAPI document. Generics erase at run time but reflect still knows the
 // instantiated type.

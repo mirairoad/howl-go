@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -322,5 +323,123 @@ func TestEncodeQueryOmitsZeroValues(t *testing.T) {
 func TestPathEscapesParameters(t *testing.T) {
 	if got := api.Path("/api/events/{id}", "../secrets"); got != "/api/events/..%2Fsecrets" {
 		t.Fatalf("Path = %q — a parameter must not reach into another route", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI
+// ---------------------------------------------------------------------------
+
+func TestDocumentDescribesWhatIsRegistered(t *testing.T) {
+	routes := []api.Route{
+		api.At("GET", "/api/echo", api.Define(api.Spec[Query, api.None, Reply]{
+			Name:    "Echo",
+			Handler: func(r *api.Request[Query, api.None]) (Reply, error) { return Reply{}, nil },
+		})),
+		api.At("POST", "/api/things/{id}", api.Define(api.Spec[api.None, Body, Created]{
+			Name:    "Create Thing",
+			Roles:   []string{"admin"},
+			Handler: func(r *api.Request[api.None, Body]) (Created, error) { return Created{}, nil },
+		})),
+	}
+	doc := api.Document(api.Info{Title: "Test", Version: "1.0.0"}, routes)
+
+	paths := doc["paths"].(map[string]any)
+	if len(paths) != 2 {
+		t.Fatalf("paths = %d, want 2", len(paths))
+	}
+
+	echo := paths["/api/echo"].(map[string]any)["get"].(map[string]any)
+	if echo["operationId"] != "getEcho" {
+		t.Fatalf("operationId = %v", echo["operationId"])
+	}
+	// The query struct's tags are the parameter names — one definition, not a
+	// hand-written list that drifts from the decoder.
+	names := map[string]bool{}
+	for _, p := range echo["parameters"].([]any) {
+		names[p.(map[string]any)["name"].(string)] = true
+	}
+	for _, want := range []string{"service", "limit", "live", "since", "ratio"} {
+		if !names[want] {
+			t.Errorf("query parameter %q missing from the document", want)
+		}
+	}
+	if names["skipped"] {
+		t.Error(`a query:"-" field was documented`)
+	}
+
+	create := paths["/api/things/{id}"].(map[string]any)["post"].(map[string]any)
+	params := create["parameters"].([]any)
+	if len(params) != 1 || params[0].(map[string]any)["in"] != "path" {
+		t.Fatalf("path parameter missing: %v", params)
+	}
+	if create["security"] == nil {
+		t.Error("an endpoint declaring roles has no security requirement")
+	}
+	if create["requestBody"] == nil {
+		t.Error("a POST with a body type has no requestBody")
+	}
+
+	// Named structs become components and are referenced, so a type shared by
+	// several endpoints is described once.
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	if _, ok := schemas["Reply"]; !ok {
+		t.Fatalf("Reply not in components: %v", schemas)
+	}
+	reply := schemas["Reply"].(map[string]any)["properties"].(map[string]any)
+	if _, ok := reply["echo"]; !ok {
+		t.Fatalf("json tag not used for the property name: %v", reply)
+	}
+}
+
+// A None response is a 204 with no content, not an empty object schema.
+func TestNoneResponseIs204(t *testing.T) {
+	doc := api.Document(api.Info{}, []api.Route{
+		api.At("DELETE", "/api/things/{id}", api.Define(api.Spec[api.None, api.None, api.None]{
+			Name:    "Delete Thing",
+			Handler: func(r *api.Request[api.None, api.None]) (api.None, error) { return api.None{}, nil },
+		})),
+	})
+	op := doc["paths"].(map[string]any)["/api/things/{id}"].(map[string]any)["delete"].(map[string]any)
+	responses := op["responses"].(map[string]any)
+	if _, ok := responses["204"]; !ok {
+		t.Fatalf("responses = %v, want a 204", responses)
+	}
+	if _, ok := responses["200"]; ok {
+		t.Error("a None response was documented as 200 with a body")
+	}
+}
+
+func TestSpecAndDocsAreServed(t *testing.T) {
+	mux := http.NewServeMux()
+	routes := []api.Route{api.At("GET", "/api/echo", api.Define(api.Spec[Query, api.None, Reply]{
+		Name: "Echo", Handler: func(r *api.Request[Query, api.None]) (Reply, error) { return Reply{}, nil },
+	}))}
+	mux.HandleFunc("GET /api/openapi.json", api.OpenAPI(api.Info{Title: "Test"}, routes...))
+	mux.HandleFunc("GET /api/docs", api.Docs("/api/openapi.json"))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	res, err := http.Get(server.URL + "/api/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var doc map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
+		t.Fatalf("the spec is not JSON: %v", err)
+	}
+	if doc["openapi"] != "3.1.0" {
+		t.Fatalf("openapi = %v", doc["openapi"])
+	}
+
+	page, err := http.Get(server.URL + "/api/docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer page.Body.Close()
+	body, _ := io.ReadAll(page.Body)
+	if !strings.Contains(string(body), "/api/openapi.json") {
+		t.Fatal("the docs page does not point at the spec it was given")
 	}
 }

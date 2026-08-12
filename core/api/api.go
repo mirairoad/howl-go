@@ -50,6 +50,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/mirairoad/howl-go/core/mw"
@@ -96,9 +97,15 @@ type Route struct {
 	Roles  []string
 	// Types records the query, body and response type names for the generated
 	// client and the OpenAPI document. Filled by Define.
-	Types  TypeNames
+	Types TypeNames
+	// schema carries the instantiated types themselves, which is what makes an
+	// accurate OpenAPI document possible without a schema library: generics
+	// erase at run time, but reflect still knows what Q, B and R were.
+	schema shapes
 	handle func(Config) http.HandlerFunc
 }
+
+type shapes struct{ query, body, response reflect.Type }
 
 // TypeNames are the Go type names behind the erased Route.
 type TypeNames struct{ Query, Body, Response string }
@@ -137,6 +144,7 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 		Path:   s.Path,
 		Roles:  s.Roles,
 		Types:  TypeNames{Query: typeName[Q](), Body: typeName[B](), Response: typeName[R]()},
+		schema: shapes{query: reflectType[Q](), body: reflectType[B](), response: reflectType[R]()},
 		handle: func(cfg Config) http.HandlerFunc {
 			return func(w http.ResponseWriter, r *http.Request) {
 				if err := authorize(cfg, r, s.Roles); err != nil {

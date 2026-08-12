@@ -104,6 +104,17 @@ The other three events are ordinary notifications, since they only make sense wh
 
 `build-error`, not `error`: `EventSource` dispatches its own connection failures under the name `error`, so the overlay would have appeared every time the stream hiccuped.
 
+## The routes widget
+
+A draggable panel listing every route the application serves, read from the
+generated table — click one to navigate, `⌃R` to toggle, position and open state
+remembered across reloads. A `.dyn` route gets a box for its parameter, since it
+has no single URL to link to; `.client` routes are tagged `wasm`.
+
+It is part of the dev client served from `/_howl/alive.js`, so it exists only
+when `howl dev` is in front. A production build has neither the panel nor the
+`/_howl/routes.json` endpoint it reads.
+
 ## Flags
 
 ```

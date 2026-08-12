@@ -506,6 +506,20 @@ func (d *devServer) serve(ctx context.Context, addr string) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_howl/alive", d.alive)
+	// The routes the widget lists. Read from the generated table, so it shows
+	// what the application actually serves rather than a list maintained
+	// alongside it — and served by the dev server, so a production build has
+	// no endpoint for it at all.
+	mux.HandleFunc("GET /_howl/routes.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		body, err := asJSON(readPageRoutes(d.root))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(body)) //nolint:errcheck
+	})
 	mux.HandleFunc("GET /_howl/alive.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")

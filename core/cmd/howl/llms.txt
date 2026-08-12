@@ -544,6 +544,21 @@ Rules:
 - Generate with `fsapis`, register with `api.Register(mux, cfg, apis.FsApiRoutes()...)`.
 - Protobuf, file serving and streaming stay ordinary `http.Handler`s on the mux.
 
+The OpenAPI document is built at startup from the same table, so it cannot
+describe an endpoint the binary does not serve:
+
+```go
+routes := apis.FsApiRoutes()
+api.Register(mux, cfg, routes...)
+mux.HandleFunc("GET /api/openapi.json", api.OpenAPI(api.Info{Title: "Guard"}, routes...))
+mux.HandleFunc("GET /api/docs", api.Docs("/api/openapi.json"))
+```
+
+Query tags become parameters, `{placeholders}` become path parameters, named
+structs become components, `Roles` becomes a security requirement. `Validate()`
+is deliberately NOT expressed — it is arbitrary Go, and a `maximum: 100` the
+handler does not enforce would be worse than silence.
+
 `fsapis -client` also emits a typed client over the same types, which compiles for wasm:
 
 ```go
@@ -556,6 +571,11 @@ events, err := api.New("").Events(ctx, telemetry.Filter{Signal: "logs", Limit: 5
 go run github.com/mirairoad/howl-go/core/cmd/howl check          # conventions, enforced
 go run github.com/mirairoad/howl-go/core/cmd/howl check -json    # structured diagnostics
 ```
+
+`howl dev` also serves a **routes widget** — draggable, persisted, `⌃R` to toggle
+— listing every route from the generated table, one click to navigate, with a
+box for the parameter on a `.dyn` route. It lives in the dev client, so a
+production build has neither the panel nor the `/_howl/routes.json` it reads.
 
 `check` reports what this file describes: a page importing `core/app`, `templ Mount()`, a
 shell missing `#outlet` / `data-route` / the page-head markers / the client config, an
