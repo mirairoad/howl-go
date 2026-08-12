@@ -108,7 +108,9 @@ The other three events are ordinary notifications, since they only make sense wh
 
 A draggable panel listing every route the application serves, read from the
 generated table — click one to navigate, `⌃R` to toggle, position and open state
-remembered across reloads. A `.dyn` route gets a box for its parameter, since it
+remembered across reloads. The collapsed pill is draggable too, with its own
+remembered position; four pixels of movement is the line between moving it and
+pressing it, so a wobble during a click still opens the panel. A `.dyn` route gets a box for its parameter, since it
 has no single URL to link to; `.client` routes are tagged `wasm`.
 
 It is part of the dev client served from `/_howl/alive.js`, so it exists only

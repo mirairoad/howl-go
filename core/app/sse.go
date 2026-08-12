@@ -54,10 +54,14 @@ func (s *Stream) Send(event, data string) error {
 	}
 	var b strings.Builder
 	if event != "" {
-		b.WriteString("event: " + event + "\n")
+		b.WriteString("event: ")
+		b.WriteString(event)
+		b.WriteString("\n")
 	}
 	for _, line := range strings.Split(data, "\n") {
-		b.WriteString("data: " + line + "\n")
+		b.WriteString("data: ")
+		b.WriteString(line)
+		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 	if _, err := s.w.Write([]byte(b.String())); err != nil {

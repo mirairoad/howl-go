@@ -138,7 +138,8 @@ func operationID(rt Route) string {
 	if rt.Name != "" {
 		var b strings.Builder
 		for _, f := range strings.FieldsFunc(rt.Name, func(r rune) bool { return r == ' ' || r == '-' || r == '_' }) {
-			b.WriteString(strings.ToUpper(f[:1]) + f[1:])
+			b.WriteString(strings.ToUpper(f[:1]))
+			b.WriteString(f[1:])
 		}
 		return strings.ToLower(rt.Method) + b.String()
 	}

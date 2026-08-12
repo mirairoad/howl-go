@@ -216,10 +216,12 @@ func goName(s string, exported bool) string {
 	var b strings.Builder
 	for i, f := range fields {
 		if i == 0 && !exported {
-			b.WriteString(strings.ToLower(f[:1]) + f[1:])
+			b.WriteString(strings.ToLower(f[:1]))
+			b.WriteString(f[1:])
 			continue
 		}
-		b.WriteString(strings.ToUpper(f[:1]) + f[1:])
+		b.WriteString(strings.ToUpper(f[:1]))
+		b.WriteString(f[1:])
 	}
 	name := b.String()
 	if name == "" {

@@ -127,35 +127,65 @@ function show(open) {
   localStorage.setItem(OPEN, open ? "1" : "0");
 }
 
-// Dragging by the title bar, with the position remembered. A panel that lands
-// on top of the thing you are working on, every reload, gets closed and never
-// reopened.
-(function draggable() {
-  const saved = JSON.parse(localStorage.getItem(POSITION) || "null");
-  if (saved) Object.assign(panel.style, { left: saved.x + "px", top: saved.y + "px", right: "auto", bottom: "auto" });
+// Dragging, with the position remembered — for the panel by its title bar, and
+// for the collapsed pill by itself. A widget that lands on top of the thing you
+// are working on, every reload, gets closed once and never reopened.
+//
+// The pill is a button, so a drag must not also fire its click. Four pixels of
+// movement is the line between "moved it" and "pressed it" — below that a
+// pointer that wobbles during a click would leave the panel shut.
+function draggable(el, handle, key) {
+  const saved = JSON.parse(localStorage.getItem(key) || "null");
+  if (saved) place(el, saved.x, saved.y);
 
-  let start = null;
-  bar.addEventListener("pointerdown", (e) => {
+  let from = null;
+  let moved = false;
+
+  handle.addEventListener("pointerdown", (e) => {
     if (e.target.id === "howl-routes-close") return;
-    const box = panel.getBoundingClientRect();
-    start = { dx: e.clientX - box.left, dy: e.clientY - box.top };
-    bar.setPointerCapture(e.pointerId);
-    bar.style.cursor = "grabbing";
+    const box = el.getBoundingClientRect();
+    from = { dx: e.clientX - box.left, dy: e.clientY - box.top, x: e.clientX, y: e.clientY };
+    moved = false;
+    handle.setPointerCapture(e.pointerId);
+    handle.style.cursor = "grabbing";
   });
-  bar.addEventListener("pointermove", (e) => {
-    if (!start) return;
-    const x = Math.max(0, Math.min(innerWidth - panel.offsetWidth, e.clientX - start.dx));
-    const y = Math.max(0, Math.min(innerHeight - 40, e.clientY - start.dy));
-    Object.assign(panel.style, { left: x + "px", top: y + "px", right: "auto", bottom: "auto" });
+
+  handle.addEventListener("pointermove", (e) => {
+    if (!from) return;
+    if (Math.abs(e.clientX - from.x) > 4 || Math.abs(e.clientY - from.y) > 4) moved = true;
+    if (moved) place(el, e.clientX - from.dx, e.clientY - from.dy);
   });
-  bar.addEventListener("pointerup", () => {
-    if (!start) return;
-    start = null;
-    bar.style.cursor = "grab";
-    const box = panel.getBoundingClientRect();
-    localStorage.setItem(POSITION, JSON.stringify({ x: box.left, y: box.top }));
+
+  handle.addEventListener("pointerup", () => {
+    if (!from) return;
+    from = null;
+    handle.style.cursor = "grab";
+    if (!moved) return;
+    const box = el.getBoundingClientRect();
+    localStorage.setItem(key, JSON.stringify({ x: box.left, y: box.top }));
   });
-})();
+
+  // A drag that ends over the pill would otherwise open the panel it just moved.
+  handle.addEventListener("click", (e) => {
+    if (moved) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      moved = false;
+    }
+  }, true);
+}
+
+// Clamped so a window resize, or a drag that overshoots, cannot leave the
+// widget somewhere you have to clear localStorage to get it back from.
+function place(el, x, y) {
+  const w = el.offsetWidth || 160;
+  Object.assign(el.style, {
+    left: Math.max(0, Math.min(innerWidth - w, x)) + "px",
+    top: Math.max(0, Math.min(innerHeight - 40, y)) + "px",
+    right: "auto",
+    bottom: "auto",
+  });
+}
 
 function row(route) {
   const here = location.pathname;
@@ -217,6 +247,10 @@ fetch("/_howl/routes.json")
     paint();
   })
   .catch(() => {});
+
+draggable(panel, bar, POSITION);
+draggable(badge, badge, POSITION + ".pill");
+badge.style.cursor = "grab";
 
 badge.addEventListener("click", () => show(true));
 bar.addEventListener("click", (e) => { if (e.target.id === "howl-routes-close") show(false); });
