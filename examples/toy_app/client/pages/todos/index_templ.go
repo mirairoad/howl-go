@@ -9,16 +9,14 @@ import "github.com/a-h/templ"
 import templruntime "github.com/a-h/templ/runtime"
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/mirairoad/howl-go/core/dom"
 	"github.com/mirairoad/howl-go/core/signal"
+	apiclient "github.com/mirairoad/howl-go/examples/toy_app/client/api"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
 )
@@ -67,7 +65,7 @@ func Page() templ.Component {
 		var templ_7745c5c3_Var2 string
 		templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d item(s) in server memory", len(store.TodosFrom(ctx))))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `client/pages/todos/index.templ`, Line: 35, Col: 105}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `client/pages/todos/index.templ`, Line: 33, Col: 105}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var2))
 		if templ_7745c5c3_Err != nil {
@@ -122,15 +120,9 @@ func Mount() {
 
 	// Hydrate from the server, then render from the local store.
 	go func() {
-		res, err := http.Get("/api/todos")
+		sn, err := apiclient.New("").Todos(context.Background())
 		if err != nil {
 			dom.Warn("[todos] hydrate failed:", err.Error())
-			return
-		}
-		defer res.Body.Close()
-		var sn store.Snapshot
-		if err := json.NewDecoder(res.Body).Decode(&sn); err != nil {
-			dom.Warn("[todos] decode failed:", err.Error())
 			return
 		}
 		store.Client().Restore(sn) // publishes to the signal, which repaints
@@ -157,13 +149,9 @@ func Unmount() {
 func mutate(op store.Op) {
 	store.Client().Apply(op)
 	go func() {
-		body, _ := json.Marshal([]store.Op{op})
-		res, err := http.Post("/api/todos/sync", "application/json", bytes.NewReader(body))
-		if err != nil {
+		if _, err := apiclient.New("").SyncTodos(context.Background(), []store.Op{op}); err != nil {
 			dom.Warn("[todos] sync deferred:", err.Error())
-			return
 		}
-		res.Body.Close()
 	}()
 }
 

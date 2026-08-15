@@ -3,50 +3,39 @@ package main
 import (
 	"context"
 	"embed"
-	"encoding/json"
 	"flag"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"strconv"
 	"time"
 
+	"github.com/mirairoad/howl-go/core/api"
 	"github.com/mirairoad/howl-go/core/app"
+	"github.com/mirairoad/howl-go/core/console"
+	"github.com/mirairoad/howl-go/core/mw"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/pages"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
+	"github.com/mirairoad/howl-go/examples/toy_app/server/apis"
+	apistore "github.com/mirairoad/howl-go/examples/toy_app/server/apis/store"
 )
 
 //go:generate go run github.com/mirairoad/howl-go/core/cmd/fsroutes -module github.com/mirairoad/howl-go/examples/toy_app/client/pages
+//go:generate go run github.com/mirairoad/howl-go/core/cmd/fsapis -dir server/apis -module github.com/mirairoad/howl-go/examples/toy_app/server/apis -client client/api/api_gen.go -client-pkg apiclient
 
 //go:embed client/public
 var publicFS embed.FS
 
 var db = store.New()
 
-func demoMetrics() store.Metrics {
-	return store.Metrics{
-		Cards: []store.Card{
-			{Label: "Active sessions", Value: "12,847", Delta: 4.2},
-			{Label: "p95 latency", Value: "184 ms", Delta: -11.5},
-			{Label: "Error rate", Value: "0.31%", Delta: -2.0},
-			{Label: "Throughput", Value: "9.2k/s", Delta: 8.7},
-		},
-		Rows: []store.Row{
-			{Name: "sydney", Value: 48210}, {Name: "singapore", Value: 39104},
-			{Name: "frankfurt", Value: 28755}, {Name: "us-east-1", Value: 91233},
-			{Name: "us-west-2", Value: 40188}, {Name: "sao-paulo", Value: 12044},
-			{Name: "tokyo", Value: 33590}, {Name: "mumbai", Value: 21877},
-		},
-	}
-}
-
 // data is the application's contribution to every render's context. Pages take
 // no arguments — the generated table needs one uniform signature — so this is
 // how they receive everything.
 func data(ctx context.Context, path string) context.Context {
-	ctx = store.WithMetrics(ctx, demoMetrics())
+	ctx = store.WithMetrics(ctx, apistore.Metrics())
 	ctx = store.WithTodos(ctx, db.List())
 	return store.WithMeta(ctx, store.Meta{
 		RenderedAt: time.Now().Format("15:04:05.000"),
@@ -57,7 +46,16 @@ func data(ctx context.Context, path string) context.Context {
 
 func main() {
 	static := flag.String("static", "", "render routes to this directory and exit")
+	debug := flag.Bool("debug", false, "log at debug level")
 	flag.Parse()
+
+	// Tinted columns in a terminal, JSON into a pipe. Everything that logs
+	// through slog — this app, core/app, core/mw — comes out the same way.
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	console.Setup(console.Options{Level: level})
 
 	db.Add("render the same component three ways")
 	db.Add("keep island state across navigation")
@@ -73,6 +71,17 @@ func main() {
 		NotFound: pages.NotFound,
 		Public:   public,
 		Data:     data,
+		// The browser fetches this once before its first local render and
+		// hands it to the wasm renderer. Omit it and no fetch happens.
+		ClientData: "/api/metrics",
+		// Outermost first. Ordinary net/http decorators — nothing here knows
+		// about templ, routes or this application.
+		Use: []mw.Middleware{
+			mw.RequestID,
+			mw.LogWith(mw.LogOptions{Callers: true, Skip: mw.SkipNoise}),
+			mw.Recover(nil),
+			mw.Compress{}.Handler,
+		},
 	})
 
 	if *static != "" {
@@ -84,32 +93,11 @@ func main() {
 
 	mux := a.Mux()
 
-	// Data endpoints. Once the wasm renderer is up these are the only things
-	// that cross the wire.
-	mux.HandleFunc("GET /api/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(demoMetrics())
-	})
-
-	mux.HandleFunc("GET /api/todos", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(db.Snapshot())
-	})
-
-	// The client has ALREADY applied these ops and re-rendered; this is
-	// bookkeeping, not the critical path.
-	mux.HandleFunc("POST /api/todos/sync", func(w http.ResponseWriter, r *http.Request) {
-		var ops []store.Op
-		if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
-			http.Error(w, "bad ops", http.StatusBadRequest)
-			return
-		}
-		for _, op := range ops {
-			db.Apply(op)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(db.Snapshot())
-	})
+	// The JSON API now lives in server/apis, one file per endpoint, generated
+	// into apis_gen.go and into the typed client the pages call. Registering it
+	// is two lines and there is no URL string in this file any more.
+	apistore.Use(db)
+	api.Register(mux, api.Config{}, apis.FsApiRoutes()...)
 
 	// Fragment API: the body is a rendered <li>, not JSON — the no-wasm path.
 	mux.HandleFunc("POST /api/todos", func(w http.ResponseWriter, r *http.Request) {

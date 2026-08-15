@@ -2,56 +2,18 @@
 // Island registry — the "SPA" half. Each island is a plain function that gets
 // the already-server-rendered element plus its props. No virtual DOM, no
 // hydration diff: the server owns the markup, the client owns the behaviour.
+//
+// The framework ships the registry, never the islands: an application declares
+// its own with howl.island(name, setup) from its own script. A registration
+// that arrives after boot hydrates immediately, so load order does not matter.
 // ---------------------------------------------------------------------------
 
 const islands = Object.create(null);
-const register = (name, setup) => (islands[name] = setup);
 
-register("counter", (el, props) => {
-  let n = props.start ?? 0;
-  const btn = el.querySelector("[data-count]");
-  const label = props.label ?? "count";
-  const paint = () => (btn.textContent = `${label}: ${n}`);
-  btn.addEventListener("click", () => {
-    n++;
-    paint();
-  });
-  paint();
-});
-
-
-// Client-side filter + sort. 25 lines of vanilla, zero round-trips per
-// keystroke.
-register("table-tools", (el) => {
-  const body = el.parentElement.querySelector("[data-rows]");
-  const input = el.querySelector("[data-filter]");
-  const sortBtn = el.querySelector("[data-sort]");
-  const rows = () => [...body.querySelectorAll("tr")];
-
-  input.addEventListener("input", () => {
-    const q = input.value.toLowerCase();
-    for (const tr of rows()) tr.hidden = !tr.dataset.name.includes(q);
-  });
-
-  sortBtn.addEventListener("click", () => {
-    const by = sortBtn.dataset.sort === "value" ? "name" : "value";
-    sortBtn.dataset.sort = by;
-    sortBtn.textContent = `sort: ${by}`;
-    rows()
-      .sort((a, b) =>
-        by === "name"
-          ? a.dataset.name.localeCompare(b.dataset.name)
-          : +b.dataset.value - +a.dataset.value,
-      )
-      .forEach((tr) => body.appendChild(tr));
-  });
-});
-
-register("toggle", (el) => {
-  const box = el.querySelector("[data-toggle]");
-  const out = el.querySelector("[data-toggle-out]");
-  box.addEventListener("change", () => (out.textContent = `value: ${box.checked}`));
-});
+function register(name, setup) {
+  islands[name] = setup;
+  if (document.readyState !== "loading") hydrate(document);
+}
 
 // Hydrate every island inside `root` exactly once.
 function hydrate(root) {
@@ -80,15 +42,46 @@ let seq = 0;
 // nothing is fetched, not even a fragment. Only data ever crosses the network.
 // ---------------------------------------------------------------------------
 
-// Patterns that need the wasm binary, published by the shell from the same
-// generated route table the server uses. No hardcoded prefix.
-const WASM_ROUTES = (() => {
-  try {
-    return JSON.parse(document.getElementById("howl-wasm-routes")?.textContent || "[]") || [];
-  } catch {
-    return [];
+// Everything the client needs to know about the Go half, published by the
+// shell from the same generated route table the server uses:
+//
+//   { "wasm": ["/dashboard", "/todos"], "data": "/api/metrics" }
+//
+// No hardcoded prefix, and no hardcoded endpoint either — an app whose client
+// routes need no data simply omits "data" and the fetch never happens.
+const CONFIG = (() => {
+  const read = (id) => {
+    try {
+      return JSON.parse(document.getElementById(id)?.textContent || "null");
+    } catch {
+      return null;
+    }
+  };
+  const c = read("howl-client");
+  // The wasm URLs are content-hashed and published by the shell, so they can be
+  // cached for a year: a new build is a new URL, and the browser never spends a
+  // conditional request asking whether a 6 MB binary changed.
+  if (c) {
+    return {
+      wasm: c.wasm || [],
+      data: c.data || null,
+      live: c.live || null,
+      binary: c.binary || "/static/views.wasm",
+      exec: c.exec || "/static/wasm_exec.js",
+    };
   }
+  return { wasm: read("howl-wasm-routes") || [], data: null, live: null,
+           binary: "/static/views.wasm", exec: "/static/wasm_exec.js" }; // pre-0.2 shells
 })();
+
+// The dev client — the /_howl/alive stream, CSS swapping, the build-error
+// overlay — is served by `howl dev`, not embedded here. A production build
+// ships one dead `if` instead of a kilobyte of code it will never run.
+if (CONFIG.live) {
+  import(CONFIG.live + ".js").catch((e) => console.warn("howl: dev client unavailable:", e));
+}
+
+const WASM_ROUTES = CONFIG.wasm;
 
 // Mirrors router.Route.Match: segment count plus {param} wildcards.
 function patternMatches(pattern, path) {
@@ -98,7 +91,8 @@ function patternMatches(pattern, path) {
   return a.every((seg, i) => (seg.startsWith("{") && seg.endsWith("}")) || seg === b[i]);
 }
 let wasmPromise = null;
-let appData = null; // JSON, fetched once
+let appData = null; // JSON string handed to the renderer; "{}" when unused
+let wasmReady = false;
 
 function loadWasm() {
   if (wasmPromise) return wasmPromise;
@@ -106,20 +100,31 @@ function loadWasm() {
     const t0 = performance.now();
     await new Promise((ok, fail) => {
       const s = document.createElement("script");
-      s.src = "/static/wasm_exec.js";
+      s.src = CONFIG.exec;
       s.onload = ok;
       s.onerror = fail;
       document.head.appendChild(s);
     });
     const go = new Go();
     const { instance } = await WebAssembly.instantiateStreaming(
-      fetch("/static/views.wasm"),
+      fetch(CONFIG.binary),
       go.importObject,
     );
     go.run(instance); // never resolves (Go main blocks on select{}) — do not await
     if (typeof howlRender !== "function") throw new Error("howlRender missing");
-    const data = await fetch("/api/metrics").then((r) => r.json());
-    appData = JSON.stringify(data);
+    // Data is optional. A site whose client routes render from their own
+    // markup (the docs site) publishes no endpoint, and a failed fetch must
+    // not take the renderer down with it — a page that needs data can decide
+    // for itself what an empty payload means.
+    appData = "{}";
+    if (CONFIG.data) {
+      try {
+        appData = JSON.stringify(await fetch(CONFIG.data).then((r) => r.json()));
+      } catch (e) {
+        console.warn("howl: client data unavailable:", CONFIG.data, e);
+      }
+    }
+    wasmReady = true;
     return performance.now() - t0;
   })().catch((e) => {
     wasmPromise = null; // fall back to server fragments
@@ -133,7 +138,7 @@ function loadWasm() {
 const wasmCandidate = (u) => WASM_ROUTES.some((p) => patternMatches(p, u));
 
 function renderLocally(url) {
-  if (!appData || typeof howlRender !== "function") return null;
+  if (!wasmReady || typeof howlRender !== "function") return null;
   const route = url.length > 1 && url.endsWith("/") ? url.slice(0, -1) : url;
   const html = howlRender(route, appData);
   if (!html) return null; // unknown route — let the server answer (it 404s)
@@ -186,7 +191,9 @@ function prefetch(url) {
 
 // (a) Should the client router handle this click?
 const spaTarget = (a) => {
-  if (!a || a.target || a.hasAttribute("download") || a.dataset.noSpa) return null;
+  // Boolean data attributes normally have an empty value (`data-no-spa=""`).
+  // Check presence: dataset.noSpa is then an empty, falsey string.
+  if (!a || a.target || a.hasAttribute("download") || a.hasAttribute("data-no-spa")) return null;
   const u = new URL(a.href, location.origin);
   if (u.origin !== location.origin || u.pathname.startsWith("/static/")) return null;
   return u.pathname + u.search;
@@ -197,7 +204,7 @@ const shouldPrefetch = (url) => {
   if (!url || url === location.pathname + location.search) return false;
   // Once wasm can render this prefix locally, fetching its HTML is pure waste.
   // Before that it is a useful bridge, so allow it while wasm is still loading.
-  if (appData && wasmCandidate(new URL(url, location.origin).pathname)) return false;
+  if (wasmReady && wasmCandidate(new URL(url, location.origin).pathname)) return false;
   return true;
 };
 
@@ -466,12 +473,17 @@ function runTransition(name, swap) {
   }
 }
 
-function applyFragment(url, entry, push, restore, transition) {
+function applyFragment(url, entry, push, restore, transition, replace) {
   // Record the outgoing page's scroll on ITS history entry before pushing the
-  // new one, otherwise the offset lands on the wrong entry.
+  // new one, otherwise the offset lands on the wrong entry. A replace throws
+  // the outgoing entry away, so there is nothing to remember.
   if (push) {
-    rememberScroll();
-    history.pushState({ url }, "", url);
+    if (replace) {
+      history.replaceState({ url }, "", url);
+    } else {
+      rememberScroll();
+      history.pushState({ url }, "", url);
+    }
   }
 
   // View transitions are a nicety; the swap is the contract. A transition that
@@ -501,7 +513,7 @@ function applyFragment(url, entry, push, restore, transition) {
   markActive();
 }
 
-async function navigate(url, { push = true, restore = 0, transition = null } = {}) {
+async function navigate(url, { push = true, restore = 0, transition = null, replace = false } = {}) {
   const mine = ++seq;
   const t0 = performance.now();
 
@@ -510,17 +522,22 @@ async function navigate(url, { push = true, restore = 0, transition = null } = {
   if (wasmCandidate(url)) {
     const local = renderLocally(url);
     if (local) {
-      applyFragment(url, local, push, restore, transition);
+      applyFragment(url, local, push, restore, transition, replace);
       navLog && (navLog.textContent =
         `wasm render → ${url} · ${(performance.now() - t0).toFixed(1)} ms · 0 bytes · server not contacted`);
       return;
     }
+    // Not loaded yet: serve this navigation from the server and start the
+    // download so the next one is local. Hovering a link warms it too, but a
+    // keyboard user, a programmatic howl.navigate() and a touch tap all arrive
+    // here without a pointerover ever having fired.
+    loadWasm();
   }
 
   // Cache hit: render now, no network on the critical path.
   const hit = CACHE.get(url);
   if (hit) {
-    applyFragment(url, hit, push, restore, transition);
+    applyFragment(url, hit, push, restore, transition, replace);
     const age = performance.now() - hit.at;
     navLog && (navLog.textContent =
       `precached nav → ${url} · ${(performance.now() - t0).toFixed(1)} ms · 0 RTT` +
@@ -554,7 +571,7 @@ async function navigate(url, { push = true, restore = 0, transition = null } = {
     const entry = await prefetch(url);
     if (seq !== mine) return; // a newer navigation won the race
     if (!entry) throw new Error("fetch failed");
-    applyFragment(url, entry, push, restore, transition);
+    applyFragment(url, entry, push, restore, transition, replace);
     navLog && (navLog.textContent =
       `cold nav → ${url} · fragment ${entry.html.length} B · ${Math.round(performance.now() - t0)} ms (paid the RTT)`);
   } catch {
@@ -570,7 +587,18 @@ async function navigate(url, { push = true, restore = 0, transition = null } = {
 // Any same-origin link in the document, not just the header — a sidebar or a
 // breadcrumb lives outside #outlet, so nothing re-renders it on navigation and
 // its active state would otherwise stay frozen on the first page visited.
-// Whether `.active` means anything visually is the stylesheet's business.
+//
+// Two things are set, because two different stylesheets want different things:
+// the `.active` class for plain CSS, and `aria-current="page"` for utility CSS
+// that targets it (Tailwind's `aria-[current=page]:` variant) — and which is
+// also what a screen reader announces. The server should render the same
+// attribute on a cold load so the first paint agrees with every paint after it.
+//
+// A link is current when the path matches OR when the page sits underneath it,
+// so a sidebar entry for /logs stays lit on /logs/42. That mirrors
+// router.Under(ctx, prefix), which is what the server uses — the two halves
+// disagreeing about which link is current is a bug you only see mid-navigation.
+// "/" is excluded from the prefix rule, or it would be current everywhere.
 function markActive() {
   const here = location.pathname;
   for (const a of document.querySelectorAll("a[href]")) {
@@ -582,7 +610,7 @@ function markActive() {
     } catch {
       continue;
     }
-    const on = path === here;
+    const on = path === here || (path !== "/" && here.startsWith(path.replace(/\/$/, "") + "/"));
     a.classList.toggle("active", on);
     if (on) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
@@ -612,7 +640,37 @@ addEventListener("popstate", (e) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Public API. Everything an application — or Go running in wasm, through
+// core/dom — is allowed to call. Anything above this line is internal.
+//
+//   howl.navigate("/dashboard", { replace: true })
+//   howl.prefetch("/reports/2024")
+//   howl.island("counter", (el, props) => { … })
+// ---------------------------------------------------------------------------
+
+globalThis.howl = {
+  navigate(url, opts = {}) {
+    return navigate(String(url), {
+      transition: opts.transition || null,
+      replace: Boolean(opts.replace),
+      restore: typeof opts.scroll === "number" ? opts.scroll : 0,
+    });
+  },
+  prefetch(url) {
+    prefetch(String(url));
+  },
+  island: register,
+  hydrate,
+  config: CONFIG,
+};
+
 hydrate(document);
+
+// Also at boot, not only after a navigation: a shell that renders its own
+// active state and one that leaves it to the client should look identical on
+// the first paint.
+markActive();
 
 // Only routes marked client or declaring a lifecycle hook need Go in the
 // browser. Server-only applications publish an empty WASM_ROUTES list and must
@@ -621,5 +679,8 @@ hydrate(document);
 // On a qualifying cold load the binary may still be downloading when the DOM
 // is ready, so the mount hook waits for the shared promise.
 if (wasmCandidate(location.pathname)) {
-  loadWasm().then(() => runMount(location.pathname.replace(/(.)\/$/, "$1")));
+  // Compiling Go's WASM runtime is substantial work. Let the cold SSR page
+  // paint and remain responsive first; pointer intent still starts it sooner
+  // when the user heads toward a client route.
+  idle(() => loadWasm().then(() => runMount(location.pathname.replace(/(.)\/$/, "$1"))));
 }

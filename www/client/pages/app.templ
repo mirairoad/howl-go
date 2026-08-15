@@ -14,10 +14,10 @@ templ App(title, head string) {
 			<meta charset="utf-8"/>
 			<meta name="viewport" content="width=device-width, initial-scale=1"/>
 			<title>{ title }</title>
-			<link rel="stylesheet" href="/static/transitions.css"/>
-			<link rel="stylesheet" href="/static/app.css"/>
-			@templ.JSONScript("howl-wasm-routes", router.NeedsWasm(router.Routes(ctx)))
-			<script src="/static/app.js" type="module"></script>
+			<link rel="stylesheet" href={ router.Asset(ctx, "transitions.css") }/>
+			<link rel="stylesheet" href={ router.Asset(ctx, "app.css") }/>
+			@templ.JSONScript("howl-client", router.ClientConfig(ctx))
+			<script src={ router.Asset(ctx, "app.js") } type="module"></script>
 			<!--page-head-->
 			@templ.Raw(head)
 			<!--/page-head-->

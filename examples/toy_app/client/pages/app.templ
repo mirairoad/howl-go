@@ -17,11 +17,14 @@ templ App(title, head string) {
 			     present, otherwise the route label is used. Two title elements
 			     and the browser keeps the first, so the page would lose. -->
 			<title>{ title }</title>
-			<link rel="stylesheet" href="/static/app.css"/>
-			<!-- Which routes need the wasm binary, straight from the generated
-			     table — so the client never hardcodes a path prefix. -->
-			@templ.JSONScript("howl-wasm-routes", router.NeedsWasm(router.Routes(ctx)))
-			<script src="/static/app.js" type="module"></script>
+			<link rel="stylesheet" href={ router.Asset(ctx, "app.css") }/>
+			<!-- What the client needs to know about the Go half: which routes
+			     the wasm binary renders, and where its data comes from. Both
+			     derived from the same generated table the server uses, so the
+			     client hardcodes neither a path prefix nor an endpoint. -->
+			@templ.JSONScript("howl-client", router.ClientConfig(ctx))
+			<script src={ router.Asset(ctx, "app.js") } type="module"></script>
+			<script src={ router.Asset(ctx, "islands.js") } type="module"></script>
 			<!--page-head-->
 			@templ.Raw(head)
 			<!--/page-head-->

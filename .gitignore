@@ -5,3 +5,6 @@ dist/
 howl-go
 examples/hello/hello
 examples/hello/howl-hello
+
+# `howl dev` builds the running binary here
+.howl/

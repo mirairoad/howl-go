@@ -14,4 +14,6 @@ var Index = []Entry{
 	{Slug: "reactivity", Title: "Reactivity", Blurb: "core/signal is fine-grained reactivity in the shape Vue's ref/computed/watch and Preact's signals popularised."},
 	{Slug: "navigation", Title: "Navigation and prefetching", Blurb: "The client runtime (core/runtime/app.js, ~8 KB gzipped) intercepts same-origin links, swaps #outlet, and calls pushState. Any failure degrades to location.hr…"},
 	{Slug: "constraints", Title: "Toolchain constraints", Blurb: "Several conventions from JavaScript frameworks cannot be ported to Go. These were verified, not assumed, and they explain why howl-go's naming looks the way …"},
+	{Slug: "http", Title: "The HTTP layer", Blurb: "Everything between the socket and a component: middleware, static files, status codes, errors, sub-applications, request state."},
+	{Slug: "dev", Title: "The dev server", Blurb: "go run github.com/mirairoad/howl-go/core/cmd/howl dev"},
 }

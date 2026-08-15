@@ -441,7 +441,277 @@ made a design choice on behalf of every application built on it.
 
 ---
 
-## 13. Open questions
+## 13. The HTTP layer
+
+Everything above is rendering. This is the part between the socket and a
+component, and the question was how much of howl's TypeScript surface to port.
+
+### Middleware is `func(http.Handler) http.Handler`, and nothing else
+
+howl (TS) has `ctx.cookies`, `ctx.query`, `ctx.json`, `ctx.state`, `ctx.headers`
+— a wrapper object, because Fresh's context lacked them. Go's standard library
+already has all five. Porting the wrapper would mean a second, worse API for
+`r.Cookie` and `json.NewEncoder`, and would cut the framework off from every
+middleware ever written for `net/http`.
+
+So: `type Middleware func(http.Handler) http.Handler`, applied outermost-first,
+wrapping the whole mux — pages, static files and application handlers alike.
+`core/mw` ships `RequestID`, `Logger`, `Recover`, `Compress`, `CORS`, `CSRF`,
+`CSP` and `Coalesce`, and none of them import anything of ours.
+
+The one thing worth porting from `ctx.state` was the *typing*, and generics do
+it in twenty lines — the key is the type itself:
+
+```go
+ctx = state.With(ctx, User{ID: "u_1"})
+u := state.Get[User](ctx)
+```
+
+### Buffering the render, and the end of the soft 404
+
+`/blog/nope` used to render a 404 body with HTTP 200 (§11). Fixing it requires a
+component to change the status *while it renders*, which is impossible while the
+response streams — the status line has already gone.
+
+So the page renders into a pooled buffer, the shell into a second one, and only
+then is anything written. Three things fall out of that:
+
+| | |
+|---|---|
+| `router.NotFound(ctx)` inside a `templ` block | the response carries 404 |
+| a component that fails halfway | error page, not a truncated document |
+| the whole document in hand | `Content-Length` |
+
+`{{ router.NotFound(ctx) }}` is a plain Go statement in the middle of markup —
+the same `{{ }}` templ already uses for assignments. It lives in `router`, not
+`app`, for the usual cycle reason: the generated table sits inside the page
+tree, so anything a page imports must stay a leaf. A page importing the server
+runtime to set a status would drag `net/http` into the wasm build.
+
+### Static: compress once, not per request
+
+`GzipStatic` wrapped `http.FileServer` and gzipped **on every request**. At
+5.6 MB of wasm that is a core per download — and with no ETag, nothing ever
+answered 304. Replaced by a handler that reads each file once, keeps the raw and
+gzipped bytes with a content ETag, and hands them to `http.ServeContent`, which
+does conditional requests and ranges for free.
+
+The gzipped copy carries its own ETag (`"abc…-gz"`). Two representations under
+one validator is how a cache ends up serving compressed bytes to a client that
+asked for plain.
+
+### The pooled gzip writer that compressed nothing
+
+`sync.Pool{New: func() any { return &gzip.Writer{} }}` looks obviously right and
+is silently wrong: a zero-value `gzip.Writer` has level 0 — `NoCompression` —
+and `Reset` keeps whatever level the writer was built with. Every response went
+out in a valid gzip frame, decoded correctly by the browser, **larger than the
+input**, with `Content-Encoding: gzip` on it.
+
+Measured on the docs site: a 5007 B page became 5035 B "compressed". After the
+fix, 1955 B. The test asserts the *ratio* now, not just that it round-trips — a
+test that only decodes the body passes happily either way.
+
+### Coalescing, and the four things it must refuse
+
+Single-flighting identical concurrent requests is easy. The interesting part is
+what must **not** be shared:
+
+- non-GET;
+- requests carrying `Cookie` or `Authorization` — that response is one user's;
+- responses that set a cookie: replaying one `Set-Cookie` to every waiter hands
+  them all the same session, or the same CSRF token, which quietly disables the
+  protection for all of them;
+- a panicking handler's half-written buffer — waiters re-run instead.
+
+The key includes `X-Partial`, because a fragment and a document share a URL.
+
+### `GET /` cannot be the catch-all once anything is mounted
+
+`Mount("/admin", h)` registers a method-less pattern, and Go 1.22's ServeMux
+**panics at registration** when a method-specific catch-all (`GET /`) meets a
+method-less pattern that is more specific in path. The 404 fallback became `/`,
+which also means a POST to a nonexistent path gets the application's 404 page
+instead of a bare 405.
+
+### The islands the framework had no business shipping
+
+`app.js` contained `counter`, `table-tools` and `toggle` — three toy-app demos,
+embedded in the framework and served to every application. The registry stays in
+core; the islands moved to the app's own `static/islands.js` and register through
+`howl.island(name, setup)`. A late registration re-scans the DOM, so script order
+does not matter.
+
+That turned `window.howl` into the deliberate public surface — `navigate`,
+`prefetch`, `island`, `config` — which `core/dom` calls into, so `dom.Navigate`
+in Go takes exactly the path a link click takes.
+
+### The client config, and the fetch that was never going to succeed
+
+`app.js` fetched `/api/metrics` before enabling the wasm renderer. That path is
+the *toy app's*. On the docs site the fetch 404'd, `r.json()` threw, and the
+renderer was disabled — the failure mode being "wasm silently never loads",
+which is indistinguishable from never having built it.
+
+The shell publishes `router.ClientConfig(ctx)` instead:
+
+```json
+{ "wasm": ["/dashboard", "/todos"], "data": "/api/metrics" }
+```
+
+No `data` means no fetch; a failed fetch warns and the renderer starts anyway.
+
+### Warming wasm on intent misses everyone who does not hover
+
+`loadWasm()` fired on `pointerover` over a link, or on a cold load of a wasm
+route. A keyboard user, a touch tap and `howl.navigate()` all reach a client
+route without any `pointerover`, so the binary never downloaded and every
+navigation stayed server-rendered — the feature quietly absent rather than
+broken. `navigate()` now starts the download when it lands on a wasm route
+without one.
+
+Measured after the fix: the first `navigate("/dashboard")` is server-rendered;
+the next reports `wasm render → /dashboard/metrics · 0 bytes · server not
+contacted`.
+
+### The colourful logger, without a console to patch
+
+howl (TS) prints `[09:25:03.412] [1234]` in a per-method colour by replacing
+`globalThis.console`. The Go equivalent is not a console patch — it is a
+`log/slog` handler, because slog is *already* the seam every library logs
+through. Install one and it covers application code, framework code and
+dependency code at once, none of which import `core/console`.
+
+The decision worth recording is when to colour: **whether stdout is a character
+device**, i.e. whether a human is reading it right now.
+
+| stdout | output |
+|---|---|
+| terminal | tinted, aligned columns |
+| pipe, file, systemd, Docker | JSON, one object per line |
+
+TS's version prints "plain" in production, which is neither pretty nor
+parseable. Splitting on the TTY gives both, with nothing to configure.
+`NO_COLOR` wins outright; `FORCE_COLOR` covers the CI viewer that renders
+escapes without being a terminal. Detection is `os.File.Stat` and
+`os.ModeCharDevice` — a dependency on x/term would buy nothing but a
+dependency.
+
+Five attribute names (`method`, `path`, `status`, `bytes`, `took`) render
+positionally and in a fixed order, so a request line reads as a request line
+regardless of the order the caller passed them — there is a test for exactly
+that, because "same record, two different lines" is the kind of thing that
+looks fine until you grep.
+
+### Logging who hit the API, and not logging who did not
+
+The startup line moved from `fmt.Printf` to the logger, so it obeys whatever
+the process decided about format. A server that is up and a server that is up
+*on the port you meant* look identical otherwise.
+
+For requests, the interesting question is not "log the client" — it is "log the
+clients that are not us". Every navigation and every fetch from our own pages
+would otherwise stamp our own IP on every line and bury the one caller worth
+seeing. `Callers: true` adds `ip`/`ua` only when the request did not come from a
+page on this host, decided by `Sec-Fetch-Site`, then `Origin`, then `Referer` —
+and `cross-site` is believed over a `Referer` that claims otherwise, since the
+browser sets the first and script cannot.
+
+`Skip: mw.SkipNoise` drops `/static/`, `/healthz` and `/favicon.ico`: the
+majority of requests and the least informative line in any log.
+
+### The dev loop, and refusing to call it HMR
+
+`go run .` plus four commands by hand was the loop. `howl dev` is the loop now:
+watch, regenerate, templ, build, restart, reload. **~540 ms** for a templ edit,
+**~390 ms** for a Go edit, measured on the toy app.
+
+Go cannot hot-swap a linked binary. howl (TS) hot-reloads a `.vue` file in
+~50 ms because Deno compiles it per request; there is no equivalent here and
+pretending otherwise would be a lie the first time someone timed it. What can be
+removed is the manual part and the reload keystroke — so that is what was.
+
+Three decisions worth keeping:
+
+**A proxy in front of the restarting app.** The browser talks to the dev server,
+never to the child, which is started on a private port. The address bar never
+stops answering, a request landing mid-rebuild *waits* for the new binary
+instead of failing, and — the reason it works at all — the live-reload
+connection survives the restart it is reporting. Doing this without a proxy
+means the SSE stream dies with the process and the client has to guess when to
+come back.
+
+**A failed build keeps the last good binary serving.** The child is not killed;
+the compiler error goes to the browser as an overlay instead. Reloading onto a
+broken build replaces a working page with a blank one, which is strictly worse
+than a stale page with the error printed over it.
+
+**The application has no dev-mode code.** The dev server passes `HOWL_ADDR`,
+`HOWL_PUBLIC_DIR` and `HOWL_DEV`, and `app.New` reads them. `HOWL_PUBLIC_DIR` is
+the one that earns its place: static files are `//go:embed`ed, so without it a
+one-character CSS change would need a full rebuild. With it, CSS is served from
+disk and a stylesheet edit skips Go entirely — the client swaps the `<link>`
+rather than reloading, which keeps scroll position, focus and open dropdowns.
+
+Polling, not fsnotify. Walking a few hundred files costs well under a
+millisecond and keeps the module at one dependency; it also sidesteps the fact
+that most editors save by writing a temp file and renaming it over the original,
+which arrives as delete-then-create rather than write. Generated files are
+excluded from the watch, or generating the route table triggers a rebuild that
+generates the route table.
+
+The dev client is served by the dev server and imported dynamically, so a
+production build ships one dead `if` instead of a kilobyte of code it will never
+run — and the `error` event had to be renamed `build-error`, because
+`EventSource` dispatches its own connection failures under that name and the
+overlay would have appeared every time the stream hiccuped.
+
+**The reload signal is a revision, not an event.** The first version broadcast a
+`reload` event, which is wrong for the same reason polling for state beats
+listening for edges: an event fired while the browser was not connected is gone.
+A tab that slept through a rebuild, or one left open across a restart of the dev
+server itself, sat there stale.
+
+howl (TS) had already solved this on its `/_howl/alive` socket, so howl-go now
+uses the same name and the same shape: a monotonic revision, sent on connect
+*and* on every change. The client remembers the first number and reloads on
+anything higher, which makes a missed rebuild self-correcting — `EventSource`
+reconnects by itself, gets greeted with the current revision, and reloads if it
+moved. The clock seeds it so a restarted dev server always outranks the one it
+replaced; the +1 covers two rebuilds inside one millisecond.
+
+Measured: page open on /about, dev server killed, file edited, dev server
+restarted → the page reloaded itself on reconnect with no interaction.
+
+### The docs site stopped building a wasm binary nobody loaded
+
+`www`'s Makefile built `views.wasm` (5.5 MB) and installed `wasm_exec.js` on
+every change. Not one route there is `.client`, so `router.NeedsWasm` published
+an empty list, the client was told there was nothing to load, and the binary was
+never fetched by anything. Dead weight on every build.
+
+The fix was to delete the target, not to opt the site in. A public documentation
+site is precisely the case §3's payload argument rules out: 1.63 MB gzipped to
+save a round-trip that prefetch-on-intent already reduces to 0.3 ms. The AOT
+renderer is demonstrated by `examples/toy_app`, which is behind no such
+constraint — measured there as `wasm render → /dashboard/metrics · 0 bytes ·
+server not contacted`.
+
+`www/wasm/main.go` stays, with a `wasm-check` target that compiles it to
+`/dev/null` and is not part of `all`. Deleting the build step without that
+would leave a file nothing compiles, which rots silently under a `js && wasm`
+build tag — invisible to `go build ./...` and to every test.
+
+### `.bare` and `.raw`
+
+howl's `skipInheritedLayouts` and `skipAppWrapper`, as file-name modifiers.
+`.bare` drops the layout chain — resolved at generation time, so it costs
+nothing at runtime. `.raw` drops the document shell too: the component's markup
+is the entire response, for embeds and print views.
+
+---
+
+## 14. Open questions
 
 - **TinyGo** — would it bring 1.63 MB gzipped down to the 200–800 KB range, and
   does templ's generated code survive its reflection limits?
@@ -452,6 +722,10 @@ made a design choice on behalf of every application built on it.
 - **Per-route data.** The wasm renderer receives one blob (`/api/metrics`) and
   unmarshals it as one type, so a client route needing different data has no
   mechanism.
-- **Soft 404s.** `/blog/nope` renders a 404 body with HTTP 200.
 - **`dom.On` never releases its `js.Func`** — one leaked closure per listener
   per mount.
+- **A typed endpoint layer.** howl's `defineApi` — method, roles, validated
+  query/body/responses, generated OpenAPI — has no equivalent here; API routes
+  are hand-written `mux.HandleFunc`. Go's types are real at runtime, so the
+  reflection half is easier than in TypeScript; the file-crawl half has to be
+  codegen, like `fsroutes`, since there is no dynamic import.

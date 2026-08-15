@@ -1,0 +1,669 @@
+# howl-go — LLM context file
+
+Go + [templ](https://templ.guide) rendering the same components on the server, into static
+files, and inside the browser via WebAssembly. One Go module, no Node, no npm, no client
+framework. Module path: `github.com/mirairoad/howl-go`.
+
+This file describes `main` (post-v0.1.0). Everything under "Added after v0.1.0" at the
+bottom does not exist in the `v0.1.0` tag — check `go.mod` before using it.
+
+**Read this before writing howl-go code.** The conventions are not guessable: Go's
+toolchain forbids the file-naming tricks other frameworks use, so howl-go's answers look
+different on purpose. The reasoning is in `DESIGN-LOG.md`; the reference docs are in
+`www/docs/*.md`.
+
+---
+
+## Mental model
+
+A `templ.Component` is just `Render(ctx, io.Writer)`. It cannot tell what it is being
+written into. That single fact is the whole framework:
+
+| mode | caller | output |
+|---|---|---|
+| cold SSR | `Shell(title, head).Render(WithChildren(ctx, route.Component()), w)` | full HTML document |
+| SPA navigation | `route.Component().Render(ctx, w)` | fragment swapped into `#outlet` |
+| static export | `.Render(ctx, file)` | `.html` on disk |
+| fragment API | `ui.TodoItem(t).Render(ctx, w)` | one `<li>` |
+| wasm | `route.Component().Render(ctx, &sb)` | HTML, in the browser, 0 bytes over the wire |
+
+Components never branch on which one is happening. One switch in `core/app` does, once.
+
+---
+
+## Packages
+
+| Import | What it is |
+|---|---|
+| `core/app` | server runtime: `app.New(Config)`, mux, SSR/SPA switch, static, SSE, export |
+| `core/router` | route model, context accessors, response status, client config. **Leaf — pages import this** |
+| `core/mw` | middleware: `Middleware = func(http.Handler) http.Handler` |
+| `core/console` | `log/slog` handler: tinted columns on a terminal, JSON in a pipe |
+| `core/state` | typed request state on `context.Context`, via generics |
+| `core/signal` | fine-grained reactivity for the browser: signal, computed, effect, watch |
+| `core/dom` | browser API — real under `GOOS=js`, no-ops elsewhere |
+| `core/runtime` | embeds `app.js` + `transitions.css`, served from `/static/` |
+| `core/api` | the typed endpoint layer: `api.Define(api.Spec[Q, B, R]{…})`, plus the generated client's transport |
+| `core/cmd/howl` | `howl dev` (watch/rebuild/reload), `howl check` (conventions, enforced), `howl mcp` (the same as MCP tools) |
+| `core/cmd/fsapis` | endpoint tree → route table + typed client (build time) |
+| `core/cmd/fsroutes` | directory tree → generated route table (build time) |
+| `core/cmd/mddocs` | Markdown → templ pages (build time) |
+
+**Layering rule that matters:** the generated route table lives *inside* the page tree, so
+anything a page imports must be a leaf. Pages may import `core/router`, `core/state`,
+`core/signal`, `core/dom` — **never `core/app`** (it would drag `net/http` into the wasm
+build and risk an import cycle).
+
+---
+
+## Application layout
+
+```
+myapp/
+  main.go                       app.New(...) + API handlers
+  client/
+    pages/
+      app.templ                 document shell — reserved name, never a route
+      layout.templ              wraps its directory and everything below
+      index.templ               /
+      about/index.templ         /about
+      blog/index.templ          /blog
+      blog/article_id.dyn.templ /blog/{article_id}
+      fsroutes_gen.go           GENERATED — never edit
+    public/                     app's own static files, served at /static/
+    ui/                         shared components (leaf package)
+    store/                      domain types + state (leaf, compiles for wasm)
+  wasm/main.go                  optional: the browser renderer (GOOS=js)
+```
+
+`client/pages/` is the only special directory. Everything else is ordinary Go packages.
+
+---
+
+## Bootstrap a new app
+
+```bash
+go mod init example.com/myapp
+go get github.com/mirairoad/howl-go@latest
+go get -tool github.com/a-h/templ/cmd/templ@v0.3.1020   # tool directives do NOT propagate
+```
+
+Build pipeline — **always in this order**:
+
+```bash
+go run github.com/mirairoad/howl-go/core/cmd/fsroutes -module example.com/myapp/client/pages
+go tool templ generate
+go build .
+```
+
+`fsroutes` must run before `templ generate`, and both before `go build`. Put them in a
+Makefile; every example in the repo does. `-module` is the *import path* of the page
+directory, not a filesystem path.
+
+### The dev loop
+
+Do not tell people to run `go run .` and rebuild by hand:
+
+```bash
+go run github.com/mirairoad/howl-go/core/cmd/howl dev      # add -pre "…" for a Markdown step
+```
+
+It watches, regenerates, rebuilds, restarts and reloads the browser (~400-550ms
+per save), proxies a stable port in front of the restarting app, keeps the last
+good binary serving when a build fails, and shows the compiler error as an
+overlay in the page. CSS edits skip the rebuild and swap the stylesheet in place.
+
+There is **no HMR** — Go cannot hot-swap a linked binary. Do not claim otherwise.
+
+The app needs no dev-mode code: `app.New` reads `HOWL_ADDR`, `HOWL_PUBLIC_DIR`
+(serve /static/ from disk) and `HOWL_DEV` (publish the live endpoint), all set by
+the dev server and unset otherwise.
+
+Live reload is the `/_howl/alive` SSE stream, same name and pattern as howl (TS):
+it carries a monotonic revision, the client remembers the first and reloads on
+anything higher, so a rebuild missed while disconnected still reloads on
+reconnect. Events: `alive` (revision), `css` (swap stylesheets), `build-error`
+(overlay), `build-ok`. Never name an SSE event `error` — EventSource already
+uses that for connection failures.
+
+Optional wasm renderer:
+
+```bash
+GOOS=js GOARCH=wasm go build -o client/public/views.wasm ./wasm
+install -m 644 "$(go env GOROOT)/lib/wasm/wasm_exec.js" client/public/wasm_exec.js
+```
+
+---
+
+## Routing conventions
+
+Routes come from the directory tree. Behaviour is encoded in **dot-separated suffixes** on
+the file name.
+
+### Reserved basenames (never routes)
+
+| name | meaning |
+|---|---|
+| `app.templ` | the document shell, root of the page tree only |
+| `layout.templ` | wraps its directory and everything below it |
+| `*.component.templ` | colocated markup, never publishes a URL |
+
+### Modifiers
+
+| file | route | meaning |
+|---|---|---|
+| `index.templ` | `/dir` | plain server-rendered route |
+| `index.client.templ` | `/dir` | also rendered in the browser by the wasm build |
+| `article_id.dyn.templ` | `/dir/{article_id}` | path parameter |
+| `article_id.dyn.client.templ` | `/dir/{article_id}` | both, in either order |
+| `print.bare.templ` | `/dir/print` | no layout chain, keeps the document shell |
+| `embed.raw.templ` | `/dir/embed` | no layouts, no shell — the markup is the whole reply |
+
+Directory names take modifiers too: `posts/id.dyn/index.templ` → `/posts/{id}`.
+
+**An unknown modifier is a hard error.** A silently ignored typo is a route that quietly
+loses a capability.
+
+`index` cannot be `.dyn` — name the file after the parameter instead.
+
+### Directives
+
+```go
+//howl:route /custom/path      // override the derived pattern outright
+```
+
+Directives attach to the file, not to a Go symbol, so several routes can share a package.
+
+### Why not `_layout` or `[id]`
+
+The Go toolchain refuses both, verified:
+
+| attempted | result |
+|---|---|
+| `_layout.templ` | Go ignores every file/dir starting with `_` → "no Go files in package" |
+| `[article_id].templ` | "invalid input file name" |
+| `[article_id]/` or `{id}/` | "malformed import path: invalid char" |
+| `article_id.dyn.templ` | **works** — dots are legal in file names and import paths |
+
+Never propose bracket or underscore conventions for this framework.
+
+---
+
+## Page anatomy
+
+```templ
+package blog
+
+import "github.com/mirairoad/howl-go/core/router"
+
+// Optional. Merged into <head>. The <title> is extracted and emitted once by the shell.
+templ Head() {
+	<title>Article — myapp</title>
+	<meta name="description" content="…"/>
+}
+
+// The page component: the FIRST zero-argument `templ Name()` in the file that is not
+// Head. Files sharing a directory share a Go package, so give them different names.
+templ Article() {
+	{{ a, ok := store.ArticleByID(router.Param(ctx, "article_id")) }}
+	if ok {
+		<h1>{ a.Title }</h1>
+	} else {
+		{{ router.NotFound(ctx) }}   // the response carries 404, not a soft 200
+		<h1>404</h1>
+	}
+}
+
+// Optional lifecycle, plain Go funcs — NOT templ. Run in the browser only.
+func Mount()   { … }   // after this page's markup is in the DOM
+func Unmount() { … }   // just before its markup is replaced
+```
+
+Rules:
+
+- `templ` produces markup; `func` does something. `templ Mount()` is impossible — a templ
+  block compiles to a function that writes HTML.
+- Pages take **no arguments**. The generated table needs one uniform signature. Everything
+  reaches them through `ctx`.
+- `Mount`/`Unmount` must not import `syscall/js` — use `core/dom`, which compiles for both
+  targets. A page declaring either automatically requires the wasm binary.
+- Anything `Mount` registers, `Unmount` must release, or every visit adds a subscription
+  that fires against a DOM that no longer exists.
+
+### Layouts
+
+```templ
+// client/pages/dashboard/layout.templ
+templ Layout() {
+	<nav>
+		for _, r := range router.Children(router.Routes(ctx), "/dashboard") {
+			@ui.Tab(r.Pattern, r.Label)
+		}
+	</nav>
+	{ children... }
+}
+```
+
+The chain is resolved at build time by walking up the tree, so a nested page never imports
+its parent. The component must be named `Layout`.
+
+### The document shell (`client/pages/app.templ`)
+
+```templ
+templ App(title, head string) {
+	<!doctype html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<title>{ title }</title>                                   <!-- exactly ONE -->
+			<link rel="stylesheet" href="/static/app.css"/>
+			@templ.JSONScript("howl-client", router.ClientConfig(ctx)) <!-- what the client needs -->
+			<script src="/static/app.js" type="module"></script>
+			<script src="/static/islands.js" type="module"></script>   <!-- your islands, if any -->
+			<!--page-head-->
+			@templ.Raw(head)
+			<!--/page-head-->
+		</head>
+		<body>
+			<main id="outlet" data-route={ router.Current(ctx) }>{ children... }</main>
+		</body>
+	</html>
+}
+
+templ NotFound(path string) { <h1>404</h1> }
+```
+
+Non-negotiable parts, each for a reason:
+
+| element | why |
+|---|---|
+| `id="outlet"` | the client swaps its `innerHTML`; without it navigation cannot work |
+| `data-route` | the outgoing route's `Unmount` is looked up from it |
+| `<!--page-head-->` markers | page-owned head tags are removed on leaving instead of stacking |
+| exactly one `<title>` | two, and the browser keeps the first — the page would lose to the fallback |
+| `howl-client` JSON | which routes need wasm, and where its data comes from |
+
+Anything **outside** `#outlet` survives navigation (headers, sidebars, islands with state).
+Anything inside is replaced.
+
+---
+
+## `core/router` API
+
+Everything a page or layout can read from `ctx`:
+
+```go
+router.Param(ctx, "article_id") string      // path parameter
+router.Current(ctx) string                  // active path
+router.Routes(ctx) []router.Route           // the whole table
+router.Under(ctx, "/dashboard") bool        // nav highlighting, incl. children
+router.Nav(routes) []Route                  // top-level static routes — derived, not declared
+router.Children(routes, "/dashboard") []Route
+router.Lookup(routes, path) (Route, map[string]string, bool)
+router.NeedsWasm(routes) []string
+router.ClientConfig(ctx) router.Client
+
+router.NotFound(ctx)                        // this response is a 404
+router.SetStatus(ctx, code)                 // any status, from inside a component
+router.Status(ctx) int
+```
+
+Status works because pages render into a buffer before anything is sent. This is also why
+a component that fails halfway produces an error page rather than a truncated document.
+
+`router.Route` fields: `Pattern`, `Label`, `Page`, `Head`, `Mount`, `Unmount`, `Layouts`,
+`Client`, `Raw`. All produced by `fsroutes` — never construct one by hand outside tests.
+
+---
+
+## `core/app` API
+
+```go
+a := app.New(app.Config{
+	Routes:   pages.FsClientRoutes(),   // generated
+	Shell:    pages.App,                // func(title, head string) templ.Component
+	NotFound: pages.NotFound,           // func(path string) templ.Component
+	Public:   public,                   // fs.FS — the app's own /static/ files
+	Data:     data,                     // func(ctx, path) ctx — context for every render
+	Addr:     ":9000",
+
+	Use:     []mw.Middleware{…},        // outermost first
+	OnError: func(w, r, err) {…},       // owns the response; nothing written yet
+	Log:     nil,                       // defaults to slog.Default()
+
+	StaticMaxAge:    0,                 // 0 = revalidate with ETag
+	StaticImmutable: app.Hashed,        // app.9f8c2a1b.css → cache a year
+	Dev:             false,             // re-read static files every request
+
+	ClientData: "/api/metrics",         // JSON handed to the wasm renderer; omit = no fetch
+	PublicDir:  "",                     // serve /static/ from disk instead of the embed (dev)
+})
+
+mux := a.Mux()                          // routes + /static/ + 404 fallback
+mux.HandleFunc("GET /api/things", …)    // your own handlers, plain net/http
+a.Mount("/admin", adminHandler)         // sub-app, prefix stripped
+log.Fatal(a.Listen(mux))                // applies Use + logs the startup line
+
+a.Handler()                             // Mux wrapped in Use — for tests/custom servers
+a.Wrap(h)                               // apply Use to any handler
+a.Export("./dist")                      // static export of every non-dynamic route
+app.SSE(w, r)                           // (*Stream, error); Send(event, data), Done()
+```
+
+There is **no `ctx` wrapper and no framework handler type**. Use `r.Cookie`,
+`r.URL.Query()`, `r.PathValue`, `json.NewEncoder(w)`. Do not invent `ctx.json` helpers.
+
+---
+
+## `core/mw`
+
+```go
+Use: []mw.Middleware{
+	mw.RequestID,                                              // id on ctx + X-Request-Id
+	mw.LogWith(mw.LogOptions{Callers: true, Skip: mw.SkipNoise}),
+	mw.Recover(nil),                                           // panic → 500
+	mw.Compress{}.Handler,                                     // gzip dynamic responses
+	(&mw.Coalesce{}).Handler,                                  // share one render across identical concurrent GETs
+	mw.CORS{Origins: []string{"https://app.example.com"}}.Handler,
+	mw.CSRF{Secure: true}.Handler,                             // origin check + double-submit token
+	mw.CSP{Policy: "default-src 'self' 'nonce-{nonce}'"}.Handler,
+}
+```
+
+- `mw.Middleware` is `func(http.Handler) http.Handler` — anything written for chi or the
+  standard library drops in, in either direction.
+- Config-struct middleware are used as `Type{…}.Handler`. `Coalesce` needs a pointer
+  (`(&mw.Coalesce{}).Handler`) because it holds state.
+- Read helpers: `mw.ID(ctx)`, `mw.CSRFToken(ctx)`, `mw.Nonce(ctx)`.
+- `Coalesce` refuses to share: non-GET, requests with `Cookie`/`Authorization`, responses
+  that set a cookie, bodies over `MaxBody`.
+- `LogOptions.Callers` adds `ip`/`ua` **only** for requests that did not come from a page
+  on this host (checked via `Sec-Fetch-Site`, `Origin`, `Referer`).
+
+---
+
+## Logging
+
+```go
+console.Setup(console.Options{})   // installs as slog.Default; do this first in main()
+```
+
+```
+09:45:31.924 INFO  listening   url=http://localhost:9000 routes=8
+09:45:33.988 INFO  http        POST /api/logs 202 0B 6.76ms id=b13b1e4b ip=10.1.4.9 ua=otel-collector/0.96
+09:45:34.220 WARN  http        GET /nope 404 1.6kB 45µs id=24ab09a8
+```
+
+Terminal → tinted aligned columns. Pipe/file/systemd → JSON, one object per line. Decided
+by whether stdout is a character device; `NO_COLOR` wins outright. `method`, `path`,
+`status`, `bytes`, `took` render positionally in that order whatever order you pass them.
+
+Log through `slog` (`slog.Info`, or `a.Log()`), not `fmt.Printf`.
+
+---
+
+## `core/state` — typed request state
+
+```go
+type User struct{ ID string }
+
+ctx = state.With(ctx, User{ID: "u_1"})   // middleware or Config.Data
+u := state.Get[User](ctx)                // zero value if absent
+u, ok := state.From[User](ctx)           // when absence matters
+```
+
+The key *is* the type — one value per type. Two things of the same underlying type that
+mean different things need different named types.
+
+---
+
+## `core/signal` — reactivity (browser)
+
+```go
+Todos     = signal.WithEq([]Todo(nil), sameTodos)   // slices/maps: supply equality
+Count     = signal.Of(0)                            // comparable: skips equal writes
+Derived   = signal.DeriveEq(func() int { … })       // computed
+stop      = signal.Effect(repaint)                  // auto-tracked, no dependency array
+stopWatch = signal.Watch(src, func(now, before int) { … })
+signal.Untrack(func() { … })
+```
+
+There is no dependency array because reads are observable: an effect installs itself while
+running and every `Get()` registers the edge. Re-running an effect detaches its old
+dependencies first, so a branch that stops reading a signal stops being woken by it.
+
+Signals are package-level. The server must never write them — mirror into signals only on
+the browser's instance, or concurrent requests race.
+
+---
+
+## Browser: `core/dom` and `window.howl`
+
+```go
+dom.Root()                                  // the element this page rendered into
+dom.Root().Query("[data-add]").On("click", func() { … })
+dom.Navigate("/dashboard")                  // same path a link click takes
+dom.Navigate("/", dom.Replace())            // no new history entry
+dom.Navigate("/x", dom.Transition("slide-left"))
+dom.Prefetch("/reports/2024")
+dom.Log(…) / dom.Warn(…)
+```
+
+`net/http` under `GOOS=js` **is** the browser's `fetch()` — no JS glue needed. It must run
+in a goroutine: blocking the JS callback deadlocks the Go scheduler.
+
+JS side — `window.howl` is the entire public API:
+
+```js
+howl.navigate(url, { replace, transition, scroll })
+howl.prefetch(url)
+howl.island(name, (el, props) => { … })   // your islands live in YOUR script, not the framework
+howl.config                                // { wasm: [...], data: "..." }
+```
+
+Markup attributes the client runtime understands:
+
+| attribute | effect |
+|---|---|
+| `data-island="name" data-props='{…}'` | hydrated by a registered island |
+| `data-no-prefetch` | do not warm this link (or subtree) |
+| `data-no-spa` | full page load, do not intercept |
+| `data-transition-slide-left` etc. | view transition; on `<html>` for a default, `data-transition-none` opts out |
+
+`prefers-reduced-motion` disables transitions outright. Transitions are opt-in — nothing
+animates unless declared.
+
+---
+
+## The wasm renderer
+
+`wasm/main.go` (build tag `//go:build js && wasm`) imports the **same** generated route
+table and exports three functions:
+
+```go
+js.Global().Set("howlRender", js.FuncOf(render))   // (path, dataJSON) -> html or ""
+js.Global().Set("howlMount", js.FuncOf(mount))     // (path, element)
+js.Global().Set("howlUnmount", js.FuncOf(unmount)) // (path)
+select {}                                          // main must never return
+```
+
+`render` returns `""` for a route that is not `.client`, and the client falls back to the
+server. Its output must start with the same `<template data-head><title>…</title>…</template>`
+prefix the server sends — one wire shape, one merge path.
+
+Cost: ~5.6 MB raw / 1.63 MB gzipped. Lazy-loaded only for routes in `howl.config.wasm`.
+Do not put it on the critical path of a public page.
+
+---
+
+## Endpoints
+
+One file per endpoint under `server/apis/`. The file's location is its URL, the
+file name carries the method, and the Go types are the contract — there is no
+schema library, because the types the handler is written against ARE the schema.
+
+```go
+// server/apis/settings/purge.post.api.go  ->  POST /api/settings/purge
+package settings
+
+type Purged struct {
+	Removed int64 `json:"removed"`
+}
+
+var Purge = api.Define(api.Spec[api.None, api.None, Purged]{
+	Name:  "Purge",
+	Roles: []string{"admin"},          // strings; the application decides what they mean
+	Handler: func(r *api.Request[api.None, api.None]) (Purged, error) {
+		removed, err := store.Get().Purge()
+		return Purged{Removed: removed}, err
+	},
+})
+```
+
+| file | route |
+|---|---|
+| `summary.api.go` | `GET /api/summary` |
+| `settings/index.api.go` | `GET /api/settings` |
+| `settings/index.put.api.go` | `PUT /api/settings` |
+| `events/id.dyn.api.go` | `GET /api/events/{id}` |
+| `health.api.go` with `Path: "/healthz"` | `GET /healthz` |
+
+Rules:
+
+- **One `api.Define` per file.** The file name is the URL; it can only describe one.
+- `api.None` for no query, no body, or no response (a `None` response answers 204).
+- Query decoding uses `query:"name"` tags. Body is JSON, and unknown fields are rejected.
+- Validation is a `Validate() error` method on the query or body type. It runs before the
+  handler; a plain error becomes a 400.
+- Return `*api.Error` (`api.NotFound`, `api.Invalid`, `api.Forbidden`, …) to choose a status.
+  Any other error is a 500 whose details stay server-side, with a correlation id on both.
+- A response type may implement `Status() int` for 201/202.
+- **Roles are not implemented by howl-go.** The endpoint declares strings; the application
+  supplies `api.Config{Authorize: func(*http.Request, []string) error}`. Declaring roles
+  with no Authorize wired panics at registration — it would otherwise let everyone through.
+- Generate with `fsapis`, register with `api.Register(mux, cfg, apis.FsApiRoutes()...)`.
+- Protobuf, file serving and streaming stay ordinary `http.Handler`s on the mux.
+
+The OpenAPI document is built at startup from the same table, so it cannot
+describe an endpoint the binary does not serve:
+
+```go
+routes := apis.FsApiRoutes()
+api.Register(mux, cfg, routes...)
+mux.HandleFunc("GET /api/openapi.json", api.OpenAPI(api.Info{Title: "Guard"}, routes...))
+mux.HandleFunc("GET /api/docs", api.Docs("/api/openapi.json"))
+```
+
+Query tags become parameters, `{placeholders}` become path parameters, named
+structs become components, `Roles` becomes a security requirement. `Validate()`
+is deliberately NOT expressed — it is arbitrary Go, and a `maximum: 100` the
+handler does not enforce would be worse than silence.
+
+`fsapis -client` also emits a typed client over the same types, which compiles for wasm:
+
+```go
+events, err := api.New("").Events(ctx, telemetry.Filter{Signal: "logs", Limit: 50})
+```
+
+## Tooling for agents
+
+```bash
+go run github.com/mirairoad/howl-go/core/cmd/howl check          # conventions, enforced
+go run github.com/mirairoad/howl-go/core/cmd/howl check -json    # structured diagnostics
+```
+
+`howl dev` also serves a **routes widget** — draggable, persisted, `⌃R` to toggle
+— listing every route from the generated table, one click to navigate, with a
+box for the parameter on a `.dyn` route. It lives in the dev client, so a
+production build has neither the panel nor the `/_howl/routes.json` it reads.
+
+`check` reports what this file describes: a page importing `core/app`, `templ Mount()`, a
+shell missing `#outlet` / `data-route` / the page-head markers / the client config, an
+endpoint reading the raw query instead of its declared one, two endpoints in one file,
+roles with no Authorize, hand-edited generated files. With `-build` it also runs
+`go generate`, `go build` and `go vet`.
+
+The same checks are MCP tools — `howl_conventions`, `howl_check`, `howl_routes`,
+`howl_endpoints`, `howl_scaffold` — served over stdio by `howl mcp`, configured in
+`.mcp.json` at the project root. Prefer `howl_routes` / `howl_endpoints` over guessing what
+a URL maps to: they read the generated tables, so they answer with what the project
+actually serves.
+
+## Common tasks
+
+| task | do this |
+|---|---|
+| add a page | create `client/pages/x/index.templ`, re-run `fsroutes` + `templ generate` |
+| add a parameter | `client/pages/blog/article_id.dyn.templ`, read `router.Param(ctx, "article_id")` |
+| 404 from a page | `{{ router.NotFound(ctx) }}` inside the branch that has nothing to show |
+| add an API endpoint | a `*.api.go` file under `server/apis/`; run `fsapis`; register the generated table |
+| add a raw/protobuf/streaming endpoint | `mux.HandleFunc("POST /v1/x", …)` on the mux from `a.Mux()` |
+| return HTML from an API | render a component to the writer: `ui.TodoItem(t).Render(r.Context(), w)` |
+| share data with every page | `Config.Data`, or `state.With` in middleware |
+| add interactivity | an island in your own JS, or `func Mount()` in Go for a `.client` route |
+| render a route in the browser | rename to `*.client.templ`, build the wasm binary |
+| skip the layout chain | `*.bare.templ` |
+| return a bare fragment | `*.raw.templ` |
+| static site | `a.Export("./dist")` — dynamic routes are skipped |
+
+---
+
+## Hard constraints and gotchas
+
+1. **Never edit `fsroutes_gen.go`** or `*_templ.go`. They are generated; edit the source
+   and re-run the pipeline.
+2. **Never `_name` or `[name]`** in the page tree. Go rejects both. Use dot modifiers.
+3. **Pages must not import `core/app`** — cycle risk and it drags `net/http` into wasm.
+4. **`templ Mount()` does not exist.** Lifecycle hooks are plain `func`s.
+5. **One `<title>` per document.** The shell owns it; the page supplies it through `Head`.
+6. **`GET /` is ServeMux's catch-all.** The root route registers `GET /{$}`; the 404
+   fallback owns `/` for every method. Do not register `GET /` yourself.
+7. **`Mount` without `Unmount` leaks** a subscription per visit.
+8. **A `switch` with a `default:` arm is not a router** — it makes every typo a 200.
+9. **`//go:embed` bakes `app.js` into the binary**; editing it does nothing until rebuild.
+10. **`dom.On` never releases its `js.Func`** — one leaked closure per listener per mount.
+    Known, documented, unfixed.
+11. **wasm data is one blob.** `ClientData` is a single endpoint unmarshalled as one type;
+    per-route client data has no mechanism yet.
+
+---
+
+## Non-goals — do not invent these
+
+howl-go deliberately does not have, and proposals should not assume:
+
+- a `ctx` wrapper (`ctx.json`, `ctx.cookies`, `ctx.query`) — the standard library has these
+- pluggable render engines — `templ.Component` is already the seam
+- full client-side hydration of every page — islands + wasm is the opposite bet
+- a bundler, CSS pipeline, or any Node dependency
+- true HMR — Go cannot hot-swap a linked binary; the dev loop is rebuild + restart
+- a data/ORM layer or admin UI
+- SSG for dynamic routes — `Export` skips anything with a `{param}`
+
+---
+
+## Added after v0.1.0
+
+`core/mw`, `core/console`, `core/state`, `app.Static` (ETag/304/compress-once),
+`Config.Use`/`OnError`/`Log`/`ClientData`/`Dev`/`StaticMaxAge`/`StaticImmutable`,
+`a.Mount`/`a.Handler`/`a.Wrap`/`a.Log`, `app.SSE`, `router.SetStatus`/`NotFound`/`Status`,
+`router.Client`/`ClientConfig`/`WithClient`, `Route.Raw`, the `.bare` and `.raw` modifiers,
+`window.howl` (navigate/prefetch/island/config), `dom.Navigate`/`dom.Prefetch`,
+`core/cmd/howl dev` with `Config.PublicDir` and the `HOWL_*` environment
+variables, `router.Client.Live`, `core/api` + `core/cmd/fsapis` (typed endpoints,
+generated table, generated client), `howl check` and `howl mcp`.
+
+Removed: `app.GzipStatic` (replaced by `app.Static`), the framework's built-in demo
+islands (applications register their own). The `howl-wasm-routes` JSON script still works
+but is superseded by `howl-client`.
+
+---
+
+## Reference
+
+- `README.md` — overview, measurements, the client runtime
+- `www/docs/*.md` — routing, rendering, lifecycle, reactivity, navigation, constraints, HTTP, dev server
+- `DESIGN-LOG.md` — why every convention is what it is, and the bugs worth remembering
+- `examples/hello` — smallest standalone module importing the tagged release
+- `examples/toy_app` — dashboard, blog, local-first todos, wasm, islands
+- `www` — the documentation site, built with the framework

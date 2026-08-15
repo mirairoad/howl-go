@@ -40,6 +40,12 @@ type Route struct {
 	Unmount func()
 	Layouts []Wrapper // outermost first
 	Client  bool      // file named *.client.templ -> the wasm build renders it
+	// Raw marks a route that answers with its own markup and nothing else: no
+	// document shell, no head template. From *.raw.templ. For embeds, print
+	// views, and fragments consumed by something that is not our client
+	// runtime. A *.bare.templ route keeps the shell and only drops its layout
+	// chain, which needs no field here — the generator simply emits no layouts.
+	Raw bool
 }
 
 var titleTag = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
@@ -200,6 +206,9 @@ const (
 	routesKey ctxKey = iota
 	currentKey
 	paramsKey
+	clientKey
+	statusKey
+	assetsKey
 )
 
 func WithRoutes(ctx context.Context, rs []Route) context.Context {
@@ -229,9 +238,123 @@ func Param(ctx context.Context, name string) string {
 	return p[name]
 }
 
+// ---------------------------------------------------------------------------
+// Response status
+//
+// A page that discovers, mid-render, that the thing it was asked for does not
+// exist has to be able to say so. Without this a route like /blog/{id} answers
+// "no such article" markup with HTTP 200 — a soft 404, invisible to crawlers
+// and uptime checks alike.
+//
+// It lives here, not in the app package, because a page must be able to call it
+// and a page may not import the server runtime: the generated table is in the
+// page tree, so anything a page imports must stay a leaf. It is also why the
+// wasm build does not carry net/http on account of a 404.
+// ---------------------------------------------------------------------------
+
+type statusHolder struct{ code int }
+
+// WithStatus installs the status a render starts from. The server does this
+// before rendering; anything else reading Status gets 200.
+func WithStatus(ctx context.Context, code int) context.Context {
+	return context.WithValue(ctx, statusKey, &statusHolder{code: code})
+}
+
+// SetStatus sets the response status from inside a component. It works because
+// the page is rendered into a buffer first, so nothing has been sent yet.
+func SetStatus(ctx context.Context, code int) {
+	if h, ok := ctx.Value(statusKey).(*statusHolder); ok {
+		h.code = code
+	}
+}
+
+// NotFound is SetStatus(ctx, 404): the page renders its own "no such thing"
+// markup and the response carries the status that says so.
+func NotFound(ctx context.Context) { SetStatus(ctx, 404) }
+
+// Status reports the status the response will carry.
+func Status(ctx context.Context) int {
+	if h, ok := ctx.Value(statusKey).(*statusHolder); ok {
+		return h.code
+	}
+	return 200
+}
+
+// ---------------------------------------------------------------------------
+// Client configuration
+//
+// What the browser needs to know about the Go half, published by the shell:
+//
+//	@templ.JSONScript("howl-client", router.ClientConfig(ctx))
+//
+// It lives here rather than in the app package because the shell is a page,
+// and a page may not import the server runtime without a cycle.
+// ---------------------------------------------------------------------------
+
+// Client is the JSON app.js reads at boot.
+type Client struct {
+	// Wasm lists the patterns that require the wasm binary — routes the browser
+	// renders, and routes with a lifecycle hook. Derived from the route table,
+	// so adding .client to a file is enough; nothing is told about it twice.
+	Wasm []string `json:"wasm"`
+	// Data is the JSON endpoint the client fetches once before its first local
+	// render, and hands to the renderer. Empty means no fetch at all.
+	Data string `json:"data,omitempty"`
+	// Live is the dev server's reload endpoint, set only when `howl dev` is in
+	// front. Empty in production, where the client then loads no dev code at
+	// all — not even the check for it.
+	Live string `json:"live,omitempty"`
+	// Binary and Exec are the content-hashed URLs of the wasm renderer and its
+	// Go runtime shim. The client uses them instead of guessing a path, which
+	// is what lets those two be cached for a year: the URL changes when the
+	// build does, so the browser never has to ask whether it is still current.
+	Binary string `json:"binary,omitempty"`
+	Exec   string `json:"exec,omitempty"`
+}
+
+// Asset resolves a static file to its content-hashed URL:
+//
+//	<link rel="stylesheet" href={ router.Asset(ctx, "app.css") }/>
+//
+// A hashed URL can be cached forever, because changing the file changes the
+// name. Without the resolver in context — a wasm build, a static export — it
+// falls back to the plain path, which still works and merely revalidates.
+func Asset(ctx context.Context, name string) string {
+	if resolve, ok := ctx.Value(assetsKey).(func(string) string); ok {
+		return resolve(name)
+	}
+	return "/static/" + name
+}
+
+// WithAssets installs the resolver. The server does this for every render.
+func WithAssets(ctx context.Context, resolve func(string) string) context.Context {
+	return context.WithValue(ctx, assetsKey, resolve)
+}
+
+func WithClient(ctx context.Context, c Client) context.Context {
+	return context.WithValue(ctx, clientKey, c)
+}
+
+// ClientConfig returns what the shell should publish for the client runtime.
+func ClientConfig(ctx context.Context) Client {
+	c, _ := ctx.Value(clientKey).(Client)
+	return c
+}
+
 // Under reports whether the active path sits inside prefix — for nav
 // highlighting, where /dashboard should stay lit on /dashboard/metrics.
+//
+// "/" is an exact match only. Treating it as a prefix makes the root link
+// current on every page, which is how a sidebar ends up with two entries lit at
+// once — and, worse, how the server and the client runtime came to disagree:
+// the client had the exclusion, this did not.
 func Under(ctx context.Context, prefix string) bool {
 	cur := Current(ctx)
-	return cur == prefix || strings.HasPrefix(cur, strings.TrimSuffix(prefix, "/")+"/")
+	if cur == prefix {
+		return true
+	}
+	if prefix == "" || prefix == "/" {
+		return false
+	}
+	return strings.HasPrefix(cur, strings.TrimSuffix(prefix, "/")+"/")
 }
