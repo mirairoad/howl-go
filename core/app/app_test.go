@@ -370,3 +370,35 @@ func TestUnknownHashedFileIs404(t *testing.T) {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
+
+func TestARenderedPageIsNeverReusedWithoutAsking(t *testing.T) {
+	// A response with no Cache-Control, no Expires and no Last-Modified is
+	// eligible for heuristic caching, and browsers take that offer. Because
+	// assets are content-hashed and immutable, a stale document keeps pointing
+	// at the exact assets it was built with — so the whole application stays
+	// coherently one version behind an update until somebody hard-reloads.
+	a := New(Config{
+		Shell: shell,
+		Routes: []router.Route{{
+			Pattern: "/", Label: "Home",
+			Page: func() templ.Component { return templ.Raw("<p>hello</p>") },
+		}},
+	})
+
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		partial(httptest.NewRequest(http.MethodGet, "/", nil)),
+	} {
+		response := httptest.NewRecorder()
+		a.Mux().ServeHTTP(response, request)
+		if got := response.Header().Get("Cache-Control"); got != "private, no-cache" {
+			t.Fatalf("partial=%q served Cache-Control %q",
+				request.Header.Get("X-Partial"), got)
+		}
+	}
+}
+
+func partial(r *http.Request) *http.Request {
+	r.Header.Set("X-Partial", "1")
+	return r
+}

@@ -211,6 +211,22 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, rt router.Route, c 
 	title, head := rt.HeadParts(ctx, rt.Label)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// A rendered page is never reused without asking.
+	//
+	// Without this a response carrying no Cache-Control, no Expires and no
+	// Last-Modified is eligible for heuristic caching, and browsers take that
+	// offer. The failure it produces is the confusing kind rather than the
+	// obvious kind: assets are content-hashed and immutable, so a stale
+	// document keeps pointing at the exact assets it was built with, and the
+	// whole application stays coherently one version behind until somebody
+	// thinks to hard-reload. Everything works; it is just yesterday.
+	//
+	// `no-cache` rather than `no-store`: the browser may keep the bytes, it
+	// simply has to revalidate, so an unchanged page still costs a 304 rather
+	// than a re-render. `private` because a rendered page is somebody's — a
+	// shared cache holding one signed-in person's dashboard is the other half
+	// of this bug.
+	w.Header().Set("Cache-Control", "private, no-cache")
 
 	// SPA navigation: the page plus its layouts, without the document shell.
 	// A fragment has no <head>, so the page's head travels with it in an inert
