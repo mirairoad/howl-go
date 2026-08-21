@@ -348,3 +348,31 @@ func TestRecoverAnswers500(t *testing.T) {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 }
+
+func TestCoalesceLeavesEventStreamsAlone(t *testing.T) {
+	// An event stream never ends, so recording one means the browser sees
+	// nothing at all. Two concurrent listeners must each get their own handler
+	// call rather than one being replayed the other's buffered output.
+	var calls atomic.Int64
+	c := &Coalesce{}
+	handler := c.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: hello\n\n")) //nolint:errcheck
+	}))
+
+	var wait sync.WaitGroup
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			request := httptest.NewRequest(http.MethodGet, "/stream", nil)
+			request.Header.Set("Accept", "text/event-stream")
+			handler.ServeHTTP(httptest.NewRecorder(), request)
+		}()
+	}
+	wait.Wait()
+	if calls.Load() != 2 {
+		t.Fatalf("an event stream was shared between listeners: %d calls", calls.Load())
+	}
+}
