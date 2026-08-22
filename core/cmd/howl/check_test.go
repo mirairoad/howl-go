@@ -343,7 +343,7 @@ func TestMCPSurvivesAMalformedLine(t *testing.T) {
 
 func TestScaffoldPageNaming(t *testing.T) {
 	root := t.TempDir()
-	if _, err := scaffold(root, "page", "/blog/{article_id}", "", "", true, nil); err != nil {
+	if _, err := scaffold(root, request{Kind: "page", Path: "/blog/{article_id}", Client: true}); err != nil {
 		t.Fatal(err)
 	}
 	// Brackets are impossible in a Go file name, so the parameter becomes the
@@ -356,7 +356,7 @@ func TestScaffoldPageNaming(t *testing.T) {
 
 func TestScaffoldEndpointNaming(t *testing.T) {
 	root := t.TempDir()
-	if _, err := scaffold(root, "endpoint", "/api/settings/purge", "Purge", "POST", false, []string{"admin"}); err != nil {
+	if _, err := scaffold(root, request{Kind: "endpoint", Path: "/api/settings/purge", Name: "Purge", Method: "POST", Roles: []string{"admin"}}); err != nil {
 		t.Fatal(err)
 	}
 	want := filepath.Join(root, "server/apis/settings/purge.post.api.go")
@@ -373,10 +373,10 @@ func TestScaffoldEndpointNaming(t *testing.T) {
 
 func TestScaffoldRefusesToOverwrite(t *testing.T) {
 	root := t.TempDir()
-	if _, err := scaffold(root, "page", "/reports", "", "", false, nil); err != nil {
+	if _, err := scaffold(root, request{Kind: "page", Path: "/reports"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := scaffold(root, "page", "/reports", "", "", false, nil); err == nil {
+	if _, err := scaffold(root, request{Kind: "page", Path: "/reports"}); err == nil {
 		t.Fatal("scaffold overwrote an existing file")
 	}
 }
@@ -392,4 +392,543 @@ func tree(t *testing.T, root string) string {
 		return nil
 	})
 	return strings.Join(out, ", ")
+}
+
+// A page importing db is the same mistake as importing core/app, and it fails
+// the same two ways: the page tree stops being leaves, and database/sql lands
+// in the wasm build.
+func TestPageImportingDBIsAnError(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/pages/reports/index.templ": `package reports
+
+import "github.com/mirairoad/howl-go/db"
+
+templ Reports() {
+	<h1>{ db.IDPath }</h1>
+}
+`,
+	})
+	found := rules(runCheck(root, false))
+	d, ok := found["page-imports-db"]
+	if !ok {
+		t.Fatalf("page-imports-db not reported: %+v", found)
+	}
+	if d.Level != "error" || d.Line == 0 {
+		t.Errorf("diagnostic = %+v", d)
+	}
+}
+
+// Defaults on a value receiver satisfies the interface, so the service calls
+// it — and every default is written to a copy. Nothing fails; the field is
+// just empty forever, which is exactly the class of bug this command exists
+// for.
+func TestCollectionValueReceiverDefaultsIsAnError(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"server/store/users.go": `package store
+
+import "github.com/mirairoad/howl-go/db"
+
+type User struct {
+	db.Doc
+	Plan string ` + "`json:\"plan\"`" + `
+}
+
+func (u User) Defaults() {
+	if u.Plan == "" {
+		u.Plan = "free"
+	}
+}
+`,
+	})
+	found := rules(runCheck(root, false))
+	d, ok := found["collection-value-receiver"]
+	if !ok {
+		t.Fatalf("collection-value-receiver not reported: %+v", found)
+	}
+	if d.Level != "error" {
+		t.Errorf("level = %q, want error", d.Level)
+	}
+	if !strings.Contains(d.Fix, "*User") {
+		t.Errorf("fix = %q, want the pointer receiver", d.Fix)
+	}
+}
+
+func TestPointerReceiverDefaultsPasses(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"server/store/users.go": `package store
+
+import "github.com/mirairoad/howl-go/db"
+
+type User struct {
+	db.Doc
+	Plan string ` + "`json:\"plan\"`" + `
+}
+
+func (u *User) Defaults() { u.Plan = "free" }
+`,
+	})
+	if _, reported := rules(runCheck(root, false))["collection-value-receiver"]; reported {
+		t.Error("a pointer receiver was reported")
+	}
+}
+
+// A value-receiver Defaults on a struct that is not a document is somebody
+// else's business.
+func TestValueReceiverOnANonDocumentIsIgnored(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"server/store/config.go": `package store
+
+import "github.com/mirairoad/howl-go/db"
+
+type Settings struct {
+	Theme string
+}
+
+func (s Settings) Defaults() { s.Theme = "dark" }
+
+type User struct {
+	db.Doc
+}
+`,
+	})
+	if _, reported := rules(runCheck(root, false))["collection-value-receiver"]; reported {
+		t.Error("a non-document struct was reported")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reactivity and lifecycle
+// ---------------------------------------------------------------------------
+
+// The leak the docs warn about, made into a rule. A Mount that subscribes and
+// never releases keeps working — it just also keeps firing at the DOM of every
+// page that has since been replaced, one more listener per visit.
+func TestMountThatRegistersNeedsUnmount(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/pages/todos/index.client.templ": `package todos
+
+templ Page() {
+	<ul id="list"></ul>
+}
+
+var stop func()
+
+func Mount() {
+	stop = signal.Effect(repaint)
+	dom.Root().Query("[data-add]").On("click", add)
+}
+`,
+	})
+	got := rules(runCheck(root, false))
+	d, ok := got["mount-without-unmount"]
+	if !ok {
+		t.Fatalf("no diagnostic; got %#v", got)
+	}
+	if d.Level != "error" {
+		t.Errorf("level = %q, want error", d.Level)
+	}
+}
+
+// Mount that only reads is fine. The metrics page in the toy app logs a row
+// count and fetches once; demanding an Unmount there would be ceremony, and a
+// rule that fires on correct code is a rule people turn off.
+func TestMountThatRegistersNothingIsFine(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/pages/metrics/index.client.templ": `package metrics
+
+templ Page() {
+	<table></table>
+}
+
+func Mount() {
+	dom.Log("rows:", len(dom.Root().QueryAll("tr")))
+}
+`,
+	})
+	if result := runCheck(root, false); !result.OK || result.Warnings != 0 {
+		t.Fatalf("reported %#v", result.Diagnostics)
+	}
+}
+
+// A stop func that is never bound cannot be called, so the subscription it
+// represents outlives the page by definition.
+func TestDiscardedEffectIsAnError(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/pages/x/index.client.templ": `package x
+
+templ Page() {
+	<div></div>
+}
+
+func Mount() {
+	signal.Effect(repaint)
+}
+
+func Unmount() {}
+`,
+	})
+	if _, ok := rules(runCheck(root, false))["effect-not-released"]; !ok {
+		t.Fatal("a discarded stop func was accepted")
+	}
+}
+
+// Signals are package-level. A handler writing one is not a slow path or a
+// stale read — it is two requests writing one variable.
+func TestServerImportingSignalIsAnError(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"server/apis/metrics.api.go": `package apis
+
+import "github.com/mirairoad/howl-go/core/signal"
+
+var Live = signal.Of(0)
+`,
+	})
+	if _, ok := rules(runCheck(root, false))["server-imports-signal"]; !ok {
+		t.Fatal("server-side signal write was accepted")
+	}
+}
+
+// The store is imported by pages, and pages compile for wasm. database/sql in
+// here surfaces as a link error naming a package the author never wrote down.
+func TestStoreMustCompileForWasm(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/store/todos.go": `package store
+
+import "database/sql"
+
+var db *sql.DB
+`,
+	})
+	if _, ok := rules(runCheck(root, false))["store-not-portable"]; !ok {
+		t.Fatal("a server-only import in the store was accepted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Component references
+// ---------------------------------------------------------------------------
+
+const componentsPkg = `package components
+
+templ SettingsShell(title string) {
+	<div>{ title }</div>
+}
+
+templ card(label string) {
+	<article>{ label }</article>
+}
+`
+
+func componentProject(t *testing.T, page string) string {
+	t.Helper()
+	return project(t, map[string]string{
+		"go.mod":                            "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ":            goodShell,
+		"client/components/shell.templ":     componentsPkg,
+		"client/pages/settings/index.templ": page,
+	})
+}
+
+// The error this framework reports worst. templ emits no //line directives, so
+// the compiler names a generated file at a line that exists in no source —
+// after two generators have run. Here it is the line that was typed.
+func TestUnknownComponentIsFoundBeforeTheCompiler(t *testing.T) {
+	root := componentProject(t, `package settings
+
+import "example.com/app/client/components"
+
+templ Page() {
+	@components.SettingsShel("Settings")
+}
+`)
+	d, ok := rules(runCheck(root, false))["unknown-component"]
+	if !ok {
+		t.Fatal("an undefined component reference was accepted")
+	}
+	if d.Line != 6 {
+		t.Errorf("line = %d, want 6 — the point of this rule is the line", d.Line)
+	}
+	// A typo and a wrong package look identical to the compiler.
+	if !strings.Contains(d.Fix, "SettingsShell") {
+		t.Errorf("no suggestion: %q", d.Fix)
+	}
+}
+
+func TestComponentArityIsChecked(t *testing.T) {
+	root := componentProject(t, `package settings
+
+import "example.com/app/client/components"
+
+templ Page() {
+	@components.SettingsShell("Settings", "extra")
+}
+`)
+	if _, ok := rules(runCheck(root, false))["component-arity"]; !ok {
+		t.Fatal("a call with the wrong number of arguments was accepted")
+	}
+}
+
+// Go's export rule is the case of the first letter, and templ inherits it —
+// which is not obvious when both files are in the same client/ tree.
+func TestUnexportedComponentAcrossPackages(t *testing.T) {
+	root := componentProject(t, `package settings
+
+import "example.com/app/client/components"
+
+templ Page() {
+	@components.card("nope")
+}
+`)
+	if _, ok := rules(runCheck(root, false))["unexported-component"]; !ok {
+		t.Fatal("a lowercase component was accepted from another package")
+	}
+}
+
+// An unexported component used inside its own package is the normal case — a
+// layout's nav link, a row helper. A rule that fires here is a rule that gets
+// switched off.
+func TestUnexportedComponentInItsOwnPackageIsFine(t *testing.T) {
+	root := componentProject(t, `package settings
+
+templ Page() {
+	@row("a")
+	@row("b")
+}
+
+templ row(label string) {
+	<li>{ label }</li>
+}
+`)
+	if result := runCheck(root, false); !result.OK {
+		t.Fatalf("reported %#v", result.Diagnostics)
+	}
+}
+
+// Arguments contain commas: struct literals, JSON blobs, func literals. A rule
+// that counts them naively reports working code.
+func TestArgumentCountingSurvivesCommas(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/ui/ui.templ": `package ui
+
+templ Island(name, props string) {
+	<div data-island={ name }>{ children... }</div>
+}
+
+templ Rows(items []Row, fn func(Row) string) {
+	<tbody></tbody>
+}
+`,
+		"client/pages/index.templ": `package pages
+
+import "example.com/app/client/ui"
+
+templ Page() {
+	@ui.Island("counter", ` + "`" + `{"start":10,"label":"a, b"}` + "`" + `)
+	@ui.Rows([]ui.Row{{Name: "a", Value: 1}}, func(r ui.Row) string { return r.Name })
+}
+`,
+	})
+	if result := runCheck(root, false); !result.OK {
+		t.Fatalf("commas inside arguments were counted as arguments: %#v", result.Diagnostics)
+	}
+}
+
+// A local variable holding a component reads exactly like a qualified call.
+// It cannot be resolved from here, so it must not be reported.
+func TestMethodCallOnAValueIsNotAComponentReference(t *testing.T) {
+	root := componentProject(t, `package settings
+
+templ Page() {
+	{{ r := current(ctx) }}
+	@r.Component()
+}
+`)
+	if result := runCheck(root, false); !result.OK {
+		t.Fatalf("a method call was read as a package reference: %#v", result.Diagnostics)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cost in the wrong place
+// ---------------------------------------------------------------------------
+
+// The lifecycle code that matters lives in .templ files, beside markup that is
+// not Go. These rules only reach it because the templ blocks are blanked and
+// the rest is parsed — at the original line numbers.
+func TestPerformanceRulesReachTemplFiles(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/pages/dash/index.client.templ": `package dash
+
+import (
+	"net/http"
+	"regexp"
+)
+
+templ Page() {
+	<ul data-list>
+		for _, r := range rows() {
+			<li>{ r }</li>
+		}
+	</ul>
+}
+
+func Mount() {}
+
+func Unmount() {}
+
+func repaint(names []string) {
+	html := ""
+	for _, name := range names {
+		resp, _ := http.Get("/api/row")
+		defer resp.Body.Close()
+		html += regexp.MustCompile("[*]").ReplaceAllString(name, "")
+	}
+	_ = html
+}
+`,
+	})
+	got := rules(runCheck(root, false))
+	for _, rule := range []string{"request-in-loop", "defer-in-loop", "concat-in-loop", "regexp-recompiled"} {
+		d, ok := got[rule]
+		if !ok {
+			t.Errorf("%s did not fire", rule)
+			continue
+		}
+		if d.Level != "warning" {
+			t.Errorf("%s is %s; a judgement call that fails a build is a rule people delete", rule, d.Level)
+		}
+		// The templ block above is 8 lines long. A line number that ignored it
+		// would point into the markup.
+		if d.Line < 20 {
+			t.Errorf("%s reported line %d; the templ block was not accounted for", rule, d.Line)
+		}
+	}
+}
+
+// An accumulator declared inside the loop is one short string per iteration,
+// not a quadratic append. Reporting it would make the rule noise.
+func TestConcatDeclaredInsideTheLoopIsFine(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/pages/index.templ": `package pages
+
+templ Page() {
+	<div></div>
+}
+
+func describe(items []string) []string {
+	var out []string
+	for _, item := range items {
+		extra := ""
+		if item != "" {
+			extra += " +set"
+		}
+		out = append(out, item+extra)
+	}
+	return out
+}
+`,
+	})
+	if result := runCheck(root, false); !result.OK || result.Warnings != 0 {
+		t.Fatalf("reported %#v", result.Diagnostics)
+	}
+}
+
+// A table-driven test is a loop of deliberate single queries, and a test helper
+// is not a hot path.
+func TestPerformanceRulesSkipTests(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		// Not named _test.go on purpose: a conformance suite is ordinary code
+		// that happens to take a *testing.T.
+		"server/store/conformance.go": `package store
+
+import (
+	"context"
+	"testing"
+
+	"github.com/mirairoad/howl-go/db"
+)
+
+func Run(t *testing.T, ctx context.Context, s *db.Service[User, *User]) {
+	for _, name := range []string{"a", "b"} {
+		if _, err := s.Find(ctx, db.Query{Where: db.Eq("name", name)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+`,
+	})
+	if _, ok := rules(runCheck(root, false))["query-in-loop"]; ok {
+		t.Fatal("a table-driven test was reported as an N+1")
+	}
+}
+
+// A pattern built from a value cannot be hoisted, so telling someone to hoist
+// it is advice they cannot take.
+func TestDynamicRegexpOutsideALoopIsFine(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/pages/index.templ": `package pages
+
+import "regexp"
+
+templ Page() {
+	<div></div>
+}
+
+func find(name, body string) bool {
+	return regexp.MustCompile("^" + regexp.QuoteMeta(name) + "$").MatchString(body)
+}
+`,
+	})
+	if result := runCheck(root, false); result.Warnings != 0 {
+		t.Fatalf("reported %#v", result.Diagnostics)
+	}
+}
+
+// The N+1 the filter grammar exists to avoid.
+func TestQueryInLoopIsReported(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"server/apis/users.api.go": `package apis
+
+import (
+	"context"
+
+	"github.com/mirairoad/howl-go/db"
+)
+
+func load(ctx context.Context, s *db.Service[User, *User], ids []string) []User {
+	var out []User
+	for _, id := range ids {
+		u, err := s.Get(ctx, id)
+		if err == nil {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+`,
+	})
+	if _, ok := rules(runCheck(root, false))["query-in-loop"]; !ok {
+		t.Fatal("an N+1 was accepted")
+	}
 }

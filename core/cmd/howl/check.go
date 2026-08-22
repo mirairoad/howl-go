@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -90,12 +96,25 @@ func runCheck(root string, build bool) checkResult {
 	files := sourceFiles(root)
 
 	out = append(out, lintPages(root, files)...)
+	out = append(out, lintReactivity(root, files)...)
+	out = append(out, lintComponents(root, files)...)
+	out = append(out, lintPerformance(root, files)...)
 	out = append(out, lintShell(root, files)...)
 	out = append(out, lintEndpoints(root, files)...)
+	out = append(out, lintCollections(root, files)...)
 	out = append(out, lintGenerated(root, files)...)
 	if build {
 		out = append(out, lintBuild(root)...)
 	}
+
+	// Sorted, because the rules run in whatever order suits them and a reader
+	// works through a file top to bottom.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].File != out[j].File {
+			return out[i].File < out[j].File
+		}
+		return out[i].Line < out[j].Line
+	})
 
 	result := checkResult{Diagnostics: out}
 	for _, d := range out {
@@ -118,6 +137,7 @@ func runCheck(root string, build bool) checkResult {
 
 var (
 	importAppRe   = regexp.MustCompile(`"[^"]*howl-go/core/app"`)
+	importDBRe    = regexp.MustCompile(`"[^"]*howl-go/db(/[\w/]+)?"`)
 	templMountRe  = regexp.MustCompile(`(?m)^templ\s+(Mount|Unmount)\s*\(`)
 	rawQueryRe    = regexp.MustCompile(`r\.HTTP\.(URL\.Query\(\)|FormValue|PostFormValue)`)
 	rolesRe       = regexp.MustCompile(`Roles:\s*\[\]string\{[^}]*"`)
@@ -142,6 +162,16 @@ func lintPages(root string, files []sourceFile) []Diagnostic {
 					File: f.Rel, Line: line, Rule: "page-imports-app", Level: "error",
 					Message: "a page imports core/app; the generated route table lives here, so page imports must stay leaves",
 					Fix:     "use core/router (router.NotFound, router.ClientConfig, router.Param) — or move the code out of client/pages",
+				})
+			}
+			// Same rule, different package: db drags database/sql into a build
+			// that may target wasm, and a page reaching storage directly is the
+			// import that makes the page tree stop being leaves.
+			if line, ok := findLine(f.Body, importDBRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "page-imports-db", Level: "error",
+					Message: "a page imports db; page imports must stay leaves, and db links database/sql into the wasm build",
+					Fix:     "load the documents in an endpoint or Config.Data and hand them to the page through ctx",
 				})
 			}
 		}
@@ -199,6 +229,923 @@ func lintShell(root string, files []sourceFile) []Diagnostic {
 			out = append(out, Diagnostic{
 				File: f.Rel, Rule: "shell-client-config", Level: level, Message: message,
 				Fix: `@templ.JSONScript("howl-client", router.ClientConfig(ctx))`,
+			})
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Reactivity and lifecycle
+//
+// These are the rules the browser half of the framework relies on, and every
+// one of them fails silently: a leaked effect still works, it just also fires
+// against a DOM that was thrown away, and it does so once more per visit. The
+// server ones are worse — a signal written from a request handler is a data
+// race that shows up as one user seeing another's data, under load, later.
+// ---------------------------------------------------------------------------
+
+var (
+	funcMountRe   = regexp.MustCompile(`(?m)^func\s+Mount\s*\(\s*\)`)
+	funcUnmountRe = regexp.MustCompile(`(?m)^func\s+Unmount\s*\(\s*\)`)
+	registersRe   = regexp.MustCompile(`signal\.(Effect|Watch|WatchAny)\(|\.On\("`)
+	bareEffectRe  = regexp.MustCompile(`(?m)^\s*signal\.(Effect|Watch|WatchAny)\(`)
+	// A statement that is only a .On( call: the release func it returns went
+	// nowhere, so the js.Func behind it can never be released.
+	bareListenerRe = regexp.MustCompile(`(?m)^\s*[\w.()\[\]"' -]*\.On\("`)
+	importSignalRe = regexp.MustCompile(`"[^"]*howl-go/core/signal"`)
+	importJSRe     = regexp.MustCompile(`"syscall/js"`)
+	notPortableRe  = regexp.MustCompile(`"(database/sql|os|os/exec|net/http/httptest)"`)
+)
+
+func lintReactivity(root string, files []sourceFile) []Diagnostic {
+	var out []Diagnostic
+	for _, f := range files {
+		// Generated files restate the source they came from — a docs page
+		// carries every code sample in this file's own documentation, and
+		// linting those is how a rule reports itself.
+		if generatedRe.Match(f.Body) {
+			continue
+		}
+		inPages := strings.HasPrefix(f.Rel, "client/pages") || strings.Contains(f.Rel, "/client/pages/")
+		inStore := strings.Contains(f.Rel, "client/store/")
+		isServer := strings.HasPrefix(f.Rel, "server/") || strings.Contains(f.Rel, "/server/") ||
+			strings.HasSuffix(f.Rel, ".api.go")
+
+		if inPages && funcMountRe.Match(f.Body) {
+			// Mount that registers nothing needs no Unmount — the metrics page
+			// in the toy app logs and fetches, and pairing it would be
+			// ceremony. Mount that subscribes is the leak: one more live
+			// listener or effect per visit, all of them firing at a DOM that
+			// no longer exists.
+			if registersRe.Match(f.Body) && !funcUnmountRe.Match(f.Body) {
+				line, _ := findLine(f.Body, funcMountRe)
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "mount-without-unmount", Level: "error",
+					Message: "Mount registers an effect, a watcher or a DOM listener and there is no Unmount; every visit to this route adds another one",
+					Fix:     "keep the stop funcs in package-level vars and call them in func Unmount()",
+				})
+			}
+			if line, ok := findLine(f.Body, bareEffectRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "effect-not-released", Level: "error",
+					Message: "the stop func from signal.Effect/Watch is discarded, so this subscription can never be released",
+					Fix:     "stopEffect = signal.Effect(repaint), then call stopEffect() in Unmount",
+				})
+			}
+			if line, ok := findLine(f.Body, bareListenerRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "listener-not-released", Level: "warning",
+					Message: "the release func from dom.On is discarded; a js.Func is held alive from the JS side until it is released, so this leaks one Go closure per visit",
+					Fix:     "release = append(release, el.On(\"click\", fn)), then dom.Off(release...) in Unmount",
+				})
+			}
+			if line, ok := findLine(f.Body, importJSRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "page-imports-syscall-js", Level: "error",
+					Message: "a page imports syscall/js; the page package is compiled for the server too, where that does not build",
+					Fix:     "use core/dom, which is real under GOOS=js and no-ops everywhere else",
+				})
+			}
+		}
+
+		// The server must never write a signal. Signals are package-level, so
+		// two concurrent requests would be writing one variable — and the
+		// browser's renderer would then read whatever the last request left.
+		if isServer && !inStore {
+			if line, ok := findLine(f.Body, importSignalRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "server-imports-signal", Level: "error",
+					Message: "server code imports core/signal; signals are package-level, so a request handler writing one races every other request",
+					Fix:     "keep request state in ctx (core/state, Config.Data) and mirror into signals only on the browser's store instance",
+				})
+			}
+		}
+
+		// A store package is imported by pages, and pages compile for wasm.
+		// Anything here that only exists on a server takes the whole browser
+		// build down with it — at link time, in a message about a package the
+		// author never mentioned.
+		if inStore {
+			if line, ok := findLine(f.Body, notPortableRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "store-not-portable", Level: "warning",
+					Message: "the store imports a server-only package; this package is compiled into the wasm build through the pages that import it",
+					Fix:     "keep the store to domain types and pure logic — do the I/O in an endpoint and hand the result over as a Snapshot",
+				})
+			}
+			if line, ok := findLine(f.Body, importDBRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "store-not-portable", Level: "warning",
+					Message: "the store imports db; database/sql cannot go into the wasm build the pages produce",
+					Fix:     "load documents in an endpoint and hand the store a Snapshot",
+				})
+			}
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Component references
+//
+// `undefined: components.SettingsShell` is the error this framework produces
+// most, and it is the one it reports worst. templ emits no //line directives,
+// so the compiler names ui_templ.go:412 — a generated file, at a line that
+// exists in no source, after fsroutes and templ generate have both run. The
+// author sees a failure three steps from the `@components.SettingsShell()`
+// they typed.
+//
+// The reference itself is resolvable without a compiler: a .templ file
+// declares its imports, and every package in the module declares its exported
+// names. Doing it here reports the mistake at the line that made it, before
+// anything is generated.
+// ---------------------------------------------------------------------------
+
+// pkgInfo is what one directory declares, from the point of view of somebody
+// calling into it.
+type pkgInfo struct {
+	Path    string         // import path
+	Name    string         // the package clause, which is not always the directory
+	Symbols map[string]int // exported name -> parameter count, or -1 when it cannot be counted
+}
+
+var (
+	// Unexported too: a component used only inside its own package is the
+	// normal case for a layout's nav link, and reporting it would be a rule
+	// that fires on the framework's own documentation site.
+	templDeclRe  = regexp.MustCompile(`(?m)^templ\s+([A-Za-z_]\w*)\s*\(([^)]*)\)`)
+	goFuncDeclRe = regexp.MustCompile(`(?m)^func\s+([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\(([^)]*)\)`)
+	pkgClauseRe  = regexp.MustCompile(`(?m)^package\s+(\w+)`)
+	// A component call: @Name( or @alias.Name(. The leading boundary keeps an
+	// email address in body text from reading as a call.
+	callRe = regexp.MustCompile(`(^|[\s(){}>,;])@([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?\s*\(`)
+)
+
+// indexPackages reads what every directory in the module declares. It is a
+// source scan, not a type check: it has to work on .templ files, which are not
+// Go, and before templ generate has turned them into files that are.
+func indexPackages(root string, files []sourceFile) map[string]*pkgInfo {
+	module := modulePath(root)
+	byDir := map[string]*pkgInfo{}
+
+	for _, f := range files {
+		dir := path.Dir(f.Rel)
+		if dir == "." {
+			dir = ""
+		}
+		info := byDir[dir]
+		if info == nil {
+			importPath := module
+			if dir != "" {
+				importPath = module + "/" + dir
+			}
+			info = &pkgInfo{Path: importPath, Symbols: map[string]int{}}
+			byDir[dir] = info
+		}
+		if info.Name == "" {
+			if m := pkgClauseRe.FindSubmatch(f.Body); m != nil {
+				info.Name = string(m[1])
+			}
+		}
+
+		// Generated files are indexed too. They declare the same names as the
+		// source they came from, and a project mid-pipeline may have only one
+		// of the two on disk — missing a declaration would report a call that
+		// is perfectly correct.
+		if strings.HasSuffix(f.Rel, ".go") {
+			indexGoDecls(f, info.Symbols)
+			continue
+		}
+		for _, m := range templDeclRe.FindAllSubmatch(f.Body, -1) {
+			info.Symbols[string(m[1])] = countParams(string(m[2]))
+		}
+		for _, m := range goFuncDeclRe.FindAllSubmatch(f.Body, -1) {
+			info.Symbols[string(m[1])] = countParams(string(m[2]))
+		}
+	}
+
+	byPath := make(map[string]*pkgInfo, len(byDir))
+	for _, info := range byDir {
+		byPath[info.Path] = info
+	}
+	return byPath
+}
+
+// indexGoDecls uses the parser rather than a regex, because a .go file is
+// real Go: grouped var blocks, generics and methods all have to come out
+// right, and a missed declaration here is a false report on working code.
+func indexGoDecls(f sourceFile, out map[string]int) {
+	file, err := parser.ParseFile(token.NewFileSet(), f.Rel, f.Body, parser.SkipObjectResolution)
+	if err != nil {
+		return // mid-edit, or generated but not yet written: index nothing
+	}
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv != nil {
+				continue // a method is not callable as @Name()
+			}
+			out[d.Name.Name] = fieldCount(d.Type.Params)
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch sp := spec.(type) {
+				case *ast.ValueSpec:
+					for _, n := range sp.Names {
+						// A var may hold a func; its arity is not worth
+						// chasing through the type.
+						out[n.Name] = -1
+					}
+				case *ast.TypeSpec:
+					out[sp.Name.Name] = -1
+				}
+			}
+		}
+	}
+}
+
+func fieldCount(list *ast.FieldList) int {
+	if list == nil {
+		return 0
+	}
+	n := 0
+	for _, f := range list.List {
+		if _, variadic := f.Type.(*ast.Ellipsis); variadic {
+			return -1
+		}
+		if len(f.Names) == 0 {
+			n++
+			continue
+		}
+		n += len(f.Names)
+	}
+	return n
+}
+
+// countParams counts declared parameters. `a, b string, c int` is three: the
+// names are comma-separated whether or not they share a type.
+func countParams(sig string) int {
+	sig = strings.TrimSpace(sig)
+	if sig == "" {
+		return 0
+	}
+	if strings.Contains(sig, "...") {
+		return -1
+	}
+	return len(splitTopLevel(sig))
+}
+
+func lintComponents(root string, files []sourceFile) []Diagnostic {
+	index := indexPackages(root, files)
+	var out []Diagnostic
+
+	for _, f := range files {
+		if !strings.HasSuffix(f.Rel, ".templ") || generatedRe.Match(f.Body) {
+			continue
+		}
+		body := string(f.Body)
+		imports := templImports(body, index)
+		dir := path.Dir(f.Rel)
+		if dir == "." {
+			dir = ""
+		}
+		module := modulePath(root)
+		self := module
+		if dir != "" {
+			self = module + "/" + dir
+		}
+
+		for _, m := range callRe.FindAllStringSubmatchIndex(body, -1) {
+			// Submatch indices: 1 is the leading boundary, 2 is the name or
+			// the alias, 3 is the name when the call is qualified.
+			name := body[m[4]:m[5]]
+			target, qualified := index[self], ""
+			if m[6] >= 0 { // @alias.Name(
+				qualified = name
+				alias := name
+				name = body[m[6]:m[7]]
+				importPath, ok := imports[alias]
+				if !ok {
+					// Not an import: a local variable holding a component,
+					// which is legal and cannot be resolved from here.
+					continue
+				}
+				target, ok = index[importPath]
+				if !ok {
+					continue // outside this module; the compiler owns it
+				}
+				qualified += "." + name
+			} else {
+				qualified = name
+			}
+			if target == nil {
+				continue
+			}
+			line := strings.Count(body[:m[4]], "\n") + 1
+
+			if _, ok := target.Symbols[name]; !ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "unknown-component", Level: "error",
+					Message: fmt.Sprintf("%s is not declared in %s", qualified, target.Path),
+					Fix:     nearest(name, target.Symbols, target.Path, target.Path != self),
+				})
+				continue
+			}
+			// Declared, but not from here. Go's export rule is the case of the
+			// first letter, and templ inherits it.
+			if target.Path != self && !token.IsExported(name) {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "unexported-component", Level: "error",
+					Message: fmt.Sprintf("%s is declared in %s but is not exported", qualified, target.Path),
+					Fix:     "capitalise it at the declaration, or move the caller into that package",
+				})
+				continue
+			}
+
+			want := target.Symbols[name]
+			if want < 0 {
+				continue // variadic, or a value whose arity is not knowable here
+			}
+			got, ok := countArgs(body[m[1]-1:])
+			if !ok || got == want {
+				continue
+			}
+			out = append(out, Diagnostic{
+				File: f.Rel, Line: line, Rule: "component-arity", Level: "error",
+				Message: fmt.Sprintf("%s takes %s, called with %d", qualified, plural(want, "argument"), got),
+				Fix:     "pages take no arguments — everything reaches them through ctx; shared components declare theirs",
+			})
+		}
+	}
+	return out
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, word)
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
+// nearest suggests the declared name closest to the one that was written. A
+// typo and a wrong package look identical in the compiler's message; here the
+// two can be told apart.
+func nearest(name string, symbols map[string]int, importPath string, exportedOnly bool) string {
+	best, bestScore := "", 0
+	for candidate := range symbols {
+		if exportedOnly && !token.IsExported(candidate) {
+			continue
+		}
+		score := commonPrefix(strings.ToLower(candidate), strings.ToLower(name))
+		if score > bestScore && score >= 3 {
+			best, bestScore = candidate, score
+		}
+	}
+	if best != "" {
+		return fmt.Sprintf("did you mean %s.%s?", path.Base(importPath), best)
+	}
+	names := visible(symbols, exportedOnly)
+	if len(names) == 0 {
+		return fmt.Sprintf("%s declares no components — check the import path", importPath)
+	}
+	return fmt.Sprintf("%s declares: %s", importPath, strings.Join(names, ", "))
+}
+
+func commonPrefix(a, b string) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
+}
+
+func visible(symbols map[string]int, exportedOnly bool) []string {
+	out := make([]string, 0, len(symbols))
+	for name := range symbols {
+		if exportedOnly && !token.IsExported(name) {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	if len(out) > 12 {
+		out = append(out[:12], "…")
+	}
+	return out
+}
+
+// templImports reads the import block of a .templ file. templ's import syntax
+// is Go's, but the file around it is not Go, so this cannot go through the
+// parser.
+func templImports(body string, index map[string]*pkgInfo) map[string]string {
+	out := map[string]string{}
+	add := func(alias, importPath string) {
+		if alias == "" {
+			// The default alias is the package clause, not the directory:
+			// client/api may well be `package apiclient`, and guessing from
+			// the path would leave the call unresolved.
+			alias = path.Base(importPath)
+			if info, ok := index[importPath]; ok && info.Name != "" {
+				alias = info.Name
+			}
+		}
+		if alias == "_" || alias == "." {
+			return
+		}
+		out[alias] = importPath
+	}
+	for _, m := range importLineRe.FindAllStringSubmatch(body, -1) {
+		add(strings.TrimSpace(m[1]), m[2])
+	}
+	return out
+}
+
+var importLineRe = regexp.MustCompile(`(?m)^\s*(?:import\s+)?([A-Za-z_]\w*\s+)?"([^"]+)"`)
+
+// countArgs counts the top-level arguments of a call whose opening paren is at
+// s[0]. It tracks nesting and every kind of Go string literal, because an
+// argument may perfectly well contain a comma — a struct literal, a JSON blob,
+// a func literal. When the call does not close, it reports that it could not
+// tell rather than guessing.
+func countArgs(s string) (int, bool) {
+	inner, ok := balanced(s)
+	if !ok {
+		return 0, false
+	}
+	if strings.TrimSpace(inner) == "" {
+		return 0, true
+	}
+	return len(splitTopLevel(inner)), true
+}
+
+// balanced returns the text between s[0] and its matching close paren.
+func balanced(s string) (string, bool) {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				return s[1:i], true
+			}
+		case '"', '\'', '`':
+			j, ok := skipString(s, i)
+			if !ok {
+				return "", false
+			}
+			i = j
+		}
+	}
+	return "", false
+}
+
+func skipString(s string, i int) (int, bool) {
+	quote := s[i]
+	for j := i + 1; j < len(s); j++ {
+		if s[j] == '\\' && quote != '`' {
+			j++
+			continue
+		}
+		if s[j] == quote {
+			return j, true
+		}
+		if s[j] == '\n' && quote != '`' {
+			return 0, false // an unterminated literal: give up rather than guess
+		}
+	}
+	return 0, false
+}
+
+// splitTopLevel splits on commas that are not inside brackets or a string.
+func splitTopLevel(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case '"', '\'', '`':
+			if j, ok := skipString(s, i); ok {
+				i = j
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
+// ---------------------------------------------------------------------------
+// Cost in the wrong place
+//
+// None of these are wrong answers. They are the right answer computed once per
+// row, once per request, or once per keystroke, which is why nothing ever fails
+// and the page is simply slower than it reads. The compiler has no opinion
+// about any of them, so they survive review by looking exactly like working
+// code — because they are working code.
+//
+// Everything here is a warning. A judgement call that fails a build is a rule
+// people delete rather than argue with.
+// ---------------------------------------------------------------------------
+
+func lintPerformance(root string, files []sourceFile) []Diagnostic {
+	var out []Diagnostic
+	for _, f := range files {
+		if generatedRe.Match(f.Body) || strings.HasSuffix(f.Rel, "_test.go") {
+			continue
+		}
+		body := f.Body
+		if strings.HasSuffix(f.Rel, ".templ") {
+			// The lifecycle code that matters most — Mount, repaint, the
+			// handlers they bind — lives in .templ files, next to markup that
+			// is not Go. Blanking the templ blocks leaves the Go, at its
+			// original line numbers.
+			body = goPortion(f.Body)
+		} else if !strings.HasSuffix(f.Rel, ".go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, f.Rel, body, parser.SkipObjectResolution)
+		if err != nil {
+			continue // mid-edit; the compiler will say so more precisely
+		}
+		usesDB := importDBRe.Match(f.Body)
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			fn, ok := n.(*ast.FuncDecl)
+			if !ok {
+				return true
+			}
+			// main and init run once. Everything else may run per request,
+			// per render or per row.
+			once := fn.Recv == nil && (fn.Name.Name == "main" || fn.Name.Name == "init")
+			// A test helper is not a hot path, and a table-driven test is a
+			// loop of deliberate single queries. Reported, it would only teach
+			// people that these rules are noise.
+			if takesTestingT(fn) {
+				return false
+			}
+			at := func(pos token.Pos) int { return fset.Position(pos).Line }
+
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				// A pattern built from a value cannot be hoisted — it is not
+				// known until the call. Only a constant one is the mistake
+				// this rule is about; the dynamic case is caught below, and
+				// only when it is inside a loop.
+				if call, ok := n.(*ast.CallExpr); ok && !once && isRegexpCompile(call) && constantPattern(call) {
+					out = append(out, Diagnostic{
+						File: f.Rel, Line: at(call.Pos()), Rule: "regexp-recompiled", Level: "warning",
+						Message: "this regexp is compiled every time " + fn.Name.Name + " runs; compiling is orders of magnitude dearer than matching",
+						Fix:     "hoist it to a package-level var: var thingRe = regexp.MustCompile(`…`)",
+					})
+				}
+				body, isLoop := loopBody(n)
+				if !isLoop {
+					return true
+				}
+				out = append(out, loopDiagnostics(f.Rel, body, at, usesDB)...)
+				return true
+			})
+			return false // the outer Inspect already reached every function
+		})
+	}
+	return out
+}
+
+// loopDiagnostics reports the things that are only a problem because they are
+// inside a loop.
+func loopDiagnostics(rel string, body *ast.BlockStmt, at func(token.Pos) int, usesDB bool) []Diagnostic {
+	var out []Diagnostic
+	declared := declaredIn(body)
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.DeferStmt:
+			out = append(out, Diagnostic{
+				File: rel, Line: at(node.Pos()), Rule: "defer-in-loop", Level: "warning",
+				Message: "a defer runs when the function returns, not when the iteration ends; these accumulate for the whole loop",
+				Fix:     "close it at the end of the iteration, or move the body into its own function",
+			})
+
+		case *ast.AssignStmt:
+			// A string built by repeated += reallocates and copies everything
+			// written so far, once per iteration. An accumulator declared
+			// inside the loop is not that — it is one short string per row.
+			if node.Tok != token.ADD_ASSIGN || len(node.Lhs) != 1 || !looksLikeString(node.Rhs) {
+				return true
+			}
+			target, ok := node.Lhs[0].(*ast.Ident)
+			if !ok || declared[target.Name] {
+				return true
+			}
+			out = append(out, Diagnostic{
+				File: rel, Line: at(node.Pos()), Rule: "concat-in-loop", Level: "warning",
+				Message: "building a string with += in a loop copies everything written so far on every iteration",
+				Fix:     "use a strings.Builder, or render into the io.Writer you were given",
+			})
+
+		case *ast.CallExpr:
+			switch {
+			case isRegexpCompile(node) && !constantPattern(node):
+				out = append(out, Diagnostic{
+					File: rel, Line: at(node.Pos()), Rule: "regexp-recompiled", Level: "warning",
+					Message: "a regexp built and compiled on every iteration; compiling costs orders of magnitude more than matching",
+					Fix:     "compile it once outside the loop, cache it by the value it varies on, or match without a regexp",
+				})
+			case isHTTPRequest(node):
+				out = append(out, Diagnostic{
+					File: rel, Line: at(node.Pos()), Rule: "request-in-loop", Level: "warning",
+					Message: "one HTTP round trip per iteration; in the browser that is one network latency per item, serially",
+					Fix:     "ask for the whole set in one request, or run them concurrently and collect the results",
+				})
+			case usesDB && isDocumentRead(node):
+				out = append(out, Diagnostic{
+					File: rel, Line: at(node.Pos()), Rule: "query-in-loop", Level: "warning",
+					Message: "one query per iteration — the N+1 the filter grammar exists to avoid",
+					Fix:     `Find(ctx, db.Query{Where: db.In("id", ids)}) once, then index the result by id`,
+				})
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// takesTestingT reports a func that receives *testing.T or *testing.B — a test
+// or a helper for one, wherever it happens to live.
+func takesTestingT(fn *ast.FuncDecl) bool {
+	if fn.Type.Params == nil {
+		return false
+	}
+	for _, param := range fn.Type.Params.List {
+		star, ok := param.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		if sel, ok := star.X.(*ast.SelectorExpr); ok {
+			if x, ok := sel.X.(*ast.Ident); ok && x.Name == "testing" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func loopBody(n ast.Node) (*ast.BlockStmt, bool) {
+	switch loop := n.(type) {
+	case *ast.ForStmt:
+		return loop.Body, true
+	case *ast.RangeStmt:
+		return loop.Body, true
+	}
+	return nil, false
+}
+
+// declaredIn reports the names declared inside this block, so an accumulator
+// that lives for one iteration can be told from one that lives for the loop.
+func declaredIn(body *ast.BlockStmt) map[string]bool {
+	out := map[string]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			if node.Tok == token.DEFINE {
+				for _, lhs := range node.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						out[id.Name] = true
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for _, name := range node.Names {
+				out[name.Name] = true
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// looksLikeString is a heuristic, because this runs without type information.
+// It only has to be right about the shape that matters: text being appended.
+func looksLikeString(rhs []ast.Expr) bool {
+	found := false
+	for _, e := range rhs {
+		ast.Inspect(e, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.BasicLit:
+				if node.Kind == token.STRING {
+					found = true
+				}
+			case *ast.CallExpr:
+				if name, ok := calleeName(node); ok {
+					switch name {
+					case "fmt.Sprintf", "fmt.Sprint", "string", "strconv.Itoa", "strconv.Quote":
+						found = true
+					}
+				}
+			}
+			return !found
+		})
+	}
+	return found
+}
+
+func isRegexpCompile(call *ast.CallExpr) bool {
+	name, ok := calleeName(call)
+	if !ok {
+		return false
+	}
+	switch name {
+	case "regexp.MustCompile", "regexp.Compile", "regexp.MustCompilePOSIX", "regexp.CompilePOSIX":
+		return true
+	}
+	return false
+}
+
+// constantPattern reports whether every part of the pattern is a literal, so
+// the call could be hoisted to a package-level var as it stands.
+func constantPattern(call *ast.CallExpr) bool {
+	if len(call.Args) == 0 {
+		return false
+	}
+	var literal func(ast.Expr) bool
+	literal = func(e ast.Expr) bool {
+		switch node := e.(type) {
+		case *ast.BasicLit:
+			return node.Kind == token.STRING
+		case *ast.BinaryExpr:
+			return node.Op == token.ADD && literal(node.X) && literal(node.Y)
+		}
+		return false
+	}
+	return literal(call.Args[0])
+}
+
+func isHTTPRequest(call *ast.CallExpr) bool {
+	name, ok := calleeName(call)
+	if !ok {
+		return false
+	}
+	switch name {
+	case "http.Get", "http.Post", "http.Head", "http.PostForm":
+		return true
+	}
+	// c.Do(req) on anything: an http.Client is the only thing in ordinary use
+	// with that name and one argument.
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "Do" && len(call.Args) == 1
+}
+
+// isDocumentRead spots a db.Service call by its shape: a method with a name
+// from the small, fixed set the service exposes, taking ctx first. It is only
+// consulted for files that import db at all.
+func isDocumentRead(call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || len(call.Args) == 0 {
+		return false
+	}
+	switch sel.Sel.Name {
+	case "Get", "Find", "Create", "Patch", "PatchFields", "Delete", "Count", "PatchWhere":
+	default:
+		return false
+	}
+	first, ok := call.Args[0].(*ast.Ident)
+	return ok && (first.Name == "ctx" || first.Name == "c")
+}
+
+// calleeName renders pkg.Fn or Fn for a call, and reports false for anything
+// deeper — a chained call is not something these rules match on.
+func calleeName(call *ast.CallExpr) (string, bool) {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name, true
+	case *ast.SelectorExpr:
+		if x, ok := fn.X.(*ast.Ident); ok {
+			return x.Name + "." + fn.Sel.Name, true
+		}
+	}
+	return "", false
+}
+
+// goPortion blanks out every templ, css and script block, leaving the Go
+// declarations around them — the imports, Mount, Unmount, repaint, the helper
+// funcs — at their original line numbers, so a diagnostic still points at the
+// line the author is looking at.
+func goPortion(body []byte) []byte {
+	src := string(body)
+	out := []byte(src)
+	for _, m := range blockStartRe.FindAllStringSubmatchIndex(src, -1) {
+		open := strings.IndexByte(src[m[0]:], '{')
+		if open < 0 {
+			continue
+		}
+		open += m[0]
+		inner, ok := balanced(src[open:])
+		if !ok {
+			continue
+		}
+		blank(out, m[0], open+len(inner)+2)
+	}
+	return out
+}
+
+var blockStartRe = regexp.MustCompile(`(?m)^(templ|css|script)\s+\w+\s*\(`)
+
+// blank replaces a span with spaces, keeping every newline, so byte offsets
+// and line numbers both survive.
+func blank(b []byte, from, to int) {
+	if to > len(b) {
+		to = len(b)
+	}
+	for i := from; i < to; i++ {
+		if b[i] != '\n' {
+			b[i] = ' '
+		}
+	}
+}
+
+// A db collection's Defaults must be on the pointer receiver. On a value
+// receiver it still satisfies the interface — a value method is in the
+// pointer's method set — so the service calls it, it mutates a copy, and the
+// defaults silently never reach storage. Nothing fails; the field is just
+// empty forever.
+//
+// Validate is fine either way: it only reads.
+//
+// This is the one rule that parses instead of matching. A regex cannot tell a
+// declaration from a string literal, and the first thing it flagged was the
+// deliberately-broken fixture inside this package's own tests. go/parser needs
+// no build and no type information, so the constraint that keeps the rest of
+// this file regex-based does not apply.
+func lintCollections(root string, files []sourceFile) []Diagnostic {
+	var out []Diagnostic
+	for _, f := range files {
+		if !strings.HasSuffix(f.Rel, ".go") || !bytes.Contains(f.Body, []byte("db.Doc")) {
+			continue
+		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, f.Rel, f.Body, 0)
+		if err != nil {
+			continue // not our problem; the compiler will say so first
+		}
+
+		documents := map[string]bool{}
+		for _, decl := range parsed.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				for _, field := range st.Fields.List {
+					if len(field.Names) > 0 {
+						continue // named, so not embedded
+					}
+					if sel, ok := field.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "Doc" {
+						if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "db" {
+							documents[ts.Name.Name] = true
+						}
+					}
+				}
+			}
+		}
+		if len(documents) == 0 {
+			continue
+		}
+
+		for _, decl := range parsed.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Name.Name != "Defaults" || fn.Recv == nil || len(fn.Recv.List) != 1 {
+				continue
+			}
+			recv := fn.Recv.List[0]
+			ident, byValue := recv.Type.(*ast.Ident)
+			if !byValue || !documents[ident.Name] {
+				continue
+			}
+			name := "d"
+			if len(recv.Names) > 0 {
+				name = recv.Names[0].Name
+			}
+			out = append(out, Diagnostic{
+				File: f.Rel, Line: fset.Position(fn.Pos()).Line,
+				Rule: "collection-value-receiver", Level: "error",
+				Message: "Defaults is on a value receiver, so it mutates a copy — the service calls it and the defaults are lost",
+				Fix:     "func (" + name + " *" + ident.Name + ") Defaults()",
 			})
 		}
 	}
