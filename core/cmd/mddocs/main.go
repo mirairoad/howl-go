@@ -35,9 +35,11 @@ type doc struct {
 }
 
 var (
-	h1Re    = regexp.MustCompile(`(?m)^#\s+(.+?)\s*$`)
-	orderRe = regexp.MustCompile(`^(\d+)[-_]`)
-	paraRe  = regexp.MustCompile(`(?m)^([A-Za-z\x60*\[].+)$`)
+	h1Re = regexp.MustCompile(`(?m)^#\s+(.+?)\s*$`)
+	// Stripped from a blurb, once per document rather than once per line.
+	markupRe = regexp.MustCompile("[`*]")
+	orderRe  = regexp.MustCompile(`^(\d+)[-_]`)
+	paraRe   = regexp.MustCompile(`(?m)^([A-Za-z\x60*\[].+)$`)
 )
 
 func main() {
@@ -200,7 +202,7 @@ func blurb(src string) string {
 			continue
 		}
 		if paraRe.MatchString(line) {
-			line = regexp.MustCompile("[`*]").ReplaceAllString(line, "")
+			line = markupRe.ReplaceAllString(line, "")
 			if len(line) > 160 {
 				line = line[:157] + "…"
 			}

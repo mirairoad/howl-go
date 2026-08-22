@@ -370,3 +370,87 @@ func TestUnknownHashedFileIs404(t *testing.T) {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
+
+func TestARenderedPageIsNeverReusedWithoutAsking(t *testing.T) {
+	// A response with no Cache-Control, no Expires and no Last-Modified is
+	// eligible for heuristic caching, and browsers take that offer. Because
+	// assets are content-hashed and immutable, a stale document keeps pointing
+	// at the exact assets it was built with — so the whole application stays
+	// coherently one version behind an update until somebody hard-reloads.
+	a := New(Config{
+		Shell: shell,
+		Routes: []router.Route{{
+			Pattern: "/", Label: "Home",
+			Page: func() templ.Component { return templ.Raw("<p>hello</p>") },
+		}},
+	})
+
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		partial(httptest.NewRequest(http.MethodGet, "/", nil)),
+	} {
+		response := httptest.NewRecorder()
+		a.Mux().ServeHTTP(response, request)
+		if got := response.Header().Get("Cache-Control"); got != "private, no-cache" {
+			t.Fatalf("partial=%q served Cache-Control %q",
+				request.Header.Get("X-Partial"), got)
+		}
+	}
+}
+
+func partial(r *http.Request) *http.Request {
+	r.Header.Set("X-Partial", "1")
+	return r
+}
+
+// The shell publishes per-route data endpoints, so the client can fetch the
+// payload for the route it is about to render instead of one blob for the app.
+func TestClientConfigCarriesPerRouteData(t *testing.T) {
+	rt := router.Route{
+		Pattern: "/dashboard/metrics",
+		Label:   "Metrics",
+		Client:  true,
+		Data:    "/api/metrics",
+		Page:    func() templ.Component { return text("<p>m</p>") },
+	}
+	var got router.Client
+	a := New(Config{
+		Routes: []router.Route{rt},
+		Shell:  shell,
+		Data: func(ctx context.Context, _ string) context.Context {
+			got = router.ClientConfig(ctx)
+			return ctx
+		},
+		ClientData: "/api/app",
+		Public:     fstest.MapFS{},
+	})
+	get(a.Mux(), "/dashboard/metrics", nil)
+
+	if got.Pages["/dashboard/metrics"] != "/api/metrics" {
+		t.Errorf("Pages = %v", got.Pages)
+	}
+	// The shared endpoint stays as the fallback for routes that name none.
+	if got.Data != "/api/app" {
+		t.Errorf("Data = %q, want the fallback to survive", got.Data)
+	}
+}
+
+// Parameters come from the mux, which already matched the pattern to get here.
+// Re-deriving them was the O(routes) scan this replaced, so the thing worth
+// testing is that the values still arrive.
+func TestParamsComeFromTheMux(t *testing.T) {
+	rt := router.Route{
+		Pattern: "/blog/{article_id}/c/{n}",
+		Label:   "Post",
+		Page: func() templ.Component {
+			return comp(func(ctx context.Context, w io.Writer) error {
+				_, err := io.WriteString(w, router.Param(ctx, "article_id")+"|"+router.Param(ctx, "n"))
+				return err
+			})
+		},
+	}
+	rec := get(testApp(rt).Mux(), "/blog/fs-routing/c/7", nil)
+	if !strings.Contains(rec.Body.String(), "fs-routing|7") {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}

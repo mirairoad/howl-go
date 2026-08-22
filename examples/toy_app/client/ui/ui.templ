@@ -5,6 +5,7 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mirairoad/howl-go/core/router"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
@@ -78,14 +79,19 @@ func DeltaText(d float64) string {
 	return fmt.Sprintf("▼ %.1f%%", -d)
 }
 
+// Commas groups digits for display. It runs once per row of the metrics
+// table, so it writes into a builder sized up front rather than growing a
+// string by += — which reallocates and copies everything written so far, once
+// per digit.
 func Commas(n int) string {
 	s := fmt.Sprint(n)
-	out := ""
+	var b strings.Builder
+	b.Grow(len(s) + len(s)/3)
 	for i, c := range s {
 		if i > 0 && (len(s)-i)%3 == 0 {
-			out += ","
+			b.WriteByte(',')
 		}
-		out += string(c)
+		b.WriteRune(c)
 	}
-	return out
+	return b.String()
 }

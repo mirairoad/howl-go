@@ -42,36 +42,40 @@ templ Page() {
 // were thrown away, and every visit adds another one.
 // ---------------------------------------------------------------------------
 
-var stopEffect, stopWatch func()
+// release holds everything Mount registered; rows holds the per-row listeners,
+// which are re-bound on every repaint and so are released separately. Both are
+// func() — a signal's stop func and a listener's release func are the same
+// shape, which is what lets Unmount treat them alike.
+var release, rows []func()
 
 func Mount() {
 	root := dom.Root()
 
 	// Any handler can reach the browser's store directly — it is a
 	// package-level instance, not something threaded through a component tree.
-	root.Query("[data-add]").On("click", func() {
+	release = append(release, root.Query("[data-add]").On("click", func() {
 		mutate(store.Op{Kind: "add", Text: "added from a Go click handler"})
-	})
-	root.Query("[data-todo-form]").On("submit", func() {
+	}))
+	release = append(release, root.Query("[data-todo-form]").On("submit", func() {
 		text := strings.TrimSpace(root.Query("[data-todo-input]").Value())
 		if text == "" {
 			return
 		}
 		mutate(store.Op{Kind: "add", Text: text})
 		root.Query("[data-todo-input]").SetValue("")
-	})
+	}))
 
 	// repaint reads store.Todos inside itself, so the effect discovers that
 	// dependency by running — there is no list of values to declare. This is the
 	// difference from useEffect(fn, [deps]): reads here are observable, so the
 	// dependency list cannot be wrong.
-	stopEffect = signal.Effect(repaint)
+	release = append(release, signal.Effect(repaint))
 
 	// A watcher on one derived value. Fires only on a transition, with both
 	// values — and not on the initial run.
-	stopWatch = signal.Watch(store.TodoCount.Get, func(now, before int) {
+	release = append(release, signal.Watch(store.TodoCount.Get, func(now, before int) {
 		dom.Log("[todos] count changed", before, "->", now)
-	})
+	}))
 
 	// Hydrate from the server, then render from the local store.
 	go func() {
@@ -88,14 +92,13 @@ func Mount() {
 }
 
 func Unmount() {
-	// Every reactive registration made in Mount is released here. An effect that
-	// outlives its DOM keeps firing against nodes that were thrown away.
-	for _, stop := range []func(){stopEffect, stopWatch} {
-		if stop != nil {
-			stop()
-		}
-	}
-	stopEffect, stopWatch = nil, nil
+	// Every registration made in Mount is released here — effects, watchers and
+	// DOM listeners alike. An effect that outlives its DOM keeps firing against
+	// nodes that were thrown away, and a listener's js.Func stays alive on the
+	// JS side until it is released, so both leak once per visit otherwise.
+	dom.Off(rows...)
+	dom.Off(release...)
+	rows, release = nil, nil
 	dom.Log("[todos] unmounted")
 }
 
@@ -129,14 +132,20 @@ func repaint() {
 	root.Query("[data-todo-count]").SetText(countText(len(items)))
 	root.Query("[data-watchers]").SetText("computed count: " + itoa(store.TodoCount.Get()))
 
-	// Delete buttons are re-created on every repaint, so rebind each time.
+	// Delete buttons are re-created on every repaint, so rebind each time —
+	// and release the previous batch first. SetHTML threw those elements away,
+	// but a js.Func is held alive from the JS side until it is released, so
+	// skipping this leaks one closure per row per repaint for the life of the
+	// tab. It is the one leak that grows while the user simply uses the page.
+	dom.Off(rows...)
+	rows = rows[:0]
 	for _, btn := range root.QueryAll("[data-del]") {
 		id := btn.Attr("data-del")
-		btn.On("click", func() {
+		rows = append(rows, btn.On("click", func() {
 			n, err := strconv.Atoi(id)
 			if err == nil {
 				mutate(store.Op{Kind: "del", ID: n})
 			}
-		})
+		}))
 	}
 }

@@ -120,3 +120,17 @@ A bar appears only after 500 ms. One that flashes on every fast navigation reads
 Prefetching moves *when* you pay, not whether. The server still renders the HTML, so a route nobody hovered still costs a round-trip, and changed data costs another.
 
 Marking a route `.client` ships the renderer instead. See [Rendering](/docs/rendering).
+
+## Head merging, and the flash it avoids
+
+A fragment carries its page's head in an inert `<template data-head>`. The shell's own tags were marked once at boot, so page tags swap without touching them.
+
+The order matters more than it looks. The obvious sequence — remove the old page's tags, add the new ones, swap the body — paints the incoming markup *before* its stylesheet has loaded and *after* the outgoing one was thrown away. For one or more frames the new content wears no page CSS at all, which reads as "the content is instant but the layout arrives late". The navigation being fast is what makes it visible.
+
+So the incoming stylesheets are loaded first, with the outgoing page still on screen and still styled, and only then is the old head removed and the body swapped:
+
+1. Parse the incoming head; separate `<link rel="stylesheet">` from everything else.
+2. Append the stylesheets and wait for `load` — capped at 300 ms, so a broken one degrades to the old behaviour instead of hanging.
+3. Remove the previous page's head, apply the rest, swap `#outlet`, set the title. One visual step.
+
+A page with no stylesheet of its own — most pages — skips steps 2 and 3's wait entirely and the swap stays synchronous. And because a prefetched fragment already carries its head, hover-prefetch also issues a `<link rel="preload" as="style">` for anything it finds, so by click time the wait is usually already over.

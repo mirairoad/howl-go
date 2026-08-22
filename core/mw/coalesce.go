@@ -107,6 +107,14 @@ func shareable(r *http.Request) bool {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
+	// An event stream has no end to buffer up to. The recorder below holds a
+	// response until the handler returns, so coalescing one means the browser
+	// sees nothing until the stream closes — which for SSE is never. The
+	// framework ships app.SSE, so this is a case it has to know about rather
+	// than a caller's problem to work around.
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		return false
+	}
 	return r.Header.Get("Cookie") == "" && r.Header.Get("Authorization") == ""
 }
 

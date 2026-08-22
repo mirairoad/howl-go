@@ -91,8 +91,53 @@ function patternMatches(pattern, path) {
   return a.every((seg, i) => (seg.startsWith("{") && seg.endsWith("}")) || seg === b[i]);
 }
 let wasmPromise = null;
-let appData = null; // JSON string handed to the renderer; "{}" when unused
 let wasmReady = false;
+
+// Client data, one entry per endpoint rather than one blob for the whole app.
+// A route names its own with `//howl:data`; anything that does not falls back
+// to CONFIG.data, which is what every route shared before this existed.
+const DATA = new Map(); // endpoint URL -> Promise<JSON string>
+
+// The endpoint for a concrete path. CONFIG.pages is keyed by route pattern, so
+// a dynamic route resolves through the same matcher the wasm candidate check
+// uses — /blog/hello finds the entry filed under /blog/{article_id}.
+function dataURLFor(route) {
+  if (CONFIG.pages) {
+    for (const pattern in CONFIG.pages) {
+      if (patternMatches(pattern, route)) return CONFIG.pages[pattern];
+    }
+  }
+  return CONFIG.data || "";
+}
+
+// fetchData caches the promise, not the result, so N concurrent renders of the
+// same route share one request. A failure is not cached: the entry is dropped
+// so the next navigation retries, and the renderer is handed "{}" rather than
+// being taken down — a page that needs data decides for itself what empty means.
+function fetchData(url) {
+  if (!url) return Promise.resolve("{}");
+  let p = DATA.get(url);
+  if (!p) {
+    p = fetch(url, { credentials: "same-origin" })
+      .then((r) => r.json())
+      .then((v) => JSON.stringify(v))
+      .catch((e) => {
+        console.warn("howl: client data unavailable:", url, e);
+        DATA.delete(url);
+        return "{}";
+      });
+    DATA.set(url, p);
+  }
+  return p;
+}
+
+// warmData starts a route's data fetch without waiting for it — hover and
+// focus fire well before the click, so the render usually finds it resolved.
+const warmData = (url) => {
+  if (wasmCandidate(url)) fetchData(dataURLFor(canonical(url)));
+};
+
+const canonical = (u) => (u.length > 1 && u.endsWith("/") ? u.slice(0, -1) : u);
 
 function loadWasm() {
   if (wasmPromise) return wasmPromise;
@@ -113,17 +158,10 @@ function loadWasm() {
     go.run(instance); // never resolves (Go main blocks on select{}) — do not await
     if (typeof howlRender !== "function") throw new Error("howlRender missing");
     // Data is optional. A site whose client routes render from their own
-    // markup (the docs site) publishes no endpoint, and a failed fetch must
-    // not take the renderer down with it — a page that needs data can decide
-    // for itself what an empty payload means.
-    appData = "{}";
-    if (CONFIG.data) {
-      try {
-        appData = JSON.stringify(await fetch(CONFIG.data).then((r) => r.json()));
-      } catch (e) {
-        console.warn("howl: client data unavailable:", CONFIG.data, e);
-      }
-    }
+    // markup (the docs site) publishes no endpoint at all. The shared fallback
+    // is warmed here because it was always fetched at this point; per-route
+    // endpoints are fetched when their route is first wanted.
+    if (CONFIG.data) await fetchData(CONFIG.data);
     wasmReady = true;
     return performance.now() - t0;
   })().catch((e) => {
@@ -137,10 +175,12 @@ function loadWasm() {
 // Warm the renderer as soon as the user is anywhere near the app section.
 const wasmCandidate = (u) => WASM_ROUTES.some((p) => patternMatches(p, u));
 
-function renderLocally(url) {
+async function renderLocally(url) {
   if (!wasmReady || typeof howlRender !== "function") return null;
-  const route = url.length > 1 && url.endsWith("/") ? url.slice(0, -1) : url;
-  const html = howlRender(route, appData);
+  const route = canonical(url);
+  // Awaited, but normally already resolved: hover, focus and touchstart all
+  // warm it, and the same endpoint is fetched once however many routes share it.
+  const html = howlRender(route, await fetchData(dataURLFor(route)));
   if (!html) return null; // unknown route — let the server answer (it 404s)
   // The wasm build returns the same <template data-head> prefix the server
   // sends, so head merging works identically on both paths.
@@ -171,12 +211,38 @@ const CACHE = new Map(); // url -> {html, title}
 const INFLIGHT = new Map();
 const FRESH_MS = 15000;
 
+// Stylesheets already asked for, by href — a preload is pointless twice and a
+// second <link rel=preload> for a sheet the document already has is noise in
+// the network panel.
+const WARMED = new Set();
+
+// A prefetched fragment carries its page's head, so its stylesheet can be
+// fetched now rather than at swap time. Hover fires 200-800ms before the click;
+// that is the whole budget the swap would otherwise have to wait out.
+function warmStyles(html) {
+  const head = splitHead(html).head;
+  if (!head) return;
+  const tpl = document.createElement("template");
+  tpl.innerHTML = head;
+  for (const node of tpl.content.querySelectorAll('link[rel="stylesheet"][href]')) {
+    const href = node.getAttribute("href");
+    if (WARMED.has(href)) continue;
+    WARMED.add(href);
+    const pre = document.createElement("link");
+    pre.rel = "preload";
+    pre.as = "style";
+    pre.href = href;
+    document.head.appendChild(pre);
+  }
+}
+
 function prefetch(url) {
   if (CACHE.has(url) || INFLIGHT.has(url)) return INFLIGHT.get(url);
   const p = fetch(url, { headers: { "X-Partial": "1" }, credentials: "same-origin" })
     .then(async (res) => {
       const entry = { html: await res.text(), title: headerTitle(res), at: performance.now() };
       CACHE.set(url, entry);
+      warmStyles(entry.html);
       return entry;
     })
     .catch(() => null)
@@ -234,6 +300,7 @@ function scheduleIntent(el, url) {
   hoverEl = el;
   hoverTimer = setTimeout(() => {
     hoverTimer = null;
+    warmData(url);
     prefetch(url);
   }, PREFETCH_DELAY);
 }
@@ -268,6 +335,7 @@ for (const ev of ["focusin", "pointerdown", "touchstart"]) {
     const t = intentTarget(e);
     if (t) {
       cancelIntent();
+      warmData(t.url);
       prefetch(t.url);
     }
   }, { passive: true });
@@ -376,21 +444,75 @@ function splitHead(html) {
   return m ? { head: m[1], body: html.slice(m[0].length) } : { head: "", body: html };
 }
 
-function applyHead(html) {
-  for (const el of document.head.querySelectorAll("[data-page-head]")) el.remove();
-  if (!html) return;
+// A page's head is applied in two steps, and the split is the whole point.
+//
+// Doing it in one — remove the old tags, add the new ones, swap the body on the
+// next line — paints the incoming markup before its stylesheet has loaded, and
+// after the outgoing one has been thrown away. The result is a frame of one
+// page's DOM wearing another page's styles: the content is instant and the
+// layout arrives late, which reads as the navigation being slow when in fact it
+// was too fast.
+//
+// So: load the incoming stylesheets first, with the outgoing page still on
+// screen and still styled, and only then remove the old head and swap. Nothing
+// is ever painted unstyled, and a page with no stylesheet of its own — most
+// pages — takes no extra frame at all, because preloadHead returns null and the
+// swap stays synchronous.
+let headGeneration = 0;
+
+// A stylesheet that never answers must not strand the navigation. 300ms is
+// longer than a cache hit (~0ms) and than a warm CDN, and short enough that a
+// broken one degrades to the old flash rather than to a hang.
+const HEAD_TIMEOUT = 300;
+
+function parseHead(html) {
+  const gen = String(++headGeneration);
+  const out = { gen, title: null, blocking: [], rest: [] };
+  if (!html) return out;
   const tpl = document.createElement("template");
   tpl.innerHTML = html;
   for (const node of [...tpl.content.children]) {
     // <title> is set as a property, never appended: a second title element in
     // the document is ignored by the browser, which keeps the first.
     if (node.tagName === "TITLE") {
-      document.title = node.textContent;
+      out.title = node.textContent;
       continue;
     }
-    node.setAttribute("data-page-head", "");
-    document.head.appendChild(node);
+    node.setAttribute("data-page-head", gen);
+    const blocks = node.tagName === "LINK" && node.rel === "stylesheet";
+    (blocks ? out.blocking : out.rest).push(node);
   }
+  return out;
+}
+
+// Appends the incoming stylesheets and resolves when they have loaded. Returns
+// null when there is nothing to wait for, so the caller can stay synchronous.
+function preloadHead(incoming) {
+  if (!incoming.blocking.length) return null;
+  const loaded = incoming.blocking.map(
+    (node) =>
+      new Promise((done) => {
+        node.addEventListener("load", done, { once: true });
+        node.addEventListener("error", done, { once: true }); // a 404 must not block the nav
+        document.head.appendChild(node);
+      }),
+  );
+  return Promise.race([
+    Promise.all(loaded),
+    new Promise((r) => setTimeout(r, HEAD_TIMEOUT)),
+  ]);
+}
+
+// Removes the outgoing page's head and applies the rest of the incoming one.
+// Called in the same turn as the body swap, so the two are one visual step.
+function commitHead(incoming) {
+  for (const el of document.head.querySelectorAll("[data-page-head]")) {
+    // Anything not from this navigation: the previous page's tags, and the
+    // server-rendered ones marked at boot with an empty value.
+    if (el.getAttribute("data-page-head") !== incoming.gen) el.remove();
+  }
+  for (const node of incoming.rest) document.head.appendChild(node);
+  if (incoming.title !== null) document.title = incoming.title;
 }
 
 // ---------------------------------------------------------------------------
@@ -491,18 +613,36 @@ function applyFragment(url, entry, push, restore, transition, replace) {
   // silently leave the old DOM on screen — so always have a fallback path, and
   // guard against running the swap twice.
   let done = false;
+  // Waiting on a stylesheet is the one thing here that yields, so a newer
+  // navigation can start mid-swap. It must not then be overwritten by this one.
+  const mine = seq;
 
-  const swap = () => {
+  const swap = async () => {
     if (done) return;
     done = true;
+
+    const { head, body } = splitHead(entry.html);
+    const incoming = parseHead(head);
+    // Load the incoming page's stylesheets while the outgoing page is still on
+    // screen and still styled. Null — no stylesheet of its own — keeps this
+    // whole function synchronous, which is the common case.
+    const ready = preloadHead(incoming);
+    if (ready) {
+      await ready;
+      if (seq !== mine) return; // a newer navigation won while we waited
+    }
+
     // Tear the outgoing page down before its DOM disappears.
     runUnmount(outlet.dataset.route);
-    const { head, body } = splitHead(entry.html);
-    applyHead(head);
+    commitHead(incoming);
     outlet.innerHTML = body;
     outlet.dataset.route = new URL(url, location.origin).pathname;
     hydrate(outlet);
     runMount(outlet.dataset.route);
+    // Again, now that the incoming markup exists: the first call updated the
+    // links that survive a navigation, this one updates the links that arrived
+    // with the fragment.
+    markActive();
     // Must happen AFTER the content exists: startViewTransition defers this
     // callback, so scrolling outside it targets the old, possibly shorter DOM
     // and the browser clamps the offset to 0.
@@ -510,6 +650,8 @@ function applyFragment(url, entry, push, restore, transition, replace) {
   };
   runTransition(transition, swap);
   if (entry.title && !/<title/i.test(entry.html)) document.title = entry.title;
+  // Immediately, on the links outside #outlet: the nav should light up the
+  // moment the URL changes, not when the content lands.
   markActive();
 }
 
@@ -520,7 +662,8 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
   // Local render: the component runs in the browser. Zero bytes, zero RTT, and
   // unlike the prefetch cache this works for routes never visited before.
   if (wasmCandidate(url)) {
-    const local = renderLocally(url);
+    const local = await renderLocally(url);
+    if (seq !== mine) return; // a newer navigation won the race
     if (local) {
       applyFragment(url, local, push, restore, transition, replace);
       navLog && (navLog.textContent =
@@ -532,6 +675,7 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
     // keyboard user, a programmatic howl.navigate() and a touch tap all arrive
     // here without a pointerover ever having fired.
     loadWasm();
+    warmData(url);
   }
 
   // Cache hit: render now, no network on the critical path.

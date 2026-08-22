@@ -50,7 +50,7 @@ A store holding a slice needs `WithEq`, or re-hydrating identical data wakes eve
 
 Re-running an effect detaches all of its previous dependencies first. Without that, a conditional branch that stops reading a signal keeps a permanent subscription to it.
 
-Always pair `Effect`/`Watch` in `Mount` with their `stop` in `Unmount`. See [Lifecycle](/docs/lifecycle).
+Always pair `Effect`/`Watch` in `Mount` with their `stop` in `Unmount` — and `dom.On` with its release func, which is the same `func()` shape, so one slice and one `dom.Off(release...)` handles both. See [Lifecycle](/docs/lifecycle).
 
 ## Server safety
 
@@ -63,3 +63,38 @@ func (s *Store) publish() {
 	}
 }
 ```
+
+`howl check` reports server code that imports `core/signal` at all, because the mistake is invisible until it is concurrent: one request writes, another renders, and the bug arrives as one user seeing another's data under load.
+
+## Which mechanism
+
+Signals are the heaviest of the three ways to make something change on screen, and reaching for them by default is the most common mess. Decide by what the state *is*:
+
+| the state is | use | cost |
+|---|---|---|
+| nothing — a form that posts and re-renders | `<form method="post">` and an endpoint | 0 |
+| local to one widget, JS-shaped (dropdown, filter, sort) | an island | a few lines of vanilla |
+| domain state the server also owns, mutated by the user | a `.client` page + a store + signals | the wasm binary, 1.71 MB gzipped |
+
+The third one earns its cost when the *same rules* have to run on both sides, and you would otherwise write them twice.
+
+## The shape
+
+A store is two files because it is two rules:
+
+```
+client/store/todos.go          domain — compiles for the server AND for GOOS=js
+client/store/todos_client.go   signals — package-level, therefore browser-only
+```
+
+The domain half holds the types, the mutation methods, `Snapshot` (the wire format), `Op` (one mutation) and the `WithTodos`/`TodosFrom` context pair the server render reads. Nothing server-shaped may enter it — `net/http`, `database/sql`, `os` — because pages import it and pages compile to wasm. `howl check` reports it if something does.
+
+Then three wires, in the order they run:
+
+1. **SSR** — `Config.Data` puts the data on the context, the page renders from `store.TodosFrom(ctx)`. This is the first paint, and it needs no JavaScript.
+2. **Hydrate** — `Mount` fetches a `Snapshot` through the generated typed client and calls `Restore`, which publishes to the signal.
+3. **Local** — a mutation calls `Apply(op)`, which publishes, which wakes the effect, which re-renders the same templ component the server used.
+
+The one rule that fails silently: **read through the signal, not the store**. `store.Todos.Get()` registers the effect as a dependent; `store.TodosClient().List()` returns the same data, subscribes to nothing, and the page simply stops updating.
+
+Both files, and a page already wired to them, come out of `howl_scaffold` — `kind: "store"`, then `kind: "page"` with `client: true, store: "todos"`. See [Lifecycle](/docs/lifecycle) for the `Mount`/`Unmount` pair it writes.

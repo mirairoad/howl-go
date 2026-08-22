@@ -69,16 +69,25 @@ So the renderer itself was shipped: `GOOS=js GOARCH=wasm` compiles the **same**
 | steady-state render | **0.08 ms** |
 | bytes per navigation | **0** |
 | works for never-visited routes | **yes** (a prefetch cache cannot) |
-| `views.wasm` | 5.6 MB raw, **1.63 MB gzipped** |
+| `views.wasm` | 6.1 MB raw, **1.71 MB gzipped** |
 
-**The cost is the payload** — ~33× a comparable React bundle. Go's runtime and
-GC ship whether used or not. Fine behind a login on desktop; not for a public
-page on mobile data. Lazy-loaded only for routes that need it.
+**The cost is the payload** — 18× React's client runtime and 45× Vue's, both
+measured, before either has shipped a line of application code: React 19.2
+production is 99.2 kB gzipped (`react` 4.4 + `react-dom-client` 94.7), Vue 3.5's
+runtime is 40.0 kB. Go's runtime and GC ship whether used or not. Fine behind a
+login on desktop; not for a public page on mobile data. Lazy-loaded only for
+routes that need it.
+
+Figures for `views.wasm` are `examples/toy_app` compressed at
+`gzip.BestCompression` — the level `core/app/static.go` actually serves at, so
+it is the number a browser downloads rather than a number about compression.
+Worth re-measuring when the example grows: it read 5.6 MB / 1.63 MB when this
+was first written, and neither figure was updated by the changes that moved it.
 
 Untested: TinyGo, which usually lands Go/wasm at 200–800 KB. Whether templ's
 generated code survives its reflection limits is the open question.
 
-Also: `net/http` does not compress by default. Uncompressed this ships 5.6 MB,
+Also: `net/http` does not compress by default. Uncompressed this ships 6.1 MB,
 so `gzipStatic` is not optional at this size.
 
 ---
@@ -491,7 +500,7 @@ runtime to set a status would drag `net/http` into the wasm build.
 ### Static: compress once, not per request
 
 `GzipStatic` wrapped `http.FileServer` and gzipped **on every request**. At
-5.6 MB of wasm that is a core per download — and with no ETag, nothing ever
+6.1 MB of wasm that is a core per download — and with no ETag, nothing ever
 answered 304. Replaced by a handler that reads each file once, keeps the raw and
 gzipped bytes with a content ETag, and hands them to `http.ServeContent`, which
 does conditional requests and ranges for free.
@@ -691,7 +700,7 @@ an empty list, the client was told there was nothing to load, and the binary was
 never fetched by anything. Dead weight on every build.
 
 The fix was to delete the target, not to opt the site in. A public documentation
-site is precisely the case §3's payload argument rules out: 1.63 MB gzipped to
+site is precisely the case §3's payload argument rules out: 1.71 MB gzipped to
 save a round-trip that prefetch-on-intent already reduces to 0.3 ms. The AOT
 renderer is demonstrated by `examples/toy_app`, which is behind no such
 constraint — measured there as `wasm render → /dashboard/metrics · 0 bytes ·
@@ -711,21 +720,348 @@ is the entire response, for embeds and print views.
 
 ---
 
-## 14. Open questions
+## 14. The document store
 
-- **TinyGo** — would it bring 1.63 MB gzipped down to the 200–800 KB range, and
+A port of the TypeScript `@hushkey/service-core` + `@hushkey/pg-service` pair:
+a document store with an audit envelope, soft delete by default, optimistic
+locking, and no migration framework. It lives in `db/`, not `core/`, and
+nothing in the framework imports it — the non-goal it amends said "no ORM", and
+it still holds: there are no relations, no table mapping and no codegen.
+
+### The struct is the schema, so zod has no counterpart
+
+The TypeScript service needs a validator because its types are gone at run
+time; something has to check the write boundary. In Go `encoding/json` already
+enforces the shape, and the two things zod adds beyond it are defaults and
+invariants. Those became two optional methods:
+
+```go
+func (u *User) Defaults()       // on create, before validation
+func (u *User) Validate() error // on create and every patch -> db.ErrInvalid
+```
+
+`Validate() error` is the method `core/api` already calls on a request body, so
+a type that is both a stored document and an endpoint body validates once, in
+one implementation. This is the same trade the endpoint layer made, and it is
+the reason both layers are smaller here than in the original.
+
+### The envelope is embedded, not wrapped
+
+`Record[T]{Data: T}` would have been the obvious Go shape, and it is wrong
+twice: the stored JSON grows a `data` key that the TypeScript services do not
+write, and every field access grows a `.Data`. Embedding `db.Doc` keeps the
+JSON flat, keeps `u.ID` and `u.Email` side by side, and lets a document be an
+`api.Spec` response type with no conversion.
+
+It costs a generic pair — `Service[T any, PT Document[T]]` — because mutating
+the envelope needs the pointer. Constraint type inference fills `PT` in from
+the `*T` term, so the call site is `pg.New[User](…)` and never
+`pg.New[User, *User](…)`. `Document`'s method is unexported, which means the
+only way to satisfy it is to embed `Doc`: a collection type cannot accidentally
+opt out of the envelope the service assumes is there.
+
+### `Patch` takes a closure, and it is better than `Partial<T>`
+
+Go has no partial struct, and the obvious workarounds are both bad: a
+`map[string]any` of field names throws away the compiler, and a second
+`UserPatch` type has to be maintained beside the first.
+
+The closure falls out of what the operation already is. Validating a whole
+document means reading it first, so the caller may as well be handed the value
+that was read:
+
+```go
+u, err := Users.Patch(ctx, id, func(u *User) { u.Name = "Ada L." })
+```
+
+Field names are checked, the write is locked to the version that was read, and
+a lost race re-runs the closure against the *fresh* document instead of
+replaying a stale delta — which is the bug a partial-struct API cannot avoid,
+because by then the delta is all it has. The cost is that the closure may run
+more than once, which is documented and is the reason it must stay a pure edit.
+
+What is written is the diff between the document read and the document
+produced, as dotted paths, so `Patch` is not a whole-document overwrite: two
+writers touching different fields of the same sub-document do not clobber each
+other.
+
+### The backend interface has no type parameter
+
+Documents cross the storage boundary as JSON, so `db.Backend` is not generic:
+one `pg.Backend` serves every collection in the process instead of one
+instantiation per Go type. The generics stop at the service, where they are
+buying something — the typed closure, the typed return.
+
+This is the one place the port is *simpler* than the original rather than
+equivalent, and it came from Go's constraints, not in spite of them.
+
+### Deep-set, and the removal it cannot express
+
+Updates go through a recursive `howl_jsonb_deep_set` because plain `jsonb_set`
+does not create missing intermediate objects: a patch to `profile.plan` on a
+document written before `profile` existed is silently dropped. A lost write,
+and one that only appears on old rows.
+
+Deep-set has the mirror problem — it cannot remove a key — so `UpdateOptions`
+carries an explicit `Unset []string` alongside the paths. Without it a field a
+patch cleared would keep its stored value forever, and the schema report would
+never come clean.
+
+The diff only unsets a top-level key the *struct still declares*. A stored key
+outside that set is an orphan from an older version of the type, and an
+ordinary patch must leave it alone; only `DropField` removes those, on purpose.
+
+### The report is exact, not sampled
+
+The TypeScript service samples fifty documents and infers which fields are
+missing. Postgres can answer the real question in one grouped query over
+`jsonb_object_keys`, so `db.KeyCounter` is an optional backend capability and
+the report says which kind of answer it gave. It matters because the report is
+what you press "backfill" against.
+
+### The driver stays out of go.mod
+
+`db/pg` talks to an interface `*sql.DB` and `*sql.Tx` both satisfy, so the
+application brings pgx or lib/pq and the framework's `go.mod` keeps its single
+dependency. A test dependency would have quietly made that untrue, so the live
+Postgres conformance run is its own module in `db/pg/livetest`.
+
+`$in` binds one parameter per value rather than `= ANY($1::text[])` for the
+same reason: an array bind needs a driver that encodes Go slices, and there is
+no driver here to lean on.
+
+### One suite, two backends
+
+`db/memdb` evaluates the same filter grammar over a map. It is a test double,
+but the reason it exists is `db/conformance`: a contract described in prose
+drifts, because the first implementation defines what the words meant and the
+second implements what it read. Both backends run the same 24 cases, and the
+Postgres module runs them three times — plain, cached, and with the filtered
+paths promoted to columns, since promoting must change which index is used and
+no answer at all.
+
+### What Go cannot do here
+
+Projection cannot return a partial struct. An unselected field comes back as
+its zero value, indistinguishable from a stored empty one. The mitigation is
+the rule the TypeScript service also has for a different reason: a projected
+document is never written to its by-id cache key, because half a document must
+not be served to a later `Get`.
+
+---
+
+## 15. Teaching the browser half
+
+The server half of this framework is guessable from its types. The browser half
+is not, and the evidence was in what people — and agents — produced with it: an
+endpoint, a page, a `db` collection all came out right, and anything reactive
+came out shaped like React. A signal read through the store instead of the
+signal. `Mount` with no `Unmount`. State parked in a page package where a second
+page could never reach it.
+
+That is not a documentation failure in the ordinary sense. `www/docs/05` has
+been correct the whole time. It is that the two surfaces an agent actually
+touches — `howl_conventions` and `howl_scaffold` — described the *API* and
+generated the *markup*, and the shape lives in neither. `signal.Effect(fn)` on
+its own implies nothing about which file it belongs in, which pointer may write
+it, or what releases it. The example app had all of that, correct and commented,
+where only somebody already reading the example would find it.
+
+So the shape became three things instead of prose:
+
+**A recipe, not an API list.** "Making a page interactive" in `llms.txt` opens
+with a table that talks people *out* of signals — a form is 0 bytes, an island
+is a few lines of vanilla, and the wasm renderer is 1.71 MB gzipped. Then the
+store split, the three wires (SSR → hydrate → local), and the `Mount`/`Unmount`
+contract. Every rule in it is stated with the silent failure it prevents,
+because none of them fail loudly.
+
+**A scaffold that writes the wiring.** `kind: "store"` emits two files, and the
+split *is* the lesson: `todos.go` compiles for the server and for wasm, and
+`todos_client.go` holds the package-level signals with `publish` gated on the
+browser's own instance. A page scaffolded with `client: true, store: "todos"`
+comes out with the effect bound to a variable `Unmount` can reach, the repaint
+reading through the signal, and the hydrate call written out. The previous
+version emitted an `<h1>` — which was, for a `.client` route, everything except
+the part that is the point.
+
+**Rules, so the mess is reported and not inherited.** `check` now catches a
+`Mount` that subscribes with no `Unmount`, a `signal.Effect` whose stop func is
+discarded, server code importing `core/signal` at all, and a store importing
+something that cannot compile for wasm. The precision matters: a `Mount` that
+only reads — the metrics page logs a row count and fetches once — is fine, and a
+rule that fires on correct code is a rule people switch off.
+
+The same argument reached one more rule, from a different direction. templ
+generates no `//line` directives, so `undefined: components.SettingsShell`
+arrives as `settings_templ.go:412` — a file the author never wrote, at a line
+that exists in no source, after two generators have run. But the reference is
+resolvable without a compiler: a `.templ` file declares its imports, and every
+package in the module declares its names. `check` now indexes both and reports
+the unknown component, the wrong argument count and the unexported one at the
+line that was typed, with a did-you-mean. The precision work was all in what it
+must *not* say: an unexported component used inside its own package is the
+normal case, `@r.Component()` on a local value reads exactly like a qualified
+call and cannot be resolved, and an argument list contains commas — inside
+struct literals, JSON blobs and func literals — so counting them naively
+reports working code.
+
+The last group came from the same complaint one step further on: not code that
+fails, but code that works and costs too much. A regexp compiled per call
+instead of once at package level, a string grown with `+=` per row, an HTTP
+request or a `db.Get` per iteration, a `defer` inside a loop. The compiler has
+no opinion about any of them, so they survive review by looking exactly like
+working code — because they are.
+
+Two things made these worth having. The first is that they reach `.templ`
+files, which is where `Mount` and `repaint` live: blanking the `templ`, `css`
+and `script` blocks with spaces, newlines kept, leaves Go that parses at its
+original line numbers. The second is that they are warnings. A judgement call
+that fails a build is a rule people delete rather than argue with.
+
+Calibrating them against this repo is the part worth recording, because four of
+the six first hits taught the rule something. `regexp.MustCompile` in `mddocs`
+was real and got hoisted. `Commas` in the toy app grew a string per digit in a
+function that runs per table row; it uses a `strings.Builder` now. The other
+two were the rule being wrong: `fsroutes` declares its accumulator *inside* the
+loop, which is one short string per iteration and not a quadratic append, and
+the `db` conformance suite is a table-driven test whose loop of single queries
+is the entire point. Those became exclusions — a target declared in the loop
+body, and any function taking a `*testing.T`. A rule compiling a pattern from
+`regexp.QuoteMeta(item)` survived a third way: a pattern built from a value
+cannot be hoisted, so "hoist it" is advice the author cannot take, and the rule
+now only says it about a constant one.
+
+The measurements that prompted the sweep found nothing to fix on the server. A
+simple page renders in 1.5 µs and 2 kB; a 200-row table in 16 µs and 23 kB;
+over a real socket both disappear into ~62 µs of loopback. The one thing worth
+knowing is that per-request context assembly is O(routes) — `router.Lookup`
+re-scans the table the mux already matched, and `NeedsWasm` rebuilds a constant
+slice — so a 128-route site pays 12 µs and 282 allocations before rendering
+anything. It is the largest server-side number in the framework and it is still
+smaller than one loopback RTT, which is why it stayed a note rather than a
+change.
+
+---
+
+## 16. Three ceilings, removed
+
+Benchmarking the render path to answer "is the server fast" turned up something
+the benchmark was not looking for: the server was fast, and getting slower with
+every route added. Context assembly was O(routes) — `router.Lookup` re-scanning
+a table the mux had already matched, and `NeedsWasm` rebuilding a constant slice
+— so at 128 routes a request spent 11.4 µs and 282 allocations before a byte of
+page existed, 89% of the whole request. Both halves are constant per process.
+`NeedsWasm` now runs once in `New`, and parameters come from `r.PathValue`,
+which is the same data the mux parsed to dispatch. Context assembly is flat at
+~930 ns and 18 allocations from 4 routes to 128, and a static route allocates no
+parameter map at all.
+
+The lesson is narrow and worth keeping: the cost was invisible because it scaled
+with the *table*, not with the request. Nothing an individual page did made it
+worse, so no page-level profiling would ever have found it.
+
+`dom.On` was the opposite kind of bug — known, documented, and left alone with a
+comment saying listeners live as long as their element. That is true of the DOM
+listener and false of the `js.Func` behind it: a `js.Func` is held alive from the
+JS side until `Release`, and if the handle is dropped nothing can ever reach it.
+Pages mount on every client-side navigation, and the todo page's `repaint`
+re-binds a delete button per row on every mutation, so "one leak per call" was
+one per row per repaint, for the life of the tab. `On` now returns its release
+func, and `dom.Off(release...)` takes a slice of them — which composes with
+signals for free, because a stop func and a release func are both `func()`. The
+signature change is source-compatible: Go lets a caller ignore a single return
+value, so a listener that genuinely should outlive the page still reads the same.
+`howl check` warns when the handle is discarded inside a page.
+
+Per-route client data was the real design gap. `ClientData` was one endpoint,
+fetched once, handed to every client route and unmarshalled as one type — fine
+for the toy app, where every client route wanted the same metrics, and unusable
+for anything with two client routes that want different things. The fix follows
+the grain the rest of the framework already has: a `//howl:data /api/metrics`
+directive on the page file, read by `fsroutes` into `Route.Data`, published as
+`router.Client.Pages` keyed by pattern. Nothing is written down twice, and the
+generated table stays the only source of truth.
+
+Two details in the client were not obvious. The lookup has to go through the
+same pattern matcher `wasmCandidate` uses, because `Pages` is keyed by pattern
+and a navigation arrives with a concrete path — an object lookup would resolve
+`/blog/{article_id}` for nothing. And the cache holds the *promise*, not the
+result, so several routes naming one endpoint share a single request and a
+concurrent second render does not start a second fetch. A failed fetch drops its
+entry rather than caching the failure, and hands the renderer `{}` instead of
+taking it down: a page that needs data decides for itself what empty means.
+
+`renderLocally` became async as a result, which needed the staleness guard the
+rest of `navigate` already had — `if (seq !== mine) return` — or a slow data
+fetch could apply its fragment after a newer navigation had already won.
+
+Deliberately not fixed: `.client` still gates rendering rather than bundling, so
+every page's components link into one `views.wasm`. That is the trade the SPA
+feel is bought with, and it stays.
+
+## The flash that looked like slowness
+
+Reported as "the page is instantaneous but the layout is the old one for a bit",
+which is the kind of description worth taking literally: both halves were true,
+and the second was caused by the first.
+
+`applyHead` removed the outgoing page's tags, appended the incoming ones, and
+returned — and the very next line was `outlet.innerHTML = body`. A
+`<link rel="stylesheet">` does not load synchronously. So the new markup was
+painted after the old page's CSS had been removed and before the new page's had
+arrived: one or more frames of the incoming DOM wearing neither page's styles.
+The faster the swap, the wider that window looks, because there is nothing else
+on screen to explain the delay.
+
+The fix is only an ordering change, but the order is the whole thing. Load the
+incoming stylesheets *first*, while the outgoing page is still on screen and
+still styled; then remove the old head, apply the rest and swap the body as one
+step. Nothing is painted unstyled at any point. Three details make it safe:
+
+- **The common case must not pay.** A page with no stylesheet of its own gets
+  `null` back from `preloadHead` and the swap never awaits, so it stays exactly
+  as synchronous as before. Only pages that actually bring CSS wait for it.
+- **A stylesheet that never answers must not strand the navigation.** The wait
+  is raced against a 300 ms timeout, which is longer than a cache hit and long
+  enough for a warm CDN; past that it degrades to the old flash rather than to a
+  hang.
+- **Waiting introduces a race.** The swap now yields, so a newer navigation can
+  start mid-wait; it re-checks `seq` before committing, the same guard the rest
+  of `navigate` already used.
+
+Removal moved to a generation counter rather than a bare attribute, because the
+incoming tags are in the document *before* the outgoing ones come out — the two
+sets have to be told apart. Server-rendered head tags marked at boot carry an
+empty value, which is not the current generation, so they are removed correctly
+on the first navigation.
+
+Prefetch now also warms the sheet: a prefetched fragment already carries its
+head, so hovering a link issues a `<link rel="preload" as="style">` for anything
+it finds. Hover fires 200-800 ms before the click, which is the entire budget
+the swap would otherwise have to wait out.
+
+Verified by booting the real `app.js` in jsdom and driving `applyFragment`
+through a navigation: the outgoing stylesheet is still present and the body is
+still the old one after the call returns, both change together once `load`
+fires, a page with no stylesheet swaps synchronously, and a sheet that never
+answers swaps anyway at the timeout. That test is not checked in — jsdom is a
+Node dependency, and "no Node dependency" is a stated non-goal of this
+framework.
+
+---
+
+## 17. Open questions
+
+- **TinyGo** — would it bring 1.71 MB gzipped down to the 200–800 KB range, and
   does templ's generated code survive its reflection limits?
-- **Per-route wasm tables.** `.client` currently gates *rendering*, not
-  *bundling*: every page's components are linked into `views.wasm` because the
-  one table references them all. Emitting a wasm-only table containing just the
-  `.client` routes would let the linker drop the rest.
-- **Per-route data.** The wasm renderer receives one blob (`/api/metrics`) and
-  unmarshals it as one type, so a client route needing different data has no
-  mechanism.
-- **`dom.On` never releases its `js.Func`** — one leaked closure per listener
-  per mount.
-- **A typed endpoint layer.** howl's `defineApi` — method, roles, validated
-  query/body/responses, generated OpenAPI — has no equivalent here; API routes
-  are hand-written `mux.HandleFunc`. Go's types are real at runtime, so the
-  reflection half is easier than in TypeScript; the file-crawl half has to be
-  codegen, like `fsroutes`, since there is no dynamic import.
+- **Per-route wasm tables.** `.client` gates *rendering*, not *bundling*: every
+  page's components link into `views.wasm` because the one table references them
+  all. A wasm-only table containing just the `.client` routes would let the
+  linker drop the rest. Currently a deliberate no: one binary is what makes any
+  client route instant once loaded, and splitting it trades that for a download
+  per route group. Revisit if the binary outgrows the routes that need it.
+(Answered since: the typed endpoint layer, which was an open question here until
+`core/api` and `core/cmd/fsapis` shipped it — method, roles, validated
+query/body/responses, OpenAPI built from the registered table, and a generated
+typed client. §13.)

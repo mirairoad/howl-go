@@ -60,7 +60,7 @@ type endpoint struct {
 }
 
 var (
-	pkgRe    = regexp.MustCompile(`(?m)^package\s+([A-Za-z_]\w*)`)
+	pkgRe = regexp.MustCompile(`(?m)^package\s+([A-Za-z_]\w*)`)
 	// Greedy up to the last "]" before the literal's "{": a type argument can
 	// itself contain brackets — []telemetry.Event is the common case, and a
 	// lazy match stops inside it and captures a truncated type.

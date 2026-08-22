@@ -82,6 +82,13 @@ type App struct {
 	cfg    Config
 	mounts []mount
 	static *Static
+	// client is everything the shell publishes that cannot change between
+	// requests. Derived from the route table, which is generated at build time
+	// and never mutated afterwards.
+	client router.Client
+	// params maps a route pattern to the names of its {placeholders}, so a
+	// request reads them from the mux instead of re-matching the table.
+	params map[string][]string
 }
 
 type mount struct {
@@ -108,6 +115,13 @@ func New(cfg Config) *App {
 	if cfg.PublicDir != "" {
 		public = os.DirFS(cfg.PublicDir)
 	}
+	params := map[string][]string{}
+	for _, rt := range cfg.Routes {
+		if names := paramNames(rt.Pattern); len(names) > 0 {
+			params[rt.Pattern] = names
+		}
+	}
+
 	return &App{
 		cfg: cfg,
 		static: &Static{
@@ -116,6 +130,13 @@ func New(cfg Config) *App {
 			Immutable: cfg.StaticImmutable,
 			Reload:    cfg.Dev || cfg.PublicDir != "",
 		},
+		client: router.Client{
+			Wasm:  router.NeedsWasm(cfg.Routes),
+			Data:  cfg.ClientData,
+			Pages: router.PageData(cfg.Routes),
+			Live:  liveEndpoint(),
+		},
+		params: params,
 	}
 }
 
@@ -143,20 +164,27 @@ func Canonical(p string) string {
 	return p
 }
 
-func (a *App) context(ctx context.Context, path string) context.Context {
+// context assembles what every render reads. Everything here that does not
+// change between requests is computed once in New: this used to re-scan the
+// whole route table twice per request — once in NeedsWasm to rebuild a constant
+// slice, once in Lookup to find a route the mux had already matched — which at
+// 128 routes was 11.4µs and 282 allocations before a byte of page existed.
+//
+// params comes from the caller because the mux already extracted it. Re-deriving
+// it here is the O(routes) scan, and it produced exactly what r.PathValue has.
+func (a *App) context(ctx context.Context, path string, params map[string]string) context.Context {
 	ctx = router.WithRoutes(ctx, a.cfg.Routes)
 	ctx = router.WithCurrent(ctx, path)
-	if _, params, ok := router.Lookup(a.cfg.Routes, path); ok {
+	if len(params) > 0 {
 		ctx = router.WithParams(ctx, params)
 	}
 	ctx = router.WithAssets(ctx, a.asset)
-	client := router.Client{
-		Wasm: router.NeedsWasm(a.cfg.Routes),
-		Data: a.cfg.ClientData,
-		Live: liveEndpoint(),
-	}
-	// Only when something actually needs the renderer: publishing these on a
-	// server-rendered-only site would hash two files nobody downloads.
+
+	client := a.client
+	// The hashed names are resolved per request, not cached with the rest:
+	// under Dev/PublicDir the file may change between requests, and the whole
+	// point of a content-hashed URL is that it tracks the file. It is a map
+	// lookup, not a scan.
 	if len(client.Wasm) > 0 {
 		client.Binary = a.asset("views.wasm")
 		client.Exec = a.asset("wasm_exec.js")
@@ -166,6 +194,38 @@ func (a *App) context(ctx context.Context, path string) context.Context {
 		ctx = a.cfg.Data(ctx, path)
 	}
 	return ctx
+}
+
+// pathValues reads this route's parameters back out of the request. The mux
+// matched the pattern to get here, so the values are already parsed; the names
+// were extracted once at New.
+func (a *App) pathValues(pattern string, r *http.Request) map[string]string {
+	names := a.params[pattern]
+	if len(names) == 0 {
+		return nil // a static route allocates nothing
+	}
+	out := make(map[string]string, len(names))
+	for _, n := range names {
+		out[n] = r.PathValue(n)
+	}
+	return out
+}
+
+// paramNames pulls {these} out of a pattern, once, at startup.
+func paramNames(pattern string) []string {
+	var out []string
+	for {
+		open := strings.IndexByte(pattern, '{')
+		if open < 0 {
+			return out
+		}
+		close := strings.IndexByte(pattern[open:], '}')
+		if close < 0 {
+			return out
+		}
+		out = append(out, pattern[open+1:open+close])
+		pattern = pattern[open+close:]
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +260,7 @@ func (a *App) Render(w http.ResponseWriter, r *http.Request, rt router.Route, c 
 // when a component fails, and a Content-Length.
 func (a *App) render(w http.ResponseWriter, r *http.Request, rt router.Route, c templ.Component, status int) {
 	// A component may change this while it renders — see router.NotFound.
-	ctx := router.WithStatus(a.context(r.Context(), Canonical(r.URL.Path)), status)
+	ctx := router.WithStatus(a.context(r.Context(), Canonical(r.URL.Path), a.pathValues(rt.Pattern, r)), status)
 
 	body := getBuf()
 	defer bufPool.Put(body)
@@ -211,6 +271,22 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, rt router.Route, c 
 	title, head := rt.HeadParts(ctx, rt.Label)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// A rendered page is never reused without asking.
+	//
+	// Without this a response carrying no Cache-Control, no Expires and no
+	// Last-Modified is eligible for heuristic caching, and browsers take that
+	// offer. The failure it produces is the confusing kind rather than the
+	// obvious kind: assets are content-hashed and immutable, so a stale
+	// document keeps pointing at the exact assets it was built with, and the
+	// whole application stays coherently one version behind until somebody
+	// thinks to hard-reload. Everything works; it is just yesterday.
+	//
+	// `no-cache` rather than `no-store`: the browser may keep the bytes, it
+	// simply has to revalidate, so an unchanged page still costs a 304 rather
+	// than a re-render. `private` because a rendered page is somebody's — a
+	// shared cache holding one signed-in person's dashboard is the other half
+	// of this bug.
+	w.Header().Set("Cache-Control", "private, no-cache")
 
 	// SPA navigation: the page plus its layouts, without the document shell.
 	// A fragment has no <head>, so the page's head travels with it in an inert
@@ -419,7 +495,7 @@ func (a *App) Export(dir string) error {
 		if err != nil {
 			return err
 		}
-		ctx := a.context(context.Background(), rt.Pattern)
+		ctx := a.context(context.Background(), rt.Pattern, nil)
 		title, head := rt.HeadParts(ctx, rt.Label)
 		if rt.Raw {
 			err = rt.Component().Render(ctx, f)

@@ -126,7 +126,12 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 			"serverInfo":      map[string]any{"name": "howl-go", "version": "dev"},
 			"instructions": "Tools for working in a howl-go project. Call howl_conventions before writing " +
 				"routing, page or endpoint code — the file-naming rules cannot be guessed, because Go rejects " +
-				"the conventions every JS framework uses. Call howl_check after editing.",
+				"the conventions every JS framework uses. Before writing anything that updates in the browser, " +
+				"call howl_conventions with section=\"Making a page interactive\": there are no hooks, no " +
+				"re-render and no dependency array here, so a page written from JS habits compiles and then " +
+				"silently never updates. Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
+				"collection by hand — it writes the wiring that has no analogue elsewhere. Call howl_check " +
+				"after editing.",
 		}, nil
 
 	case "ping":
@@ -176,16 +181,25 @@ func str(description string) map[string]any {
 
 func tools() []tool {
 	dirProp := map[string]any{"dir": str("project root; defaults to the directory the server was started in")}
+	// Naming the sections is most of the value: an agent that does not know
+	// "Making a page interactive" exists asks for the signal API instead, and
+	// the API on its own implies none of the shape a reactive page needs.
+	sections := "Mental model, Packages, Application layout, Bootstrap a new app, Routing conventions, " +
+		"Page anatomy, core/router API, core/app API, core/mw, Logging, core/state, core/signal, " +
+		"Browser: core/dom and window.howl, Making a page interactive, The wasm renderer, Endpoints, " +
+		"The document store (db), Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
 	return []tool{
 		{
 			Name:  "howl_conventions",
 			Title: "howl-go conventions",
 			Description: "The framework's conventions in one file (llms.txt): routing and file-name modifiers, " +
-				"page anatomy, the shell contract, the package layering rule, the endpoint layer, and an explicit " +
-				"list of things not to invent. Read this before writing howl-go code — Go rejects _layout.templ " +
-				"and [id].templ, so the answers here look different from every JS framework on purpose.",
+				"page anatomy, the shell contract, the package layering rule, the endpoint layer, how a page is " +
+				"made reactive, and an explicit list of things not to invent. Read this before writing howl-go " +
+				"code — Go rejects _layout.templ and [id].templ, and there are no hooks and no re-render, so the " +
+				"answers here look different from every JS framework on purpose. Sections: " + sections,
 			InputSchema: object(map[string]any{
-				"section": str("optional heading to return on its own, e.g. \"Routing conventions\""),
+				"section": str("optional heading to return on its own, e.g. \"Routing conventions\" or " +
+					"\"Making a page interactive\". One of: " + sections),
 			}),
 		},
 		{
@@ -194,7 +208,16 @@ func tools() []tool {
 			Description: "Run the framework's conventions against the project and return structured diagnostics: " +
 				"pages importing core/app, `templ Mount()`, a shell missing #outlet or the page-head markers, " +
 				"endpoints reading the raw query instead of their declared one, roles declared with no Authorize " +
-				"wired, hand-edited generated files. Optionally also runs go generate/build/vet.",
+				"wired, hand-edited generated files — plus the browser-side rules that all fail silently: a Mount " +
+				"that subscribes with no Unmount, a discarded effect stop func, server code importing core/signal, " +
+				"a store that cannot compile for wasm. It also resolves every @pkg.Component() reference against " +
+				"what that package declares, so `undefined: components.SettingsShell`, a wrong argument count and " +
+				"an unexported component are reported at the .templ line that caused them instead of at a " +
+				"generated file the author never wrote. Warnings cover cost put in the wrong place, which the " +
+				"compiler has no opinion about: a regexp compiled per call, a string built with += in a loop, " +
+				"an HTTP request or a db query per iteration, a defer inside a loop. Run it after editing any " +
+				".templ file — it is far faster than the generate/build round trip and points at the source. " +
+				"Optionally also runs go generate/build/vet.",
 			InputSchema: object(map[string]any{
 				"dir":   dirProp["dir"],
 				"build": map[string]any{"type": "boolean", "description": "also run go generate, go build and go vet (slower)"},
@@ -217,20 +240,32 @@ func tools() []tool {
 		},
 		{
 			Name:  "howl_scaffold",
-			Title: "Scaffold a page or an endpoint",
-			Description: "Create a page or an endpoint file with the correct name, location and shape. The file name " +
-				"carries the behaviour in this framework, so a scaffold is the difference between a route that exists " +
-				"and a build error. Refuses to overwrite.",
+			Title: "Scaffold a page, an endpoint or a collection",
+			Description: "Create a page, an endpoint, a reactive store or a db collection with the correct name, " +
+				"location and shape. The file name carries the behaviour in this framework, so a scaffold is the " +
+				"difference between a route that exists and a build error; for a collection it is the envelope " +
+				"embedding and the pointer receiver Defaults silently needs; for a store and a client page it is " +
+				"the whole reactive shape — which half compiles for wasm, which signals are package-level, and the " +
+				"Mount/Unmount pair whose absence leaks one live effect per visit. To make a page reactive: " +
+				"scaffold kind=\"store\" first, then kind=\"page\" with client=true and store=<that name>, and the " +
+				"page comes out wired to it. Refuses to overwrite.",
 			InputSchema: object(map[string]any{
-				"dir":  dirProp["dir"],
-				"kind": map[string]any{"type": "string", "enum": []string{"page", "endpoint"}, "description": "what to create"},
-				"path": str("the URL this should serve, e.g. /reports or /blog/{id} or /api/reports"),
-				"name": str("display name; the page label or the endpoint's Name"),
+				"dir": dirProp["dir"],
+				"kind": map[string]any{"type": "string", "enum": []string{"page", "endpoint", "store", "collection"},
+					"description": "what to create; \"store\" is the browser-side reactive store (domain + signals), " +
+						"\"collection\" is a db document type"},
+				"path": str("the URL this should serve, e.g. /reports or /blog/{id} or /api/reports; ignored for a collection"),
+				"name": str("display name; the page label, the endpoint's Name, or the collection/table name (e.g. users)"),
 				"method": map[string]any{"type": "string", "enum": []string{"GET", "POST", "PUT", "PATCH", "DELETE"},
 					"description": "endpoint only; defaults to GET"},
-				"client": map[string]any{"type": "boolean", "description": "page only: also render it in the browser (.client)"},
-				"roles":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "endpoint only: role strings your Authorize will interpret"},
-			}, "kind", "path"),
+				"client": map[string]any{"type": "boolean", "description": "page only: also render it in the browser (.client), " +
+					"with Mount, Unmount, an auto-tracked effect and its release"},
+				"store": str("page only: the store this page renders, e.g. todos — wires the signal, the repaint and the " +
+					"hydrate call to client/store/<name>.go. Scaffold the store first."),
+				"roles": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "endpoint only: role strings your Authorize will interpret"},
+				"fields": map[string]any{"type": "array", "items": map[string]any{"type": "string"},
+					"description": `store and collection only: fields as "name:type", e.g. ["email:string","seats:int64"]`},
+			}, "kind"),
 		},
 	}
 }
@@ -246,6 +281,8 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 		Method  string   `json:"method"`
 		Client  bool     `json:"client"`
 		Roles   []string `json:"roles"`
+		Store   string   `json:"store"`
+		Fields  []string `json:"fields"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -271,7 +308,10 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 	case "howl_endpoints":
 		return asJSON(readEndpoints(dir))
 	case "howl_scaffold":
-		return scaffold(dir, args.Kind, args.Path, args.Name, args.Method, args.Client, args.Roles)
+		return scaffold(dir, request{
+			Kind: args.Kind, Path: args.Path, Name: args.Name, Method: args.Method,
+			Store: args.Store, Client: args.Client, Roles: args.Roles, Fields: args.Fields,
+		})
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
 }
