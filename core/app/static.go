@@ -20,8 +20,8 @@ import (
 // you: an ETag, a Cache-Control, and a compressed copy.
 //
 // Compression happens once per file and is kept, which is the difference that
-// matters at this scale. A 5.6 MB wasm binary gzipped on every request burns a
-// core per download; gzipped once it costs 1.63 MB of memory and nothing per
+// matters at this scale. A 6.1 MB wasm binary gzipped on every request burns a
+// core per download; gzipped once it costs 1.71 MB of memory and nothing per
 // request. That is also why this holds files in memory: the FS is normally an
 // embed.FS, so the bytes are in the binary already.
 type Static struct {

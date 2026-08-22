@@ -125,7 +125,7 @@ Three signals decide, cheapest first: `Sec-Fetch-Site`, then `Origin`, then `Ref
 
 `/static/` is served by `app.Static`, which adds the three things `http.FileServer` leaves to you: an ETag, a `Cache-Control`, and a compressed copy.
 
-Compression happens **once per file** and is kept. That is the difference that matters here: a 5.6 MB wasm binary gzipped per request burns a core per download; gzipped once it costs 1.63 MB of memory and nothing per request.
+Compression happens **once per file** and is kept. That is the difference that matters here: a 6.1 MB wasm binary gzipped per request burns a core per download; gzipped once it costs 1.71 MB of memory and nothing per request.
 
 | config | effect |
 |---|---|

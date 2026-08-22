@@ -25,6 +25,13 @@ core/                 the framework
   cmd/fsroutes/       directory tree -> generated route table
   cmd/mddocs/         Markdown -> templ pages
 
+db/                   optional document store — nothing in core/ imports it
+  doc.go              the envelope: id (UUIDv7), version, audit + soft delete
+  service.go          the contract: validation, locking, soft delete, cache
+  pg/                 Postgres backend: JSONB + promoted generated columns
+  memdb/              the same contract over a map — the test double
+  conformance/        one behavioural suite, run by every backend
+
 examples/toy_app/     kitchen sink: dashboard, blog, local-first todos
 www/                  the documentation site
   docs/*.md           the documentation source
@@ -79,7 +86,7 @@ no dev-mode code: the dev server configures it through `HOWL_ADDR`,
 Per app: `make -C examples/toy_app slow` adds `LATENCY=240ms` to every request,
 which is roughly Sydney to us-east-1 — the whole point of the wasm renderer.
 `make -C www static` writes every route to `www/dist`. The docs site builds no
-wasm binary: no route there is `.client`, and 1.63 MB gzipped is the wrong
+wasm binary: no route there is `.client`, and 1.71 MB gzipped is the wrong
 trade for a public content site whose navigation prefetch already makes
 instant. `examples/toy_app` is where the browser renderer runs.
 
@@ -130,14 +137,16 @@ Each app's `Makefile` runs the same three steps: generate the route table,
 | [Constraints](www/docs/07-constraints.md) | what the Go toolchain refuses |
 | [HTTP layer](www/docs/08-http.md) | middleware, static, status, errors, state |
 | [Dev server](www/docs/09-dev.md) | watch, rebuild, restart, live reload |
+| [Document store](www/docs/10-database.md) | `db` — collections as structs, no migrations |
 
 [DESIGN-LOG.md](DESIGN-LOG.md) records how this was arrived at — the React
 detour and why it was deleted, every measurement, and the bugs worth remembering.
 
 `howl check` enforces what this file describes rather than describing it —
-a page importing `core/app`, `templ Mount()`, a shell missing `#outlet`, an
-endpoint reading the raw query it declared a type for, roles with no `Authorize`
-wired. `howl mcp` serves the same checks plus the route and endpoint tables as
+a page importing `core/app` or `db`, `templ Mount()`, a shell missing `#outlet`,
+an endpoint reading the raw query it declared a type for, roles with no
+`Authorize` wired, a collection whose `Defaults` is on a value receiver and so
+silently mutates a copy. `howl mcp` serves the same checks plus the route and endpoint tables as
 MCP tools over stdio, configured by the `.mcp.json` in this repo, so an agent
 can ask instead of guessing.
 
@@ -249,8 +258,8 @@ the application:
   error page rather than a truncated document when a render fails halfway, and a
   `Content-Length`.
 - **Static files are compressed once and kept**, with an ETag per representation
-  and `304` on revalidation. Gzipping a 5.6 MB wasm binary per request burns a
-  core per download; gzipping it once costs 1.63 MB of memory and nothing per
+  and `304` on revalidation. Gzipping a 6.1 MB wasm binary per request burns a
+  core per download; gzipping it once costs 1.71 MB of memory and nothing per
   request.
 - **`Coalesce` shares one render across identical concurrent requests** and
   refuses to share four things that would be bugs: non-GET, requests with
@@ -330,7 +339,7 @@ So it is lazy-loaded only for users heading into a route that needs it.
 Untested next step: TinyGo, which usually lands Go/wasm at 200–800 KB; whether
 templ's generated code survives its reflection limits is the open question.
 
-`net/http` does not compress by default — uncompressed this ships 5.6 MB, so
+`net/http` does not compress by default — uncompressed this ships 6.1 MB, so
 `gzipStatic` in `main.go` is not optional at this size.
 
 ### The store runs in the browser too (`/todos`)
@@ -388,4 +397,4 @@ Navigation is solved. The remaining limits are structural:
   if a page ever needs the store, the shared types must move to their own
   package or you get a cycle.
 - Splitting `client/pages` into subpackages will not shrink the wasm — the Go
-  linker already drops unused code; the 5.6 MB is runtime and GC.
+  linker already drops unused code; the 6.1 MB is runtime and GC.

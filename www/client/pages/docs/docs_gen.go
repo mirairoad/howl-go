@@ -16,4 +16,5 @@ var Index = []Entry{
 	{Slug: "constraints", Title: "Toolchain constraints", Blurb: "Several conventions from JavaScript frameworks cannot be ported to Go. These were verified, not assumed, and they explain why howl-go's naming looks the way …"},
 	{Slug: "http", Title: "The HTTP layer", Blurb: "Everything between the socket and a component: middleware, static files, status codes, errors, sub-applications, request state."},
 	{Slug: "dev", Title: "The dev server", Blurb: "go run github.com/mirairoad/howl-go/core/cmd/howl dev"},
+	{Slug: "database", Title: "The document store", Blurb: "db is optional and separate from the framework: a document store with an audit envelope, soft delete, optimistic locking and no migration framework. A collec…"},
 }

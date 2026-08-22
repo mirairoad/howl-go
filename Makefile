@@ -1,11 +1,27 @@
-.PHONY: all core sync-llms toy www hello dev-toy dev-www clean
+.PHONY: all core db test test-db-pg sync-llms toy www hello dev-toy dev-www clean
 
 APPS := examples/toy_app www
 
-all: core toy www
+all: core db toy www
 
 core: sync-llms
 	go build ./core/...
+
+# The document store is optional and imported by nothing in core/, so it
+# builds and tests on its own.
+db:
+	go build ./db/...
+
+test:
+	go test ./core/... ./db/...
+
+# The live Postgres conformance run. Its driver lives in a nested module so
+# the framework's go.mod keeps its single dependency.
+#
+#   docker run -d --name howl-conf-pg -p 54329:5432 \
+#     -e POSTGRES_PASSWORD=conf -e POSTGRES_DB=howl_conformance postgres:16-alpine
+test-db-pg:
+	cd db/pg/livetest && PG_URL=$${PG_URL:-postgres://postgres:conf@localhost:54329/howl_conformance} go test ./...
 
 # llms.txt is the source of truth at the repo root. `howl mcp` embeds a copy so
 # the conventions tool answers the same way from a downloaded module as from a

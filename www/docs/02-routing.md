@@ -79,3 +79,16 @@ When the filesystem cannot express what you need:
 //howl:route /custom/path
 templ Page() { … }
 ```
+
+## Giving a client route its own data
+
+A `.client` route can name the endpoint it renders from, instead of sharing one payload with every other client route:
+
+```go
+//howl:data /api/metrics
+templ Page() { … }
+```
+
+The browser fetches it before rendering that route and hands the body to the renderer, so a renderer may decode a different type per route. A route that declares none falls back to `Config.ClientData`. Endpoints are fetched once and cached, so several routes naming the same URL cost one request.
+
+Directives attach to the file, not to a Go symbol, which is why several routes can share a package.
