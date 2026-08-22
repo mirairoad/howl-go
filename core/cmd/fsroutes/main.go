@@ -67,6 +67,14 @@ import (
 	"strings"
 )
 
+// directive returns the single capture of a //howl: comment, or "".
+func directive(re *regexp.Regexp, src []byte) string {
+	if m := re.FindSubmatch(src); m != nil {
+		return string(m[1])
+	}
+	return ""
+}
+
 type route struct {
 	Pattern   string
 	Label     string
@@ -74,6 +82,7 @@ type route struct {
 	Mount     bool
 	Unmount   bool
 	Client    bool
+	Data      string // //howl:data — this route's own client-data endpoint
 	Bare      bool   // no layout chain
 	Raw       bool   // no layout chain, no document shell
 	File      string // relative to pagesDir, for logging
@@ -94,6 +103,10 @@ var (
 	// share one package without colliding.
 	navRe   = regexp.MustCompile(`(?m)^//howl:nav\s*$`)
 	routeRe = regexp.MustCompile(`(?m)^//howl:route\s+(\S+)\s*$`)
+	// A `.client` route's own data endpoint. Without it every browser-rendered
+	// route shares one payload, which is only workable while they all want the
+	// same thing.
+	dataRe = regexp.MustCompile(`(?m)^//howl:data\s+(\S+)\s*$`)
 )
 
 const (
@@ -215,6 +228,7 @@ func crawl(pagesDir, modulePath string) ([]route, string, error) {
 			Mount:     mountRe.Match(src),
 			Unmount:   unmountRe.Match(src),
 			Client:    mods["client"],
+			Data:      directive(dataRe, src),
 			Bare:      mods["bare"] || mods["raw"],
 			Raw:       mods["raw"],
 			File:      relFile,
@@ -409,9 +423,13 @@ func render(routes []route, rootPkg, pagesDir, routerPkg string) ([]byte, error)
 			}
 			return name
 		}
-		fmt.Fprintf(&b, "\t\t{Pattern: %q, Label: %q, Page: %s, Head: %s, Mount: %s, Unmount: %s, Layouts: %s, Client: %t, Raw: %t},\n",
+		data := ""
+		if r.Data != "" {
+			data = fmt.Sprintf(", Data: %q", r.Data)
+		}
+		fmt.Fprintf(&b, "\t\t{Pattern: %q, Label: %q, Page: %s, Head: %s, Mount: %s, Unmount: %s, Layouts: %s, Client: %t, Raw: %t%s},\n",
 			r.Pattern, r.Label, page, qual("Head", r.Head), qual("Mount", r.Mount),
-			qual("Unmount", r.Unmount), layouts, r.Client, r.Raw)
+			qual("Unmount", r.Unmount), layouts, r.Client, r.Raw, data)
 	}
 	fmt.Fprintf(&b, "\t}\n}\n")
 

@@ -26,3 +26,31 @@ func TestUnderTreatsRootAsExact(t *testing.T) {
 		}
 	}
 }
+
+// Per-route client data is derived from the table, so a `//howl:data` line is
+// the only place it is written down.
+func TestPageDataIsDerivedFromTheTable(t *testing.T) {
+	rs := []Route{
+		{Pattern: "/dashboard", Client: true},
+		{Pattern: "/dashboard/metrics", Client: true, Data: "/api/metrics"},
+		{Pattern: "/blog/{article_id}", Client: true, Data: "/api/article"},
+	}
+	got := PageData(rs)
+	if len(got) != 2 {
+		t.Fatalf("PageData = %v, want the two routes that declared one", got)
+	}
+	if got["/dashboard/metrics"] != "/api/metrics" || got["/blog/{article_id}"] != "/api/article" {
+		t.Errorf("PageData = %v", got)
+	}
+	if _, ok := got["/dashboard"]; ok {
+		t.Error("a route with no //howl:data was given an endpoint")
+	}
+}
+
+// Nil rather than an empty map: it is omitempty in the client config, and a
+// site where no route declares one should publish no key at all.
+func TestPageDataIsAbsentWhenUnused(t *testing.T) {
+	if got := PageData([]Route{{Pattern: "/", Client: true}}); got != nil {
+		t.Errorf("PageData = %v, want nil", got)
+	}
+}

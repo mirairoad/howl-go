@@ -402,3 +402,55 @@ func partial(r *http.Request) *http.Request {
 	r.Header.Set("X-Partial", "1")
 	return r
 }
+
+// The shell publishes per-route data endpoints, so the client can fetch the
+// payload for the route it is about to render instead of one blob for the app.
+func TestClientConfigCarriesPerRouteData(t *testing.T) {
+	rt := router.Route{
+		Pattern: "/dashboard/metrics",
+		Label:   "Metrics",
+		Client:  true,
+		Data:    "/api/metrics",
+		Page:    func() templ.Component { return text("<p>m</p>") },
+	}
+	var got router.Client
+	a := New(Config{
+		Routes: []router.Route{rt},
+		Shell:  shell,
+		Data: func(ctx context.Context, _ string) context.Context {
+			got = router.ClientConfig(ctx)
+			return ctx
+		},
+		ClientData: "/api/app",
+		Public:     fstest.MapFS{},
+	})
+	get(a.Mux(), "/dashboard/metrics", nil)
+
+	if got.Pages["/dashboard/metrics"] != "/api/metrics" {
+		t.Errorf("Pages = %v", got.Pages)
+	}
+	// The shared endpoint stays as the fallback for routes that name none.
+	if got.Data != "/api/app" {
+		t.Errorf("Data = %q, want the fallback to survive", got.Data)
+	}
+}
+
+// Parameters come from the mux, which already matched the pattern to get here.
+// Re-deriving them was the O(routes) scan this replaced, so the thing worth
+// testing is that the values still arrive.
+func TestParamsComeFromTheMux(t *testing.T) {
+	rt := router.Route{
+		Pattern: "/blog/{article_id}/c/{n}",
+		Label:   "Post",
+		Page: func() templ.Component {
+			return comp(func(ctx context.Context, w io.Writer) error {
+				_, err := io.WriteString(w, router.Param(ctx, "article_id")+"|"+router.Param(ctx, "n"))
+				return err
+			})
+		},
+	}
+	rec := get(testApp(rt).Mux(), "/blog/fs-routing/c/7", nil)
+	if !strings.Contains(rec.Body.String(), "fs-routing|7") {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}

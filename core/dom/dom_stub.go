@@ -41,7 +41,12 @@ func (Element) SetValue(string)           {}
 func (Element) Hide(bool)                 {}
 func (Element) Attr(string) string        { return "" }
 func (Element) SetAttr(string, string)    {}
-func (Element) On(string, func())         {}
+
+// On returns the release func its browser counterpart returns, so a page that
+// keeps the handle compiles for the server too — where it is dead code.
+func (Element) On(string, func()) func() { return func() {} }
+
+func Off(...func()) {}
 
 // Fetch is the browser's fetch(); on the server there is no browser. The
 // signature exists so a page's Mount compiles for both targets — it is never

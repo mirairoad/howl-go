@@ -10,6 +10,12 @@ import (
 	"github.com/mirairoad/howl-go/examples/toy_app/client/ui"
 )
 
+// This route fetches its own client data rather than sharing the application's
+// one payload. Before //howl:data existed, every browser-rendered route got the
+// same blob unmarshalled as the same type, so two client routes wanting
+// different things had no mechanism at all.
+//howl:data /api/metrics
+
 // Head is merged into the document <head>. It owns this route's title and can
 // carry anything else the page needs — meta, canonical, preload — which is why
 // it beats a title string. Reserved name: it never becomes the page component.

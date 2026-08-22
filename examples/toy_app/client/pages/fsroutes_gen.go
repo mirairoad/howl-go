@@ -20,7 +20,7 @@ func FsClientRoutes() []router.Route {
 		{Pattern: "/about", Label: "About", Page: p0.Page, Head: nil, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
 		{Pattern: "/blog", Label: "Blog", Page: p1.Page, Head: nil, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
 		{Pattern: "/dashboard", Label: "Dashboard", Page: p2.Page, Head: nil, Mount: nil, Unmount: nil, Layouts: []router.Wrapper{p2.Layout}, Client: true, Raw: false},
-		{Pattern: "/dashboard/metrics", Label: "Metrics", Page: p3.Page, Head: p3.Head, Mount: p3.Mount, Unmount: nil, Layouts: []router.Wrapper{p2.Layout}, Client: true, Raw: false},
+		{Pattern: "/dashboard/metrics", Label: "Metrics", Page: p3.Page, Head: p3.Head, Mount: p3.Mount, Unmount: nil, Layouts: []router.Wrapper{p2.Layout}, Client: true, Raw: false, Data: "/api/metrics"},
 		{Pattern: "/dashboard/settings", Label: "Settings", Page: p4.Page, Head: nil, Mount: nil, Unmount: nil, Layouts: []router.Wrapper{p2.Layout}, Client: true, Raw: false},
 		{Pattern: "/todos", Label: "Todos", Page: p5.Page, Head: nil, Mount: p5.Mount, Unmount: p5.Unmount, Layouts: nil, Client: false, Raw: false},
 		{Pattern: "/blog/{article_id}", Label: "Article_id", Page: p1.Article, Head: nil, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},

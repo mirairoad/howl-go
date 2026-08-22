@@ -46,6 +46,11 @@ type Route struct {
 	// runtime. A *.bare.templ route keeps the shell and only drops its layout
 	// chain, which needs no field here — the generator simply emits no layouts.
 	Raw bool
+	// Data is this route's own client-data endpoint, from `//howl:data`. The
+	// browser fetches it before rendering this route and hands the body to the
+	// renderer. Empty means fall back to Config.ClientData — which is what
+	// every route did before per-route data existed.
+	Data string
 }
 
 var titleTag = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
@@ -156,6 +161,23 @@ func Nav(rs []Route) []Route {
 		if strings.Count(strings.Trim(r.Pattern, "/"), "/") == 0 {
 			out = append(out, r)
 		}
+	}
+	return out
+}
+
+// PageData maps each pattern that declares its own client-data endpoint to
+// that endpoint. Derived from the table, so adding a `//howl:data` line is
+// enough and nothing is configured twice.
+func PageData(rs []Route) map[string]string {
+	var out map[string]string
+	for _, r := range rs {
+		if r.Data == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[r.Pattern] = r.Data
 	}
 	return out
 }
@@ -297,9 +319,14 @@ type Client struct {
 	// renders, and routes with a lifecycle hook. Derived from the route table,
 	// so adding .client to a file is enough; nothing is told about it twice.
 	Wasm []string `json:"wasm"`
-	// Data is the JSON endpoint the client fetches once before its first local
-	// render, and hands to the renderer. Empty means no fetch at all.
+	// Data is the fallback JSON endpoint: fetched once and handed to any route
+	// that does not name its own. Empty means no fetch at all.
 	Data string `json:"data,omitempty"`
+	// Pages maps a route pattern to its own data endpoint, from `//howl:data`.
+	// A route listed here is fetched separately and gets only its own payload,
+	// so ten client routes no longer share one blob unmarshalled as one type.
+	// Absent from the JSON entirely when no route declares one.
+	Pages map[string]string `json:"pages,omitempty"`
 	// Live is the dev server's reload endpoint, set only when `howl dev` is in
 	// front. Empty in production, where the client then loads no dev code at
 	// all — not even the check for it.

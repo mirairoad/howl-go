@@ -63,22 +63,57 @@ func (e Element) Attr(name string) string {
 
 func (e Element) SetAttr(name, val string) { e.v.Call("setAttribute", name, val) }
 
-// On registers a DOM listener. The js.Func is intentionally never Released:
-// listeners live as long as the element, and the element outlives this call.
-// A page that mounts repeatedly leaks one closure per listener — fine here,
-// worth revisiting if pages start mounting in a loop.
-func (e Element) On(event string, fn func()) {
+// On registers a DOM listener and returns the function that removes it again.
+//
+// The returned func is the only way to release the js.Func underneath. A
+// js.Func holds a Go closure alive on the JS side until Release is called, and
+// nothing else can reach it — so an On whose handle is dropped leaks one
+// closure per call, permanently. Pages mount on every client-side navigation
+// and repaint handlers are re-bound on every repaint, so "one per call" is one
+// per visit, for the life of the tab.
+//
+// Ignoring the result is still legal Go and still correct for a listener that
+// should live as long as the page process — an app-shell control outside the
+// outlet, say. Inside a page, keep it and call it from Unmount.
+func (e Element) On(event string, fn func()) func() {
 	if !e.v.Truthy() {
-		return
+		return func() {}
 	}
-	e.v.Call("addEventListener", event, js.FuncOf(func(_ js.Value, args []js.Value) any {
+	cb := js.FuncOf(func(_ js.Value, args []js.Value) any {
 		// A submit or a link click would otherwise navigate away mid-handler.
 		if len(args) > 0 && args[0].Truthy() {
 			args[0].Call("preventDefault")
 		}
 		fn()
 		return nil
-	}))
+	})
+	e.v.Call("addEventListener", event, cb)
+
+	var once bool
+	return func() {
+		// Releasing twice panics, and a release func is exactly the kind of
+		// thing a defensive Unmount calls again on a second pass.
+		if once {
+			return
+		}
+		once = true
+		e.v.Call("removeEventListener", event, cb)
+		cb.Release()
+	}
+}
+
+// Off releases several listeners at once — the shape an Unmount wants, since
+// it holds one handle per thing Mount registered.
+//
+//	var stop []func()
+//	func Mount()   { stop = append(stop, el.On("click", add)) }
+//	func Unmount() { dom.Off(stop...); stop = nil }
+func Off(release ...func()) {
+	for _, r := range release {
+		if r != nil {
+			r()
+		}
+	}
 }
 
 // Navigate moves to another route through the client router — the same code
