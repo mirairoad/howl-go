@@ -98,3 +98,19 @@ Then three wires, in the order they run:
 The one rule that fails silently: **read through the signal, not the store**. `store.Todos.Get()` registers the effect as a dependent; `store.TodosClient().List()` returns the same data, subscribes to nothing, and the page simply stops updating.
 
 Both files, and a page already wired to them, come out of `howl_scaffold` — `kind: "store"`, then `kind: "page"` with `client: true, store: "todos"`. See [Lifecycle](/docs/lifecycle) for the `Mount`/`Unmount` pair it writes.
+
+## Hidden markup still costs
+
+Build an overlay from a checkbox and a sibling selector — no JavaScript, keyboard-operable, nothing to re-hydrate after a navigation. Then gate whatever fills it.
+
+There is no component tree here, so a script finds its work by asking whether the markup is present: `if (qs("[data-rows]")) refresh()`. A closed panel is `display:none`, and `display:none` markup **is still present**. It keeps answering yes, so anything on a timer rebuilds it forever, at full cost, for nobody. A virtual DOM would have said the panel was not mounted; nothing here will.
+
+```js
+const open = () => { const t = document.getElementById("panel"); return !t || t.checked; };
+if (open()) host.replaceChildren(...rows.map(render));
+document.addEventListener("change", (e) => {
+  if (e.target.id === "panel" && e.target.checked) draw();   // never open onto stale content
+});
+```
+
+`!t || t.checked` is deliberate: a page with no panel is one where that markup *is* the page, and must always draw.

@@ -45,10 +45,12 @@ let seq = 0;
 // Everything the client needs to know about the Go half, published by the
 // shell from the same generated route table the server uses:
 //
-//   { "wasm": ["/dashboard", "/todos"], "data": "/api/metrics" }
+//   { "wasm": ["/dashboard"], "data": "/api/metrics",
+//     "bootstrap": { "version": "v0.2.1" } }
 //
 // No hardcoded prefix, and no hardcoded endpoint either — an app whose client
 // routes need no data simply omits "data" and the fetch never happens.
+// Bootstrap is server runtime state embedded in the document, not fetched.
 const CONFIG = (() => {
   const read = (id) => {
     try {
@@ -62,15 +64,22 @@ const CONFIG = (() => {
   // cached for a year: a new build is a new URL, and the browser never spends a
   // conditional request asking whether a 6 MB binary changed.
   if (c) {
+    // Normalised rather than passed through, so a missing key never reaches the
+    // router as undefined. Every field the shell publishes has to be listed
+    // here: one that is not is silently dropped, and the feature behind it
+    // fails by falling back rather than by erroring.
     return {
       wasm: c.wasm || [],
+      raw: c.raw || [],
       data: c.data || null,
+      pages: c.pages || null,
+      bootstrap: c.bootstrap ?? null,
       live: c.live || null,
       binary: c.binary || "/static/views.wasm",
       exec: c.exec || "/static/wasm_exec.js",
     };
   }
-  return { wasm: read("howl-wasm-routes") || [], data: null, live: null,
+  return { wasm: read("howl-wasm-routes") || [], raw: [], data: null, pages: null, bootstrap: null, live: null,
            binary: "/static/views.wasm", exec: "/static/wasm_exec.js" }; // pre-0.2 shells
 })();
 
@@ -82,6 +91,14 @@ if (CONFIG.live) {
 }
 
 const WASM_ROUTES = CONFIG.wasm;
+
+// Patterns that answer with their own document. A .raw route has no shell and
+// no layouts by definition, so swapping its body into #outlet would dress it in
+// the chrome of whatever page the user came from — and a reload would then
+// disagree with the navigation that got there. The router hands these to the
+// browser instead.
+const RAW_ROUTES = CONFIG.raw ?? [];
+const isRawRoute = (pathname) => RAW_ROUTES.some((p) => patternMatches(p, canonical(pathname)));
 
 // Mirrors router.Route.Match: segment count plus {param} wildcards.
 function patternMatches(pattern, path) {
@@ -180,7 +197,11 @@ async function renderLocally(url) {
   const route = canonical(url);
   // Awaited, but normally already resolved: hover, focus and touchstart all
   // warm it, and the same endpoint is fetched once however many routes share it.
-  const html = howlRender(route, await fetchData(dataURLFor(route)));
+  const routeData = JSON.parse(await fetchData(dataURLFor(route)));
+  const html = howlRender(route, JSON.stringify({
+    bootstrap: CONFIG.bootstrap,
+    routeData,
+  }));
   if (!html) return null; // unknown route — let the server answer (it 404s)
   // The wasm build returns the same <template data-head> prefix the server
   // sends, so head merging works identically on both paths.
@@ -262,12 +283,15 @@ const spaTarget = (a) => {
   if (!a || a.target || a.hasAttribute("download") || a.hasAttribute("data-no-spa")) return null;
   const u = new URL(a.href, location.origin);
   if (u.origin !== location.origin || u.pathname.startsWith("/static/")) return null;
+  // Its own document: let the browser load it, the same as data-no-spa.
+  if (isRawRoute(u.pathname)) return null;
   return u.pathname + u.search;
 };
 
 // (b) Should we spend a round-trip warming it?
 const shouldPrefetch = (url) => {
   if (!url || url === location.pathname + location.search) return false;
+  if (isRawRoute(new URL(url, location.origin).pathname)) return false;
   // Once wasm can render this prefix locally, fetching its HTML is pure waste.
   // Before that it is a useful bridge, so allow it while wasm is still loading.
   if (wasmReady && wasmCandidate(new URL(url, location.origin).pathname)) return false;
@@ -643,6 +667,14 @@ function applyFragment(url, entry, push, restore, transition, replace) {
     // links that survive a navigation, this one updates the links that arrived
     // with the fragment.
     markActive();
+    // Anything that lives outside #outlet and cares where the user is now.
+    // markActive is the framework's own use of this; an application script that
+    // paints persistent chrome has had no way to know a navigation happened,
+    // because nothing outside the outlet is re-rendered. Dispatched after the
+    // markup is in the DOM and after Mount, so a listener sees the finished page.
+    document.dispatchEvent(new CustomEvent("howl:navigate", {
+      detail: { path: outlet.dataset.route, url },
+    }));
     // Must happen AFTER the content exists: startViewTransition defers this
     // callback, so scrolling outside it targets the old, possibly shorter DOM
     // and the browser clamps the offset to 0.
@@ -656,6 +688,14 @@ function applyFragment(url, entry, push, restore, transition, replace) {
 }
 
 async function navigate(url, { push = true, restore = 0, transition = null, replace = false } = {}) {
+  // A .raw route is its own document. spaTarget already declines to intercept a
+  // link to one, but howl.navigate() and a restored history entry both arrive
+  // here without passing through it.
+  if (isRawRoute(new URL(url, location.origin).pathname)) {
+    location.href = url;
+    return;
+  }
+
   const mine = ++seq;
   const t0 = performance.now();
 

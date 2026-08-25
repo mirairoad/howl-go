@@ -348,6 +348,7 @@ a := app.New(app.Config{
 
 	ClientData: "/api/metrics",         // fallback JSON for client routes; omit = no fetch
 	                                    // per-route: //howl:data in the page file
+	Bootstrap: func(ctx, path) any { … }, // per-request runtime state for wasm renders
 	PublicDir:  "",                     // serve /static/ from disk instead of the embed (dev)
 })
 
@@ -485,6 +486,23 @@ Markup attributes the client runtime understands:
 | `data-island="name" data-props='{…}'` | hydrated by a registered island |
 | `data-no-prefetch` | do not warm this link (or subtree) |
 | `data-no-spa` | full page load, do not intercept |
+
+A `*.raw.templ` route is never intercepted either: it is its own document, so
+swapping it into `#outlet` would dress it in the chrome of whatever page the
+user came from, and a reload would then disagree with the navigation that got
+there. The client reads the patterns from `router.Client.Raw` and hands them to
+the browser.
+
+Nothing outside `#outlet` is re-rendered by a navigation, so a script that
+paints persistent chrome listens for the event:
+
+```js
+document.addEventListener("howl:navigate", (e) => {
+  // e.detail.path is the new route, e.detail.url the full target
+});
+```
+
+It fires after the markup is in the DOM and after the page's `Mount`.
 | `data-transition-slide-left` etc. | view transition; on `<html>` for a default, `data-transition-none` opts out |
 
 `prefers-reduced-motion` disables transitions outright. Transitions are opt-in — nothing
@@ -621,6 +639,54 @@ Scaffold the whole thing with `howl_scaffold` (`kind: "page"`, `client: true`,
 `store: "todos"`) — it writes the page, the lifecycle, the effect and the
 release, wired to a store that exists.
 
+### Overlays, and the cost of markup nobody sees
+
+Build a modal or a drawer from a checkbox and a sibling selector, not
+`<dialog>.showModal()`:
+
+```html
+<input id="panel" type="checkbox" class="peer sr-only"/>
+<label for="panel">Open</label>
+<div class="hidden peer-checked:grid …">
+  <label for="panel" class="absolute inset-0 …"></label>  <!-- backdrop closes it -->
+  …
+</div>
+```
+
+No JavaScript, keyboard-operable, and nothing to re-hydrate after a navigation —
+the same reason a page's disclosure should be `<details>`.
+
+**Then gate whatever fills it.** This is the part that bites, and it is a
+consequence of the framework's own shape: there is no component tree, so an
+application script finds its work by asking whether the markup is there —
+`if (qs("[data-rows]")) refreshRows()`. A closed panel is `display:none`, and
+`display:none` markup **is still there**. So a panel nobody has opened keeps
+answering yes, and a script on a timer rebuilds it forever, at full cost, for
+nobody. A framework with a virtual DOM would have told the script the panel was
+not mounted. Nothing here will.
+
+```js
+const open = () => { const t = document.getElementById("panel"); return !t || t.checked; };
+
+if (open()) host.replaceChildren(...rows.map(render));   // skip the work when shut
+document.addEventListener("change", (e) => {             // ...and never show it stale
+  if (e.target.id === "panel" && e.target.checked) draw();
+});
+```
+
+`!t || t.checked` matters: a page with no panel is one where that markup *is*
+the page, and it must always draw.
+
+Measured, in an application that got this wrong: one editable row per machine,
+each a few hundred lines of markup, rebuilt every 3 s into a shut dialog. It read
+as the whole page being slow, because it was — the work was invisible, not the
+symptom.
+
+Two smaller ones: do not put `backdrop-filter` on a full-viewport backdrop over
+a page with anything animating behind it, and remember that a `required` field
+inside a hidden step is a field the browser will refuse to focus and refuse to
+explain.
+
 ### What does not exist
 
 No hooks, no re-render, no virtual DOM, no dependency array, no `useState`. A
@@ -630,21 +696,83 @@ and why the markup is identical to the server's.
 
 ---
 
+## Client render safety
+
+A `.client.templ` route is compiled into two different Go binaries. The server
+binary and `views.wasm` each have their own package globals, environment,
+startup time and build metadata. A component that calls `build.Tag()`,
+`os.Getenv`, `time.Now` or `runtime.Version` can therefore render one value on
+the cold request and another after local navigation without either build
+failing.
+
+The rule is:
+
+> Client-renderable components may only depend on route parameters, explicit
+> route data, and hydrated application state.
+
+This includes every layout and shared UI component reachable from a `.client`
+route. Compile-time constants are safe. Runtime values—running version, viewer,
+permissions, settings and feature flags—come from `Config.Bootstrap`:
+
+```go
+type AppState struct {
+	Version string `json:"version"`
+	Viewer  Viewer `json:"viewer"`
+}
+
+a := app.New(app.Config{
+	Data: func(ctx context.Context, path string) context.Context {
+		return state.With(ctx, AppState{Version: build.Tag(), Viewer: viewer(ctx)})
+	},
+	Bootstrap: func(ctx context.Context, path string) any {
+		return state.Get[AppState](ctx)
+	},
+})
+```
+
+The shell already serializes `router.ClientConfig(ctx)` as `howl-client`, so the
+bootstrap value is emitted safely with the rest of that JSON and retained for
+local navigations. `app.js` hands the wasm renderer one envelope:
+
+```go
+type RenderPayload struct {
+	Bootstrap json.RawMessage `json:"bootstrap"`
+	RouteData json.RawMessage `json:"routeData"`
+}
+
+payload, err := router.DecodeRenderPayload(args[1].String())
+ctx, err = state.Hydrate[AppState](ctx, payload.Bootstrap)
+```
+
+Route data remains separate: decode `payload.RouteData` as the type belonging
+to that route. Bootstrap is evaluated per request and sent to the browser; do
+not put secrets in it.
+
+Mark packages that must never enter a browser-renderable dependency graph with
+`//howl:server`. Prefer `//go:build !js` when the entire package is genuinely
+unavailable under wasm, because then an accidental import also fails the Go
+build. `howl check` traces client routes through layouts and module-local
+imports, rejects those packages, and reports direct uses of `os.Getenv`,
+`time.Now` and `runtime.Version` in client-renderable templates.
+
+---
+
 ## The wasm renderer
 
 `wasm/main.go` (build tag `//go:build js && wasm`) imports the **same** generated route
 table and exports three functions:
 
 ```go
-js.Global().Set("howlRender", js.FuncOf(render))   // (path, dataJSON) -> html or ""
+js.Global().Set("howlRender", js.FuncOf(render))   // (path, renderPayloadJSON) -> html or ""
 js.Global().Set("howlMount", js.FuncOf(mount))     // (path, element)
 js.Global().Set("howlUnmount", js.FuncOf(unmount)) // (path)
 select {}                                          // main must never return
 ```
 
-`render`'s second argument is the payload for *that* route — its `//howl:data` endpoint if
-it declared one, otherwise `Config.ClientData` — so a renderer may decode a different type
-per route instead of unmarshalling one blob as one type. `render` returns `""` for a route
+`render`'s second argument is `router.RenderPayload`: per-request `Config.Bootstrap` plus
+the payload for *that* route — its `//howl:data` endpoint if it declared one, otherwise
+`Config.ClientData`. A renderer may decode a different route-data type per route while
+installing the same application state for all of them. `render` returns `""` for a route
 that is not `.client`, and the client falls back to the server. Its output must start with the same `<template data-head><title>…</title>…</template>`
 prefix the server sends — one wire shape, one merge path.
 

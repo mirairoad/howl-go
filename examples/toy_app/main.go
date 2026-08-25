@@ -74,6 +74,12 @@ func main() {
 		// The browser fetches this once before its first local render and
 		// hands it to the wasm renderer. Omit it and no fetch happens.
 		ClientData: "/api/metrics",
+		// Runtime values are serialized from this server process and restored
+		// into the wasm render context. The component never calls time.Now or
+		// runtime.Version itself, so SSR and local navigation see the same value.
+		Bootstrap: func(ctx context.Context, _ string) any {
+			return store.MetaFrom(ctx)
+		},
 		// Outermost first. Ordinary net/http decorators — nothing here knows
 		// about templ, routes or this application.
 		Use: []mw.Middleware{

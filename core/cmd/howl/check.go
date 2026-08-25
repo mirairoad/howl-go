@@ -96,6 +96,7 @@ func runCheck(root string, build bool) checkResult {
 	files := sourceFiles(root)
 
 	out = append(out, lintPages(root, files)...)
+	out = append(out, lintClientRenderSafety(root, files)...)
 	out = append(out, lintReactivity(root, files)...)
 	out = append(out, lintComponents(root, files)...)
 	out = append(out, lintPerformance(root, files)...)
@@ -131,19 +132,183 @@ func runCheck(root string, build bool) checkResult {
 	return result
 }
 
+// Client-renderable templates run in two different Go binaries. A package
+// global therefore means two different values even when both builds compile:
+// build.Tag(), time.Now(), environment-backed config and session singletons all
+// render correctly on the server and quietly change after local navigation.
+//
+// Start from every .client route and every layout that can wrap one, then walk
+// module-local imports. That includes shared UI components; checking only the
+// route file misses exactly the attractive Layout -> ui.Footer -> build.Tag
+// shape that caused this rule to exist.
+func lintClientRenderSafety(root string, files []sourceFile) []Diagnostic {
+	module := modulePath(root)
+	if module == "" {
+		return nil
+	}
+	byDir := map[string][]sourceFile{}
+	clientDirs := map[string]bool{}
+	var clientFiles []string
+	for _, f := range files {
+		dir := path.Dir(f.Rel)
+		if dir == "." {
+			dir = ""
+		}
+		byDir[dir] = append(byDir[dir], f)
+		if strings.HasSuffix(f.Rel, ".client.templ") {
+			clientDirs[dir] = true
+			clientFiles = append(clientFiles, f.Rel)
+		}
+	}
+	// A layout is part of the render surface when a client route is below its
+	// directory. Its whole package is linked into the wasm route table.
+	for _, f := range files {
+		if filepath.Base(f.Rel) != "layout.templ" {
+			continue
+		}
+		dir := path.Dir(f.Rel)
+		if dir == "." {
+			dir = ""
+		}
+		prefix := strings.TrimSuffix(dir, "/") + "/"
+		for _, rel := range clientFiles {
+			if dir == "" || strings.HasPrefix(rel, prefix) {
+				clientDirs[dir] = true
+				break
+			}
+		}
+	}
+
+	queue := make([]string, 0, len(clientDirs))
+	for dir := range clientDirs {
+		queue = append(queue, dir)
+	}
+	surface := map[string]bool{}
+	for len(queue) > 0 {
+		dir := queue[0]
+		queue = queue[1:]
+		if surface[dir] {
+			continue
+		}
+		surface[dir] = true
+		for _, f := range byDir[dir] {
+			for _, imp := range sourceImports(f) {
+				if imp == module {
+					queue = append(queue, "")
+				} else if strings.HasPrefix(imp, module+"/") {
+					queue = append(queue, strings.TrimPrefix(imp, module+"/"))
+				}
+			}
+		}
+	}
+
+	var out []Diagnostic
+	seenImport := map[string]bool{}
+	for dir := range surface {
+		serverMarked := false
+		for _, f := range byDir[dir] {
+			if bytes.Contains(f.Body, []byte("//howl:server")) {
+				serverMarked = true
+			}
+		}
+		if serverMarked {
+			// The importing edge below reports the useful location; a marker on
+			// an entry package has no such edge, so report the marker itself.
+			if clientDirs[dir] {
+				for _, f := range byDir[dir] {
+					if line, ok := findLine(f.Body, serverDirectiveRe); ok {
+						out = append(out, Diagnostic{File: f.Rel, Line: line, Rule: "client-imports-server-package", Level: "error", Message: "a client-renderable package is marked //howl:server", Fix: "move runtime state behind Config.Bootstrap or a route-data endpoint and hydrate it into ctx"})
+						break
+					}
+				}
+			}
+		}
+		for _, f := range byDir[dir] {
+			if strings.HasSuffix(f.Rel, ".templ") {
+				if line, ok := findLine(f.Body, runtimeStateCallRe); ok {
+					out = append(out, Diagnostic{File: f.Rel, Line: line, Rule: "client-runtime-global", Level: "error", Message: "client-renderable markup reads process runtime state; the server and wasm binaries can produce different HTML", Fix: "compute the value on the server, return it from Config.Bootstrap or route data, and read the hydrated value from ctx"})
+				}
+			}
+			for _, imp := range sourceImports(f) {
+				key := f.Rel + "\x00" + imp
+				if seenImport[key] {
+					continue
+				}
+				seenImport[key] = true
+				level, message := "", ""
+				if imp == "os" || imp == "os/exec" || strings.Contains(imp, "/server/") || strings.HasSuffix(imp, "/server") || markedServerImport(module, imp, byDir) {
+					level, message = "error", "a client-renderable package imports server/runtime state"
+				} else if suspiciousClientImportRe.MatchString(imp) {
+					level, message = "error", "a client-renderable package imports build/config/auth state; values from it describe the wasm build instead of the running server"
+				}
+				if level != "" {
+					line := importLine(f.Body, imp)
+					out = append(out, Diagnostic{File: f.Rel, Line: line, Rule: "client-imports-server-package", Level: level, Message: message + ": " + imp, Fix: "expose compile-time constants separately; deliver runtime values through Config.Bootstrap or route data"})
+				}
+			}
+		}
+	}
+	return out
+}
+
+func sourceImports(f sourceFile) []string {
+	if strings.HasSuffix(f.Rel, ".go") {
+		parsed, err := parser.ParseFile(token.NewFileSet(), f.Rel, f.Body, parser.ImportsOnly)
+		if err != nil {
+			return nil
+		}
+		out := make([]string, 0, len(parsed.Imports))
+		for _, imp := range parsed.Imports {
+			out = append(out, strings.Trim(imp.Path.Value, `"`))
+		}
+		return out
+	}
+	var out []string
+	for _, m := range importLineRe.FindAllSubmatch(f.Body, -1) {
+		out = append(out, string(m[2]))
+	}
+	return out
+}
+
+func markedServerImport(module, imp string, byDir map[string][]sourceFile) bool {
+	if imp != module && !strings.HasPrefix(imp, module+"/") {
+		return false
+	}
+	dir := strings.TrimPrefix(strings.TrimPrefix(imp, module), "/")
+	for _, f := range byDir[dir] {
+		if bytes.Contains(f.Body, []byte("//howl:server")) {
+			return true
+		}
+	}
+	return false
+}
+
+func importLine(body []byte, imp string) int {
+	quoted := `"` + imp + `"`
+	for i, line := range strings.Split(string(body), "\n") {
+		if strings.Contains(line, quoted) {
+			return i + 1
+		}
+	}
+	return 0
+}
+
 // ---------------------------------------------------------------------------
 // Rules
 // ---------------------------------------------------------------------------
 
 var (
-	importAppRe   = regexp.MustCompile(`"[^"]*howl-go/core/app"`)
-	importDBRe    = regexp.MustCompile(`"[^"]*howl-go/db(/[\w/]+)?"`)
-	templMountRe  = regexp.MustCompile(`(?m)^templ\s+(Mount|Unmount)\s*\(`)
-	rawQueryRe    = regexp.MustCompile(`r\.HTTP\.(URL\.Query\(\)|FormValue|PostFormValue)`)
-	rolesRe       = regexp.MustCompile(`Roles:\s*\[\]string\{[^}]*"`)
-	authorizeRe   = regexp.MustCompile(`Authorize:\s*`)
-	structFieldRe = regexp.MustCompile(`(?m)^\s+([A-Z]\w*)\s+[\[\]\*\w\.]+(\s+` + "`" + `[^` + "`" + `]*` + "`" + `)?\s*$`)
-	generatedRe   = regexp.MustCompile(`^// Code generated`)
+	importAppRe              = regexp.MustCompile(`"[^"]*howl-go/core/app"`)
+	importDBRe               = regexp.MustCompile(`"[^"]*howl-go/db(/[\w/]+)?"`)
+	templMountRe             = regexp.MustCompile(`(?m)^templ\s+(Mount|Unmount)\s*\(`)
+	rawQueryRe               = regexp.MustCompile(`r\.HTTP\.(URL\.Query\(\)|FormValue|PostFormValue)`)
+	rolesRe                  = regexp.MustCompile(`Roles:\s*\[\]string\{[^}]*"`)
+	authorizeRe              = regexp.MustCompile(`Authorize:\s*`)
+	structFieldRe            = regexp.MustCompile(`(?m)^\s+([A-Z]\w*)\s+[\[\]\*\w\.]+(\s+` + "`" + `[^` + "`" + `]*` + "`" + `)?\s*$`)
+	generatedRe              = regexp.MustCompile(`^// Code generated`)
+	runtimeStateCallRe       = regexp.MustCompile(`\b(os\.(Getenv|LookupEnv|Environ)|time\.Now|runtime\.Version)\s*\(`)
+	suspiciousClientImportRe = regexp.MustCompile(`/(internal/)?(build|config|auth|session)$`)
+	serverDirectiveRe        = regexp.MustCompile(`//howl:server`)
 )
 
 // A page may not import core/app: the generated table lives inside the page

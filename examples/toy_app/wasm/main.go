@@ -13,8 +13,9 @@ import (
 	"syscall/js"
 
 	"github.com/mirairoad/howl-go/core/dom"
-	"github.com/mirairoad/howl-go/examples/toy_app/client/pages"
 	"github.com/mirairoad/howl-go/core/router"
+	"github.com/mirairoad/howl-go/core/state"
+	"github.com/mirairoad/howl-go/examples/toy_app/client/pages"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
 )
 
@@ -51,7 +52,7 @@ func unmount(_ js.Value, args []js.Value) any {
 	return nil
 }
 
-// render(path, dataJSON) -> html for the page + its layouts, or "" if this
+// render(path, renderPayloadJSON) -> html for the page + its layouts, or "" if this
 // route is not client-renderable (then the client falls back to the server).
 func render(_ js.Value, args []js.Value) any {
 	if len(args) < 2 {
@@ -64,16 +65,23 @@ func render(_ js.Value, args []js.Value) any {
 		return ""
 	}
 
-	var m store.Metrics
-	if err := json.Unmarshal([]byte(args[1].String()), &m); err != nil {
+	payload, err := router.DecodeRenderPayload(args[1].String())
+	if err != nil {
 		return "<p class=\"hint\">bad data: " + err.Error() + "</p>"
+	}
+	var m store.Metrics
+	if err := json.Unmarshal(payload.RouteData, &m); err != nil {
+		return "<p class=\"hint\">bad route data: " + err.Error() + "</p>"
 	}
 
 	ctx := router.WithRoutes(context.Background(), routes)
 	ctx = router.WithCurrent(ctx, path)
 	ctx = router.WithParams(ctx, params)
+	ctx, err = state.Hydrate[store.Meta](ctx, payload.Bootstrap)
+	if err != nil {
+		return "<p class=\"hint\">bad bootstrap state: " + err.Error() + "</p>"
+	}
 	ctx = store.WithMetrics(ctx, m)
-	ctx = store.WithMeta(ctx, store.Meta{Region: "us-east-1"})
 
 	var sb strings.Builder
 	// Same wire shape as the server's fragment: the page's head rides along in

@@ -6,6 +6,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"html"
 	"io"
 	"regexp"
@@ -182,6 +183,18 @@ func PageData(rs []Route) map[string]string {
 	return out
 }
 
+// RawRoutes lists the patterns that are their own document. Derived from the
+// table, so marking a file *.raw.templ is enough.
+func RawRoutes(rs []Route) []string {
+	var out []string
+	for _, r := range rs {
+		if r.Raw {
+			out = append(out, r.Pattern)
+		}
+	}
+	return out
+}
+
 // NeedsWasm lists the patterns that require the wasm binary — either because
 // the browser renders them or because they have a lifecycle hook. The shell
 // hands this to the client so nothing has to hardcode a path prefix.
@@ -327,16 +340,44 @@ type Client struct {
 	// so ten client routes no longer share one blob unmarshalled as one type.
 	// Absent from the JSON entirely when no route declares one.
 	Pages map[string]string `json:"pages,omitempty"`
+	// Bootstrap is runtime application state for this document: viewer,
+	// permissions, settings, the running version. Unlike the route table above
+	// it is evaluated per request, then kept by app.js for every local render.
+	// Components must read the decoded value from ctx, never from process
+	// globals whose server and wasm builds can disagree.
+	Bootstrap any `json:"bootstrap,omitempty"`
 	// Live is the dev server's reload endpoint, set only when `howl dev` is in
 	// front. Empty in production, where the client then loads no dev code at
 	// all — not even the check for it.
 	Live string `json:"live,omitempty"`
+	// Raw lists the patterns that answer with their own document — no shell,
+	// no layouts, from `*.raw.templ`. The client must not intercept a link to
+	// one: swapping it into #outlet would wrap a standalone document in the
+	// chrome of whatever page the user happened to be on, which is exactly the
+	// thing .raw exists to avoid. Absent when no route is raw.
+	Raw []string `json:"raw,omitempty"`
 	// Binary and Exec are the content-hashed URLs of the wasm renderer and its
 	// Go runtime shim. The client uses them instead of guessing a path, which
 	// is what lets those two be cached for a year: the URL changes when the
 	// build does, so the browser never has to ask whether it is still current.
 	Binary string `json:"binary,omitempty"`
 	Exec   string `json:"exec,omitempty"`
+}
+
+// RenderPayload is the one value handed from app.js to the wasm renderer.
+// Bootstrap survives navigation; RouteData is the payload fetched for this
+// route. RawMessage keeps the framework independent of application types while
+// letting the wasm entrypoint decode both into the same types SSR installed.
+type RenderPayload struct {
+	Bootstrap json.RawMessage `json:"bootstrap"`
+	RouteData json.RawMessage `json:"routeData"`
+}
+
+// DecodeRenderPayload parses the second argument passed to howlRender.
+func DecodeRenderPayload(data string) (RenderPayload, error) {
+	var p RenderPayload
+	err := json.Unmarshal([]byte(data), &p)
+	return p, err
 }
 
 // Asset resolves a static file to its content-hashed URL:

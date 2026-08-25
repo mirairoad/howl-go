@@ -5,6 +5,19 @@ import (
 	"testing"
 )
 
+func TestDecodeRenderPayloadKeepsBootstrapAndRouteDataSeparate(t *testing.T) {
+	p, err := DecodeRenderPayload(`{"bootstrap":{"version":"v1"},"routeData":{"rows":[1]}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(p.Bootstrap) != `{"version":"v1"}` {
+		t.Fatalf("Bootstrap = %s", p.Bootstrap)
+	}
+	if string(p.RouteData) != `{"rows":[1]}` {
+		t.Fatalf("RouteData = %s", p.RouteData)
+	}
+}
+
 // The root link must not be current everywhere. Treating "/" as a prefix lights
 // up two sidebar entries at once, and it is the one case where the server and
 // the client runtime disagreed — the client excluded "/", this did not.
@@ -52,5 +65,16 @@ func TestPageDataIsDerivedFromTheTable(t *testing.T) {
 func TestPageDataIsAbsentWhenUnused(t *testing.T) {
 	if got := PageData([]Route{{Pattern: "/", Client: true}}); got != nil {
 		t.Errorf("PageData = %v, want nil", got)
+	}
+}
+
+func TestRawRoutesAreDerivedFromTheTable(t *testing.T) {
+	rs := []Route{{Pattern: "/"}, {Pattern: "/status", Raw: true}, {Pattern: "/login", Raw: true}}
+	got := RawRoutes(rs)
+	if len(got) != 2 || got[0] != "/status" || got[1] != "/login" {
+		t.Fatalf("RawRoutes = %v", got)
+	}
+	if RawRoutes([]Route{{Pattern: "/"}}) != nil {
+		t.Error("a table with no raw route should publish nothing")
 	}
 }

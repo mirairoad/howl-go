@@ -1000,6 +1000,35 @@ Deliberately not fixed: `.client` still gates rendering rather than bundling, so
 every page's components link into one `views.wasm`. That is the trade the SPA
 feel is bought with, and it stays.
 
+## Markup nobody sees is still markup
+
+An application built on this framework moved a list into a modal and the page
+got slower — not the modal, the page. The list was rebuilt every three seconds
+into a `display:none` dialog nobody had opened: one large subtree per row, at
+full cost, for nobody.
+
+The mistake was easy to make and the reason is ours. There is no component tree
+here, so an application script has no way to be told what is mounted; the idiom
+the architecture pushes it toward is asking whether the markup is present —
+`if (qs("[data-rows]")) refresh()`. That question has exactly one answer for a
+hidden panel, and it is the wrong one. A framework with a virtual DOM never
+lets the question be asked; it tells the component it unmounted. Here nothing
+does, and the cost is invisible in the one place it hurts: the work happens, the
+symptom shows up somewhere else, and profiling the modal finds nothing because
+the modal is shut.
+
+So it is written down next to the overlay recipe rather than left as a thing to
+rediscover: build the panel from a checkbox and a sibling selector, and gate
+whatever fills it on the panel being open — rendering on open too, or it comes
+up stale. The guard is `!toggle || toggle.checked`, because a page with no panel
+is one where that markup *is* the page.
+
+It generalises past modals. Anything conditionally hidden — a tab that is not
+the current tab, a drawer, a `<details>` that is shut — is present to every
+`querySelector` in the application, and the framework will never say otherwise.
+
+---
+
 ## The flash that looked like slowness
 
 Reported as "the page is instantaneous but the layout is the old one for a bit",

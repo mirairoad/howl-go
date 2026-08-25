@@ -613,6 +613,75 @@ var db *sql.DB
 	}
 }
 
+func TestClientTemplateCannotReadProcessRuntime(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/pages/dashboard/index.client.templ": `package dashboard
+
+import "runtime"
+
+templ Page() { <span>{ runtime.Version() }</span> }
+`,
+	})
+	d, ok := rules(runCheck(root, false))["client-runtime-global"]
+	if !ok || d.Level != "error" {
+		t.Fatalf("runtime global was accepted: %#v", d)
+	}
+}
+
+func TestClientSafetyTraversesLayoutAndSharedComponents(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/pages/dashboard/layout.templ": `package dashboard
+
+import "example.com/app/client/ui"
+
+templ Layout() { @ui.Footer() { children... } }
+`,
+		"client/pages/dashboard/index.client.templ": `package dashboard
+
+templ Page() { <p>ok</p> }
+`,
+		"client/ui/footer.templ": `package ui
+
+import "example.com/app/internal/build"
+
+templ Footer() { <span>{ build.Tag() }</span> }
+`,
+		"internal/build/build.go": `package build
+
+func Tag() string { return "dev" }
+`,
+	})
+	d, ok := rules(runCheck(root, false))["client-imports-server-package"]
+	if !ok || d.Level != "error" {
+		t.Fatalf("transitive server state import was accepted: %#v", d)
+	}
+}
+
+func TestHowlServerPackageCannotReachClientRoute(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/pages/index.client.templ": `package pages
+
+import "example.com/app/internal/meta"
+
+templ Page() { <span>{ meta.Value() }</span> }
+`,
+		"internal/meta/meta.go": `//howl:server
+package meta
+
+func Value() string { return "server" }
+`,
+	})
+	if _, ok := rules(runCheck(root, false))["client-imports-server-package"]; !ok {
+		t.Fatal("a //howl:server package reached a client route")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Component references
 // ---------------------------------------------------------------------------

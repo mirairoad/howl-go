@@ -33,6 +33,47 @@ The wasm binary imports the same generated route table and resolves the path thr
 
 The cost is the payload: a Go wasm binary carries the runtime and GC whether you use them or not. Load it lazily, for the routes that need it.
 
+## Runtime state must cross the wire
+
+A `.client` component is compiled into both the server binary and `views.wasm`.
+Package globals belong to those separate binaries, so `build.Tag()`,
+`os.Getenv`, `time.Now()` or `runtime.Version()` can change after a local
+navigation even though the same component rendered both pages.
+
+Client-renderable components—including their layouts and shared UI—may only
+depend on route parameters, explicit route data and hydrated application state.
+Put runtime global state in the server context and publish the same typed value
+as bootstrap state:
+
+```go
+type AppState struct {
+	Version string `json:"version"`
+	Viewer  Viewer `json:"viewer"`
+}
+
+app.Config{
+	Data: func(ctx context.Context, path string) context.Context {
+		return state.With(ctx, loadAppState(ctx))
+	},
+	Bootstrap: func(ctx context.Context, path string) any {
+		return state.Get[AppState](ctx)
+	},
+}
+```
+
+The WASM renderer receives bootstrap and route data separately:
+
+```go
+payload, err := router.DecodeRenderPayload(args[1].String())
+ctx, err = state.Hydrate[AppState](ctx, payload.Bootstrap)
+json.Unmarshal(payload.RouteData, &pageData)
+```
+
+Bootstrap is evaluated per request, serialized in `howl-client`, and retained
+across navigation. It is browser-visible, so it must not contain secrets.
+`howl check` traces `.client` routes through layouts and local imports; use
+`//howl:server` on packages that must never enter that graph.
+
 ## `templ Head()`
 
 A page may declare a reserved `Head` component, merged into the document `<head>`:

@@ -10,6 +10,8 @@ package store
 import (
 	"context"
 	"sync"
+
+	"github.com/mirairoad/howl-go/core/state"
 )
 
 // ---------------------------------------------------------------------------
@@ -40,9 +42,9 @@ type Metrics struct {
 
 // Meta is per-request scalars the pages display.
 type Meta struct {
-	RenderedAt string
-	GoVersion  string
-	Region     string
+	RenderedAt string `json:"renderedAt"`
+	GoVersion  string `json:"goVersion"`
+	Region     string `json:"region"`
 }
 
 // Pages take no arguments — the route table needs one uniform signature — so
@@ -52,7 +54,6 @@ type ctxKey int
 const (
 	metricsKey ctxKey = iota
 	todosKey
-	metaKey
 )
 
 func WithMetrics(ctx context.Context, m Metrics) context.Context {
@@ -74,12 +75,11 @@ func TodosFrom(ctx context.Context) []Todo {
 }
 
 func WithMeta(ctx context.Context, m Meta) context.Context {
-	return context.WithValue(ctx, metaKey, m)
+	return state.With(ctx, m)
 }
 
 func MetaFrom(ctx context.Context) Meta {
-	m, _ := ctx.Value(metaKey).(Meta)
-	return m
+	return state.Get[Meta](ctx)
 }
 
 type Store struct {
