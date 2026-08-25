@@ -661,6 +661,28 @@ func Tag() string { return "dev" }
 	}
 }
 
+func TestClientRoutePackageNamedConfigIsNotServerState(t *testing.T) {
+	root := project(t, map[string]string{
+		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
+		"client/pages/app.templ": goodShell,
+		"client/pages/index.client.templ": `package pages
+
+import "example.com/app/client/pages/settings/config"
+
+templ Page() { @config.Page() }
+`,
+		"client/pages/settings/config/index.templ": `package config
+
+templ Page() { <p>configuration</p> }
+`,
+	})
+	for _, d := range runCheck(root, false).Diagnostics {
+		if d.Rule == "client-imports-server-package" {
+			t.Fatalf("client route package name produced a server-state error: %#v", d)
+		}
+	}
+}
+
 func TestHowlServerPackageCannotReachClientRoute(t *testing.T) {
 	root := project(t, map[string]string{
 		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
