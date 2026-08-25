@@ -47,6 +47,9 @@ a := app.New(app.Config{
     NotFound: pages.NotFound,
     Public:   public,                   // its own css; app.js comes from core
     Data:     data,                     // context for every render
+	Bootstrap: func(ctx context.Context, path string) any {
+		return state.Get[AppState](ctx)    // runtime state restored before wasm renders
+	},
     Use: []mw.Middleware{               // outermost first; plain net/http
         mw.RequestID, mw.Logger(nil), mw.Recover(nil), mw.Compress{}.Handler,
     },
@@ -314,7 +317,8 @@ GOOS=js GOARCH=wasm go build -o client/public/views.wasm ./wasm
 ```
 
 `wasm/main.go` imports the **same generated route table** and the same templ
-components, and exports `howlRender(path, dataJSON)`. Not a port — it resolves
+components, and exports `howlRender(path, renderPayloadJSON)`. The payload keeps
+per-request bootstrap state separate from route data. Not a port — it resolves
 the path through `router.Lookup`, exactly as the server does:
 
 | | |

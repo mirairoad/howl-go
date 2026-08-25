@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/a-h/templ v0.3.1020
-	github.com/mirairoad/howl-go v0.0.0-20260725204857-9a42f30ec000
+	github.com/mirairoad/howl-go v0.1.1-0.20260822030038-75b03e5072a3
 )
 
 require (

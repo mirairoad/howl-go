@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -435,6 +436,39 @@ func TestClientConfigCarriesPerRouteData(t *testing.T) {
 	}
 }
 
+func TestBootstrapIsPerRequestAndRunsAfterData(t *testing.T) {
+	type appState struct {
+		Version string `json:"version"`
+	}
+	type key struct{}
+	var sequence int
+	var got []router.Client
+	a := New(Config{
+		Routes: []router.Route{{Pattern: "/", Label: "Home", Page: func() templ.Component {
+			return comp(func(ctx context.Context, w io.Writer) error {
+				got = append(got, router.ClientConfig(ctx))
+				return nil
+			})
+		}}},
+		Shell: shell,
+		Data: func(ctx context.Context, _ string) context.Context {
+			sequence++
+			return context.WithValue(ctx, key{}, appState{Version: fmt.Sprintf("v%d", sequence)})
+		},
+		Bootstrap: func(ctx context.Context, _ string) any {
+			return ctx.Value(key{}).(appState)
+		},
+	})
+	get(a.Mux(), "/", nil)
+	get(a.Mux(), "/", nil)
+	if len(got) != 2 {
+		t.Fatalf("renders = %d", len(got))
+	}
+	if got[0].Bootstrap.(appState).Version != "v1" || got[1].Bootstrap.(appState).Version != "v2" {
+		t.Fatalf("bootstrap values = %#v, %#v", got[0].Bootstrap, got[1].Bootstrap)
+	}
+}
+
 // Parameters come from the mux, which already matched the pattern to get here.
 // Re-deriving them was the O(routes) scan this replaced, so the thing worth
 // testing is that the values still arrive.
@@ -452,5 +486,30 @@ func TestParamsComeFromTheMux(t *testing.T) {
 	rec := get(testApp(rt).Mux(), "/blog/fs-routing/c/7", nil)
 	if !strings.Contains(rec.Body.String(), "fs-routing|7") {
 		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+// A .raw route is its own document: no shell, no layouts. The client is told
+// which patterns those are so it can hand them to the browser instead of
+// swapping one into #outlet, where it would inherit the chrome of whatever page
+// the user came from — and disagree with what a reload shows.
+func TestClientConfigCarriesRawRoutes(t *testing.T) {
+	var got router.Client
+	a := New(Config{
+		Routes: []router.Route{
+			{Pattern: "/metrics", Label: "Metrics", Page: func() templ.Component { return text("<p>m</p>") }},
+			{Pattern: "/status", Label: "Status", Raw: true, Page: func() templ.Component { return text("<p>ok</p>") }},
+		},
+		Shell: shell,
+		Data: func(ctx context.Context, _ string) context.Context {
+			got = router.ClientConfig(ctx)
+			return ctx
+		},
+		Public: fstest.MapFS{},
+	})
+	get(a.Mux(), "/metrics", nil)
+
+	if len(got.Raw) != 1 || got.Raw[0] != "/status" {
+		t.Fatalf("Raw = %v, want [/status]", got.Raw)
 	}
 }

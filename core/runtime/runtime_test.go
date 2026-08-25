@@ -20,3 +20,16 @@ func TestAppJSNoSPAUsesAttributePresence(t *testing.T) {
 		t.Fatal("truthiness check ignores data-no-spa with an empty value")
 	}
 }
+
+func TestAppJSPassesStructuredRenderPayload(t *testing.T) {
+	source, err := fs.ReadFile(Assets(), "app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(source)
+	for _, want := range []string{"bootstrap: CONFIG.bootstrap", "routeData,", "JSON.stringify({"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("app.js does not pass %q to the wasm renderer", want)
+		}
+	}
+}

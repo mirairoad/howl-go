@@ -76,6 +76,12 @@ type Config struct {
 	// it empty when client routes need no data — the fetch is then skipped
 	// entirely rather than failing on a URL that does not exist.
 	ClientData string
+	// Bootstrap returns runtime state that client-renderable components need on
+	// every navigation: the running version, viewer, permissions or settings.
+	// It runs per request after Data, is serialized into howl-client by the
+	// shell, and is restored by the application's wasm renderer before render.
+	// Do not put secrets here: the value is sent to the browser.
+	Bootstrap func(ctx context.Context, path string) any
 }
 
 type App struct {
@@ -132,6 +138,7 @@ func New(cfg Config) *App {
 		},
 		client: router.Client{
 			Wasm:  router.NeedsWasm(cfg.Routes),
+			Raw:   router.RawRoutes(cfg.Routes),
 			Data:  cfg.ClientData,
 			Pages: router.PageData(cfg.Routes),
 			Live:  liveEndpoint(),
@@ -189,10 +196,16 @@ func (a *App) context(ctx context.Context, path string, params map[string]string
 		client.Binary = a.asset("views.wasm")
 		client.Exec = a.asset("wasm_exec.js")
 	}
+	// Data has historically been able to inspect ClientConfig. Install the
+	// static part first, then replace it below with the per-request bootstrap.
 	ctx = router.WithClient(ctx, client)
 	if a.cfg.Data != nil {
 		ctx = a.cfg.Data(ctx, path)
 	}
+	if a.cfg.Bootstrap != nil {
+		client.Bootstrap = a.cfg.Bootstrap(ctx, path)
+	}
+	ctx = router.WithClient(ctx, client)
 	return ctx
 }
 

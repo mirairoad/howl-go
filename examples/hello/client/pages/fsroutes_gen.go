@@ -10,6 +10,6 @@ import (
 // FsClientRoutes is the route table derived from the page tree.
 func FsClientRoutes() []router.Route {
 	return []router.Route{
-		{Pattern: "/", Label: "Home", Page: Page, Head: Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false},
+		{Pattern: "/", Label: "Home", Page: Page, Head: Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
 	}
 }

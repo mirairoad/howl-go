@@ -129,7 +129,9 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 				"the conventions every JS framework uses. Before writing anything that updates in the browser, " +
 				"call howl_conventions with section=\"Making a page interactive\": there are no hooks, no " +
 				"re-render and no dependency array here, so a page written from JS habits compiles and then " +
-				"silently never updates. Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
+				"silently never updates. Before editing a .client route, its layouts or shared components, call " +
+				"howl_conventions with section=\"Client render safety\": process globals describe the wasm " +
+				"build after local navigation, not the running server. Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
 				"collection by hand — it writes the wiring that has no analogue elsewhere. Call howl_check " +
 				"after editing.",
 		}, nil
@@ -186,7 +188,8 @@ func tools() []tool {
 	// the API on its own implies none of the shape a reactive page needs.
 	sections := "Mental model, Packages, Application layout, Bootstrap a new app, Routing conventions, " +
 		"Page anatomy, core/router API, core/app API, core/mw, Logging, core/state, core/signal, " +
-		"Browser: core/dom and window.howl, Making a page interactive, The wasm renderer, Endpoints, " +
+		"Browser: core/dom and window.howl, Making a page interactive, Client render safety, " +
+		"The wasm renderer, Endpoints, " +
 		"The document store (db), Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
 	return []tool{
 		{
@@ -196,7 +199,8 @@ func tools() []tool {
 				"page anatomy, the shell contract, the package layering rule, the endpoint layer, how a page is " +
 				"made reactive, and an explicit list of things not to invent. Read this before writing howl-go " +
 				"code — Go rejects _layout.templ and [id].templ, and there are no hooks and no re-render, so the " +
-				"answers here look different from every JS framework on purpose. Sections: " + sections,
+				"answers here look different from every JS framework on purpose. Client render safety also " +
+				"defines which runtime values must be bootstrapped instead of read from Go globals. Sections: " + sections,
 			InputSchema: object(map[string]any{
 				"section": str("optional heading to return on its own, e.g. \"Routing conventions\" or " +
 					"\"Making a page interactive\". One of: " + sections),
@@ -210,7 +214,9 @@ func tools() []tool {
 				"endpoints reading the raw query instead of their declared one, roles declared with no Authorize " +
 				"wired, hand-edited generated files — plus the browser-side rules that all fail silently: a Mount " +
 				"that subscribes with no Unmount, a discarded effect stop func, server code importing core/signal, " +
-				"a store that cannot compile for wasm. It also resolves every @pkg.Component() reference against " +
+				"a store that cannot compile for wasm. Client render checks trace .client routes through their " +
+				"layouts and module-local UI imports, rejecting server-only packages and process-dependent calls " +
+				"such as os.Getenv, time.Now and runtime.Version. It also resolves every @pkg.Component() reference against " +
 				"what that package declares, so `undefined: components.SettingsShell`, a wrong argument count and " +
 				"an unexported component are reported at the .templ line that caused them instead of at a " +
 				"generated file the author never wrote. Warnings cover cost put in the wrong place, which the " +

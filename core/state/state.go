@@ -17,7 +17,10 @@
 // anyway.
 package state
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // key is generic, so key[User]{} and key[Session]{} are distinct types and
 // therefore distinct, uncollidable context keys.
@@ -39,4 +42,18 @@ func From[T any](ctx context.Context) (T, bool) {
 func Get[T any](ctx context.Context) T {
 	v, _ := From[T](ctx)
 	return v
+}
+
+// Hydrate decodes a bootstrap or route-data value and installs it on ctx.
+// It is the browser half of state.With(ctx, value): SSR constructs T from
+// runtime server state, while the wasm renderer restores the exact serialized
+// T before rendering the same component.
+func Hydrate[T any](ctx context.Context, data json.RawMessage) (context.Context, error) {
+	var v T
+	if len(data) != 0 && string(data) != "null" {
+		if err := json.Unmarshal(data, &v); err != nil {
+			return ctx, err
+		}
+	}
+	return With(ctx, v), nil
 }

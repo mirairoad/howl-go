@@ -21,8 +21,8 @@ github.com/mattn/go-colorable v0.1.13/go.mod h1:7S9/ev0klgBDR4GtXTXX8a3vIGJpMovk
 github.com/mattn/go-isatty v0.0.16/go.mod h1:kYGgaQfpe5nmfYZH+SKPsOc2e4SrIfOl2e/yFXSvRLM=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
-github.com/mirairoad/howl-go v0.0.0-20260725204857-9a42f30ec000 h1:RUviGyXcuak7jAZqOnHpNZsgzKHlCO47s2aPm0eFTGc=
-github.com/mirairoad/howl-go v0.0.0-20260725204857-9a42f30ec000/go.mod h1:f4xy4K7eeCU6ABUltOxz50PyZ2ARjvQVf5/duD9E3v4=
+github.com/mirairoad/howl-go v0.1.1-0.20260822030038-75b03e5072a3 h1:yGP/Yge4LQPcxWyYOoeKcmvjMMsQ+FwEaCO1A81A5Fg=
+github.com/mirairoad/howl-go v0.1.1-0.20260822030038-75b03e5072a3/go.mod h1:f4xy4K7eeCU6ABUltOxz50PyZ2ARjvQVf5/duD9E3v4=
 github.com/natefinch/atomic v1.0.1 h1:ZPYKxkqQOx3KZ+RsbnP/YsgvxWQPGxjC0oBt2AhwV0A=
 github.com/natefinch/atomic v1.0.1/go.mod h1:N/D/ELrljoqDyT3rZrsUmtsuzvHkeB/wWjHV22AZRbM=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
