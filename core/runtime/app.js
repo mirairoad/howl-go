@@ -758,8 +758,16 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
     return;
   }
 
-  document.body.classList.add("loading");
-  progressStart();
+  // A same-page re-render is not a navigation, so it does not get navigation
+  // chrome. Dimming the outlet to 55% and swapping the cursor to `progress`
+  // for the ~10ms an in-flight fragment takes on loopback reads as the page
+  // reloading on every click — which is what the caller was avoiding by using
+  // a fragment swap in the first place.
+  const chrome = !fresh;
+  if (chrome) {
+    document.body.classList.add("loading");
+    progressStart();
+  }
   try {
     const entry = await prefetch(url);
     if (seq !== mine) return; // a newer navigation won the race
@@ -770,7 +778,7 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
   } catch {
     location.href = url; // any failure degrades to a normal page load
   } finally {
-    if (seq === mine) {
+    if (chrome && seq === mine) {
       document.body.classList.remove("loading");
       progressDone();
     }
