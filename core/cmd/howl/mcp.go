@@ -13,6 +13,24 @@ import (
 	"strings"
 )
 
+// headingLevel counts the leading '#' of a Markdown ATX heading, and returns 0
+// for anything else. This file is mostly code blocks, and a shell comment at the
+// start of one of them looks exactly like an h1 — so a fenced line is never a
+// heading, whatever it starts with.
+func headingLevel(line string, fenced bool) int {
+	if fenced {
+		return 0
+	}
+	n := 0
+	for n < len(line) && line[n] == '#' {
+		n++
+	}
+	if n == 0 || n >= len(line) || line[n] != ' ' {
+		return 0
+	}
+	return n
+}
+
 // ---------------------------------------------------------------------------
 // howl mcp — the conventions as tools an agent can call
 //
@@ -337,16 +355,26 @@ func conventions(section string) string {
 	}
 	lines := strings.Split(text, "\n")
 	var out []string
-	capturing := false
+	depth := 0 // the level of the heading that matched; 0 while still looking
+	fenced := false
 	for _, line := range lines {
-		if strings.HasPrefix(line, "#") {
-			heading := strings.TrimSpace(strings.TrimLeft(line, "# "))
-			if capturing {
-				break
-			}
-			capturing = strings.Contains(strings.ToLower(heading), strings.ToLower(section))
+		if strings.HasPrefix(line, "```") {
+			fenced = !fenced
 		}
-		if capturing {
+		if level := headingLevel(line, fenced); level > 0 {
+			// Stop only at a heading that is a sibling or an ancestor of the
+			// one that matched. Breaking at any heading truncated every
+			// section that has subheadings — "Making a page interactive"
+			// returned 870 of its 7800 bytes, its intro and none of the rules.
+			if depth > 0 {
+				if level <= depth {
+					break
+				}
+			} else if heading := strings.TrimSpace(strings.TrimLeft(line, "# ")); strings.Contains(strings.ToLower(heading), strings.ToLower(section)) {
+				depth = level
+			}
+		}
+		if depth > 0 {
 			out = append(out, line)
 		}
 	}
