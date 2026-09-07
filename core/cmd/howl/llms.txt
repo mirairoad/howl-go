@@ -475,7 +475,7 @@ in a goroutine: blocking the JS callback deadlocks the Go scheduler.
 JS side — `window.howl` is the entire public API:
 
 ```js
-howl.navigate(url, { replace, transition, scroll })
+howl.navigate(url, { replace, transition, scroll, fresh })
 howl.prefetch(url)
 howl.island(name, (el, props) => { … })   // your islands live in YOUR script, not the framework
 howl.config                                // { wasm: [...], data: "..." }
@@ -488,6 +488,12 @@ Markup attributes the client runtime understands:
 | `data-island="name" data-props='{…}'` | hydrated by a registered island |
 | `data-no-prefetch` | do not warm this link (or subtree) |
 | `data-no-spa` | full page load, do not intercept |
+
+`fresh: true` skips the prefetch cache. Use it for the navigation that follows a
+write — re-rendering the page the user is already on. Without it a fragment
+cached less than 15 s ago is served as-is, which for a form → endpoint →
+re-render application means the page shows the state *before* the change and
+then silently corrects itself once the entry ages out.
 
 A `*.raw.templ` route is never intercepted either: it is its own document, so
 swapping it into `#outlet` would dress it in the chrome of whatever page the
