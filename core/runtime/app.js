@@ -687,7 +687,16 @@ function applyFragment(url, entry, push, restore, transition, replace) {
   markActive();
 }
 
-async function navigate(url, { push = true, restore = 0, transition = null, replace = false } = {}) {
+async function navigate(url, { push = true, restore = 0, transition = null, replace = false, fresh = false } = {}) {
+  // A re-render of the page the caller is already on, not a navigation to it.
+  //
+  // The prefetch cache serves an entry younger than FRESH_MS without asking the
+  // server, which is right for a link and wrong for the navigation that follows
+  // a mutation: the application has just changed the thing the page describes,
+  // and the cached fragment is by definition the state before the change. An
+  // application doing form -> endpoint -> re-render sees its own writes vanish
+  // for fifteen seconds and then appear.
+  if (fresh) CACHE.delete(url);
   // A .raw route is its own document. spaTarget already declines to intercept a
   // link to one, but howl.navigate() and a restored history entry both arrive
   // here without passing through it.
@@ -730,7 +739,7 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
     // user is still on this route and the server actually returned something new.
     if (age > FRESH_MS) {
       CACHE.delete(url);
-      const fresh = await prefetch(url);
+      const latest = await prefetch(url);
       // An innerHTML swap destroys focus, caret position, scroll and any typed
       // input. If the user is mid-interaction, keep the stale DOM — this is the
       // structural limit of swap-based rendering, and where a real VDOM wins.
@@ -738,11 +747,11 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
         /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
       if (busy) {
         navLog && (navLog.textContent = `precached nav → ${url} · 0 RTT · revalidation deferred (input focused)`);
-      } else if (fresh && seq === mine && location.pathname + location.search === url && fresh.html !== hit.html) {
+      } else if (latest && seq === mine && location.pathname + location.search === url && latest.html !== hit.html) {
         // Deliberately untransitioned: this is a background refresh of the page
         // the user is already looking at, and animating it would read as a
         // navigation they did not perform.
-        applyFragment(url, fresh, false, window.scrollY, null);
+        applyFragment(url, latest, false, window.scrollY, null);
         navLog && (navLog.textContent = `precached nav → ${url} · 0 RTT · revalidated in background`);
       }
     }
@@ -839,6 +848,10 @@ globalThis.howl = {
       transition: opts.transition || null,
       replace: Boolean(opts.replace),
       restore: typeof opts.scroll === "number" ? opts.scroll : 0,
+      // Skip the prefetch cache for this one. What it is for is re-rendering
+      // the current page after a write, where a cached fragment is guaranteed
+      // to be the state before it.
+      fresh: Boolean(opts.fresh),
     });
   },
   prefetch(url) {
