@@ -77,6 +77,7 @@ myapp/
     ui/                         shared components (leaf package)
     store/                      domain types + state (leaf, compiles for wasm)
   wasm/main.go                  optional: the browser renderer (GOOS=js)
+  desktop/main.go               optional: native window — nested module, see below
 ```
 
 `client/pages/` is the only special directory. Everything else is ordinary Go packages.
@@ -356,6 +357,7 @@ mux := a.Mux()                          // routes + /static/ + 404 fallback
 mux.HandleFunc("GET /api/things", …)    // your own handlers, plain net/http
 a.Mount("/admin", adminHandler)         // sub-app, prefix stripped
 log.Fatal(a.Listen(mux))                // applies Use + logs the startup line
+a.Serve(ln, mux)                        // Listen with the listener already open
 
 a.Handler()                             // Mux wrapped in Use — for tests/custom servers
 a.Wrap(h)                               // apply Use to any handler
@@ -921,6 +923,109 @@ Test against `db/memdb`, which is the same contract over a map. Both backends ru
 `name: "users"`, `fields: ["email:string"]`) — nothing generates from `server/store/`,
 so the location is convention, not machinery.
 
+## Native window (`desktop`)
+
+The same application in an OS-native window instead of a browser — WKWebView on macOS,
+WebKitGTK on Linux. No bundled runtime and no second language: the window is a C++ shim
+over a webview the OS already ships, and the server is the same `*app.App` this binary
+would otherwise `Listen` with, on a loopback socket nothing else can reach.
+
+```go
+// main.go of the desktop binary — the whole of it
+a, mux := boot.New()                       // the same app.New(...) the server uses
+if err := desktop.Run(a, mux, desktop.Options{
+	Title:  "myapp",
+	Width:  1180,
+	Height: 820,
+	Attach: *attach,                       // "" = own loopback server; ":9000" = howl dev
+	Debug:  *debug,                        // inspector + right-click menu
+}); err != nil {
+	log.Fatal(err)
+}
+```
+
+`desktop.Run` blocks until the window closes and is the last line of `main`, like `a.Listen`
+— but **not `log.Fatal(desktop.Run(...))`**: closing a window is how the user quits, so it
+returns `nil` there, and the `a.Listen` idiom would print `<nil>` and exit 1. With `Attach` empty it binds `127.0.0.1:0` — the kernel picks the port and
+the window is the only thing that ever learns it, so a second instance cannot collide and
+no other process on the machine can reach the app.
+
+### It is a separate module
+
+`github.com/mirairoad/howl-go/desktop` has its own `go.mod`. It needs cgo and a webview
+binding; the framework's `go.mod` has one dependency and keeps it. Nothing under `core/`
+imports this — an application opts in from its own main, and the desktop binary is a
+nested module too (`replace` back to the app, same shape as `db/pg/livetest`).
+
+### The dev loop is the reason for `Attach`
+
+```bash
+howl dev -dir . -addr :9000 &      # rebuilds and restarts the server on save
+./myapp_desktop -attach :9000      # attaches to the front door, once
+```
+
+`howl dev` keeps its proxy port up across restarts, so the window connects once and the
+dev client reloads the content in place on every rebuild. **Do not run the desktop binary
+as `howl dev`'s child** — dev restarts what it builds, and that would kill and respawn the
+window on every save.
+
+`desktop.Run` waits for the address to answer before opening. Without the wait a window
+started next to `howl dev` races the first build and lands on connection-refused — a page
+no rebuild can reload, because the dev client that would have reloaded it was never served.
+
+### `a.Serve` — the listener you opened yourself
+
+```go
+ln, _ := net.Listen("tcp", "127.0.0.1:0")
+a.Serve(ln, mux)                       // Listen, minus opening the socket and minus the
+                                       // startup line: only the caller knows an address
+```
+
+`a.Listen` is now `net.Listen` + `a.Serve`. Same middleware chain, same static warming.
+
+### `go:embed` cannot reach `..`
+
+Two binaries now need `client/public`, and the embed cannot live in either main. Put it one
+directory above the files, in `client/assets.go`:
+
+```go
+package client
+
+//go:embed public
+var publicFS embed.FS
+
+func Public() fs.FS { sub, _ := fs.Sub(publicFS, "public"); return sub }
+```
+
+For the same reason, the `app.Config` itself moves out of `main.go` into a `boot` package
+both mains import. The server main keeps only flags and `a.Listen`.
+
+### What it costs, and what it does not have
+
+The toy app's window binary is **17 MB** — one file, including the 7 MB wasm renderer.
+Keep the wasm: over loopback its download is free, and dropping it would mean full document
+loads on every navigation, which is exactly the signal state `.client` routes exist to keep.
+
+- macOS: WKWebView is in the OS. A bare binary works — webview sets the activation policy
+  itself, which non-bundled processes otherwise default to *prohibited*.
+- Linux: `libwebkit2gtk-4.1` is a runtime dependency. The binary is not fully static.
+- Windows: not wired up here.
+
+The binding creates **no menu bar** (zero `NSMenu`), so macOS key equivalents that come
+from one — ⌘Q, ⌘W, and the Edit menu's ⌘C/⌘V — are not there. Fine for an internal tool or
+a dev loop; a shipped product needs a menu, which is either ~80 lines of Objective-C in
+`desktop/` or a move to wails.
+
+Off by default and not worth re-deriving: the inspector (only when `Debug`), the webview's
+own right-click menu (Reload/Back/Forward — browser affordances in something that is not a
+browser), and dropped-file navigation, which would otherwise turn the app into a `file://`
+viewer with no address bar to get back from.
+
+Do not invent: `howl desktop` (there is no build verb — `go build` builds), a `.app` or
+AppImage packager, a tray icon, auto-update, or a frameless window. None of it exists.
+
+---
+
 ## Tooling for agents
 
 ```bash
@@ -1037,7 +1142,7 @@ variables, `router.Client.Live`, `core/api` + `core/cmd/fsapis` (typed endpoints
 generated table, generated client), `howl check` and `howl mcp`, `db` +
 `db/pg` + `db/memdb` (the document store), `//howl:data` + `Route.Data` +
 `router.Client.Pages` (per-route client data), `dom.On` returning a release func +
-`dom.Off`.
+`dom.Off`, the `desktop` module (native window) + `a.Serve`.
 
 Removed: `app.GzipStatic` (replaced by `app.Static`), the framework's built-in demo
 islands (applications register their own). The `howl-wasm-routes` JSON script still works
@@ -1052,4 +1157,5 @@ but is superseded by `howl-client`.
 - `DESIGN-LOG.md` — why every convention is what it is, and the bugs worth remembering
 - `examples/hello` — smallest standalone module importing the tagged release
 - `examples/toy_app` — dashboard, blog, local-first todos, wasm, islands
+- `examples/toy_app/desktop` — the same app in a native window (`make run-desktop`)
 - `www` — the documentation site, built with the framework

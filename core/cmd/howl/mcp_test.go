@@ -37,6 +37,15 @@ func TestConventionsSubsectionOnItsOwn(t *testing.T) {
 	}
 }
 
+func TestConventionsNativeWindow(t *testing.T) {
+	got := conventions("Native window")
+	for _, want := range []string{"desktop.Run", "Attach", "a.Serve", "go:embed"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Native window section is missing %q", want)
+		}
+	}
+}
+
 func TestConventionsUnknownSection(t *testing.T) {
 	if got := conventions("no such thing"); !strings.HasPrefix(got, "no section matching") {
 		t.Errorf("got %q", got)

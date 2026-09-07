@@ -149,7 +149,11 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 				"re-render and no dependency array here, so a page written from JS habits compiles and then " +
 				"silently never updates. Before editing a .client route, its layouts or shared components, call " +
 				"howl_conventions with section=\"Client render safety\": process globals describe the wasm " +
-				"build after local navigation, not the running server. Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
+				"build after local navigation, not the running server. Before packaging the app as a native " +
+				"window, call howl_conventions with section=\"Native window\": desktop is a separate module " +
+				"with a separate go.mod, there is no build verb to invoke, and the dev loop attaches the window " +
+				"to `howl dev` rather than being restarted by it. " +
+				"Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
 				"collection by hand — it writes the wiring that has no analogue elsewhere. Call howl_check " +
 				"after editing.",
 		}, nil
@@ -208,7 +212,8 @@ func tools() []tool {
 		"Page anatomy, core/router API, core/app API, core/mw, Logging, core/state, core/signal, " +
 		"Browser: core/dom and window.howl, Making a page interactive, Client render safety, " +
 		"The wasm renderer, Endpoints, " +
-		"The document store (db), Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
+		"The document store (db), Native window (desktop), " +
+		"Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
 	return []tool{
 		{
 			Name:  "howl_conventions",
@@ -218,7 +223,8 @@ func tools() []tool {
 				"made reactive, and an explicit list of things not to invent. Read this before writing howl-go " +
 				"code — Go rejects _layout.templ and [id].templ, and there are no hooks and no re-render, so the " +
 				"answers here look different from every JS framework on purpose. Client render safety also " +
-				"defines which runtime values must be bootstrapped instead of read from Go globals. Sections: " + sections,
+				"defines which runtime values must be bootstrapped instead of read from Go globals. \"Native window\" " +
+				"covers shipping the app as a single binary that opens an OS webview. Sections: " + sections,
 			InputSchema: object(map[string]any{
 				"section": str("optional heading to return on its own, e.g. \"Routing conventions\" or " +
 					"\"Making a page interactive\". One of: " + sections),
