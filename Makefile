@@ -1,4 +1,4 @@
-.PHONY: all core db test test-db-pg sync-llms toy www hello dev-toy dev-www clean
+.PHONY: all core db test test-db-pg sync-llms toy www hello desktop run-desktop dev-desktop dev-toy dev-www clean
 
 APPS := examples/toy_app www
 
@@ -46,6 +46,26 @@ dev-toy:
 dev-www:
 	go run ./core/cmd/howl dev -dir www -addr :9001 \
 		-pre "go run github.com/mirairoad/howl-go/core/cmd/mddocs"
+
+# The toy app in an OS-native window — WKWebView on macOS, WebKitGTK on Linux.
+# Not in `all`: it is a nested cgo module, so it must be asked for.
+desktop:
+	$(MAKE) -C examples/toy_app desktop
+
+run-desktop: desktop
+	./examples/toy_app/toy_desktop
+
+# The desktop development loop. `howl dev` rebuilds and restarts the server on
+# save but keeps its front door open, so the window attaches once and the dev
+# client reloads the content in place — the window itself is never killed.
+#
+# howl is built rather than `go run`, because the trap has to kill the dev
+# server itself and `go run` would leave it orphaned behind its wrapper.
+dev-desktop: desktop
+	@go build -o /tmp/howl-dev ./core/cmd/howl
+	@/tmp/howl-dev dev -dir examples/toy_app -addr :9000 & \
+		dev=$$!; trap "kill $$dev 2>/dev/null" EXIT INT TERM; \
+		./examples/toy_app/toy_desktop -attach :9000
 
 # Run one or the other; they bind the same port by default.
 run-toy: toy

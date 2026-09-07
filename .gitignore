@@ -8,3 +8,4 @@ examples/hello/howl-hello
 
 # `howl dev` builds the running binary here
 .howl/
+examples/toy_app/toy_desktop

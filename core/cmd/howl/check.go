@@ -298,16 +298,20 @@ func importLine(body []byte, imp string) int {
 // ---------------------------------------------------------------------------
 
 var (
-	importAppRe              = regexp.MustCompile(`"[^"]*howl-go/core/app"`)
-	importDBRe               = regexp.MustCompile(`"[^"]*howl-go/db(/[\w/]+)?"`)
-	templMountRe             = regexp.MustCompile(`(?m)^templ\s+(Mount|Unmount)\s*\(`)
-	rawQueryRe               = regexp.MustCompile(`r\.HTTP\.(URL\.Query\(\)|FormValue|PostFormValue)`)
-	rolesRe                  = regexp.MustCompile(`Roles:\s*\[\]string\{[^}]*"`)
-	authorizeRe              = regexp.MustCompile(`Authorize:\s*`)
-	structFieldRe            = regexp.MustCompile(`(?m)^\s+([A-Z]\w*)\s+[\[\]\*\w\.]+(\s+` + "`" + `[^` + "`" + `]*` + "`" + `)?\s*$`)
-	generatedRe              = regexp.MustCompile(`^// Code generated`)
-	runtimeStateCallRe       = regexp.MustCompile(`\b(os\.(Getenv|LookupEnv|Environ)|time\.Now|runtime\.Version)\s*\(`)
-	suspiciousClientImportRe = regexp.MustCompile(`/(internal/)?(build|config|auth|session)$`)
+	importAppRe        = regexp.MustCompile(`"[^"]*howl-go/core/app"`)
+	importDBRe         = regexp.MustCompile(`"[^"]*howl-go/db(/[\w/]+)?"`)
+	templMountRe       = regexp.MustCompile(`(?m)^templ\s+(Mount|Unmount)\s*\(`)
+	rawQueryRe         = regexp.MustCompile(`r\.HTTP\.(URL\.Query\(\)|FormValue|PostFormValue)`)
+	rolesRe            = regexp.MustCompile(`Roles:\s*\[\]string\{[^}]*"`)
+	authorizeRe        = regexp.MustCompile(`Authorize:\s*`)
+	structFieldRe      = regexp.MustCompile(`(?m)^\s+([A-Z]\w*)\s+[\[\]\*\w\.]+(\s+` + "`" + `[^` + "`" + `]*` + "`" + `)?\s*$`)
+	generatedRe        = regexp.MustCompile(`^// Code generated`)
+	runtimeStateCallRe = regexp.MustCompile(`\b(os\.(Getenv|LookupEnv|Environ)|time\.Now|runtime\.Version)\s*\(`)
+	// A route package is often legitimately named settings/config or auth.
+	// The heuristic is about application-internal runtime state, not the last
+	// segment of every import path. Other server-only packages can opt into the
+	// exact //howl:server marker checked above.
+	suspiciousClientImportRe = regexp.MustCompile(`/internal/(build|config|auth|session)$`)
 	serverDirectiveRe        = regexp.MustCompile(`//howl:server`)
 )
 

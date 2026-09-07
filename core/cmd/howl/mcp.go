@@ -13,6 +13,24 @@ import (
 	"strings"
 )
 
+// headingLevel counts the leading '#' of a Markdown ATX heading, and returns 0
+// for anything else. This file is mostly code blocks, and a shell comment at the
+// start of one of them looks exactly like an h1 — so a fenced line is never a
+// heading, whatever it starts with.
+func headingLevel(line string, fenced bool) int {
+	if fenced {
+		return 0
+	}
+	n := 0
+	for n < len(line) && line[n] == '#' {
+		n++
+	}
+	if n == 0 || n >= len(line) || line[n] != ' ' {
+		return 0
+	}
+	return n
+}
+
 // ---------------------------------------------------------------------------
 // howl mcp — the conventions as tools an agent can call
 //
@@ -131,7 +149,11 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 				"re-render and no dependency array here, so a page written from JS habits compiles and then " +
 				"silently never updates. Before editing a .client route, its layouts or shared components, call " +
 				"howl_conventions with section=\"Client render safety\": process globals describe the wasm " +
-				"build after local navigation, not the running server. Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
+				"build after local navigation, not the running server. Before packaging the app as a native " +
+				"window, call howl_conventions with section=\"Native window\": desktop is a separate module " +
+				"with a separate go.mod, there is no build verb to invoke, and the dev loop attaches the window " +
+				"to `howl dev` rather than being restarted by it. " +
+				"Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
 				"collection by hand — it writes the wiring that has no analogue elsewhere. Call howl_check " +
 				"after editing.",
 		}, nil
@@ -190,7 +212,8 @@ func tools() []tool {
 		"Page anatomy, core/router API, core/app API, core/mw, Logging, core/state, core/signal, " +
 		"Browser: core/dom and window.howl, Making a page interactive, Client render safety, " +
 		"The wasm renderer, Endpoints, " +
-		"The document store (db), Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
+		"The document store (db), Native window (desktop), " +
+		"Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
 	return []tool{
 		{
 			Name:  "howl_conventions",
@@ -200,7 +223,8 @@ func tools() []tool {
 				"made reactive, and an explicit list of things not to invent. Read this before writing howl-go " +
 				"code — Go rejects _layout.templ and [id].templ, and there are no hooks and no re-render, so the " +
 				"answers here look different from every JS framework on purpose. Client render safety also " +
-				"defines which runtime values must be bootstrapped instead of read from Go globals. Sections: " + sections,
+				"defines which runtime values must be bootstrapped instead of read from Go globals. \"Native window\" " +
+				"covers shipping the app as a single binary that opens an OS webview. Sections: " + sections,
 			InputSchema: object(map[string]any{
 				"section": str("optional heading to return on its own, e.g. \"Routing conventions\" or " +
 					"\"Making a page interactive\". One of: " + sections),
@@ -337,16 +361,26 @@ func conventions(section string) string {
 	}
 	lines := strings.Split(text, "\n")
 	var out []string
-	capturing := false
+	depth := 0 // the level of the heading that matched; 0 while still looking
+	fenced := false
 	for _, line := range lines {
-		if strings.HasPrefix(line, "#") {
-			heading := strings.TrimSpace(strings.TrimLeft(line, "# "))
-			if capturing {
-				break
-			}
-			capturing = strings.Contains(strings.ToLower(heading), strings.ToLower(section))
+		if strings.HasPrefix(line, "```") {
+			fenced = !fenced
 		}
-		if capturing {
+		if level := headingLevel(line, fenced); level > 0 {
+			// Stop only at a heading that is a sibling or an ancestor of the
+			// one that matched. Breaking at any heading truncated every
+			// section that has subheadings — "Making a page interactive"
+			// returned 870 of its 7800 bytes, its intro and none of the rules.
+			if depth > 0 {
+				if level <= depth {
+					break
+				}
+			} else if heading := strings.TrimSpace(strings.TrimLeft(line, "# ")); strings.Contains(strings.ToLower(heading), strings.ToLower(section)) {
+				depth = level
+			}
+		}
+		if depth > 0 {
 			out = append(out, line)
 		}
 	}

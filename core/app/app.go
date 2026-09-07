@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -438,14 +439,26 @@ func (a *App) Log() *slog.Logger {
 // JSON under systemd. It is the one line you always want: a server that is up
 // and a server that is up *on the port you meant* look identical otherwise.
 func (a *App) Listen(h http.Handler) error {
+	ln, err := net.Listen("tcp", a.cfg.Addr)
+	if err != nil {
+		return err
+	}
+	a.Log().Info("listening",
+		slog.String("url", localURL(a.cfg.Addr)),
+		slog.Int("routes", len(a.cfg.Routes)),
+	)
+	return a.Serve(ln, h)
+}
+
+// Serve is Listen with the listener already open. Two callers need that: a
+// desktop shell, which binds 127.0.0.1:0 and only learns its port afterwards,
+// and socket activation, which is handed the listener by the supervisor. It
+// logs no address, because at this point only the caller knows one.
+func (a *App) Serve(ln net.Listener, h http.Handler) error {
 	log := a.Log()
 	for _, rt := range a.cfg.Routes {
 		log.Debug("route", slog.String("pattern", rt.Pattern), slog.Bool("client", rt.Client))
 	}
-	log.Info("listening",
-		slog.String("url", localURL(a.cfg.Addr)),
-		slog.Int("routes", len(a.cfg.Routes)),
-	)
 
 	// Compress the static files now rather than on someone's first request. In
 	// the background, because a large wasm binary takes a few hundred
@@ -461,7 +474,7 @@ func (a *App) Listen(h http.Handler) error {
 			)
 		}
 	}()
-	return http.ListenAndServe(a.cfg.Addr, Latency(a.Wrap(h)))
+	return http.Serve(ln, Latency(a.Wrap(h)))
 }
 
 // liveEndpoint is where the browser subscribes to rebuild notifications. Only
