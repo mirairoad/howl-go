@@ -57,6 +57,13 @@ type Options struct {
 	// both platforms. Off by default: webview only sets developerExtrasEnabled
 	// when it is asked to, so a shipped binary has no inspector at all.
 	Debug bool
+	// NoMenu leaves the application without a macOS menu bar. Almost never
+	// what you want: the binding creates no NSMenu at all, and on macOS the
+	// standard key equivalents are menu-item behaviour rather than window
+	// behaviour — so a window with no menu has no ⌘Q, no ⌘W, and no ⌘C or ⌘V
+	// inside the page. Set this only when the application installs its own
+	// NSMenu before calling Run. Ignored on Linux.
+	NoMenu bool
 	// ContextMenu keeps the webview's own right-click menu. It is suppressed by
 	// default because what it offers is Reload, Back, Forward and Services —
 	// browser affordances in something that is not presenting itself as a
@@ -99,6 +106,11 @@ func Run(a *app.App, h http.Handler, opt Options) error {
 
 	w := webview.New(opt.Debug)
 	defer w.Destroy()
+	// After New, which is what creates the NSApplication, and before Run,
+	// which is what starts its loop.
+	if !opt.NoMenu {
+		installMenu(opt.Title)
+	}
 	if !opt.ContextMenu && !opt.Debug {
 		w.Init(appChrome)
 	}

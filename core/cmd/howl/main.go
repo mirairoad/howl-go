@@ -34,6 +34,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "howl check:", err)
 			os.Exit(1)
 		}
+	case "package":
+		if err := packageApp(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "howl package:", err)
+			os.Exit(1)
+		}
 	case "mcp":
 		if err := mcpCommand(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "howl mcp:", err)
@@ -54,6 +59,7 @@ func usage() {
 usage:
   howl dev [flags]     watch, rebuild, restart, reload
   howl check [flags]   the conventions, enforced: -json for structured output
+  howl package [flags] the desktop binary as a .app or a Linux install tree
   howl mcp [flags]     serve the conventions and checks as MCP tools (stdio)
 
 run "howl <command> -h" for the flags.
