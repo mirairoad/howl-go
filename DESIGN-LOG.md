@@ -1335,6 +1335,27 @@ pieces assembled from the wrong framework's habits. The snippets are
 spliced into the page before the names are substituted, which is the one
 thing the first version got backwards.
 
+## Tests that need a browser
+
+Every change to `app.js` and `core/dom` in this branch was verified by hand
+in a real browser, and the design log records what was seen. That is
+honest, and it does not survive the next person. The obstacle was the
+non-goal: no Node, no npm. §The flash that looked like slowness has a jsdom
+test that was written and not checked in for that reason.
+
+The resolution is to read the non-goal as what it was for. It is about what
+an application needs to build and run: one Go module, no toolchain beside
+Go's. A test harness that only a framework contributor runs, in its own
+directory, with its own `package.json`, invoked by a `make` target nobody
+hits by accident, does not change that — `go.mod` is untouched and `make`
+never enters the directory. So `test/browser` boots the real `app.js` in
+jsdom and covers what could not be covered before: the morph's identity
+guarantees, the typed-into field, the transition attributes and the timer
+behind them, the fragment swap and head merge, the build-drift reload and
+the `.raw` escape. `core/dom` is still exercised by hand — it needs Go's
+wasm test runner, which needs Node and a DOM under it, and that is a second
+harness for a package whose logic is thin over `app.js`.
+
 ## 17. Open questions
 
 - **TinyGo** — would it bring 1.71 MB gzipped down to the 200–800 KB range, and

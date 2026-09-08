@@ -1,4 +1,4 @@
-.PHONY: all core db test test-db-pg sync-llms toy www hello desktop run-desktop dev-desktop dev-toy dev-www clean
+.PHONY: all core db test test-db-pg test-browser sync-llms toy www hello desktop run-desktop dev-desktop dev-toy dev-www clean
 
 APPS := examples/toy_app www
 
@@ -22,6 +22,13 @@ test:
 #     -e POSTGRES_PASSWORD=conf -e POSTGRES_DB=howl_conformance postgres:16-alpine
 test-db-pg:
 	cd db/pg/livetest && PG_URL=$${PG_URL:-postgres://postgres:conf@localhost:54329/howl_conformance} go test ./...
+
+# The client runtime and the morph can only be tested in a browser. This runs
+# the real app.js in jsdom. Node is a dependency of test/browser only — never
+# of the framework, never of `make` or `make test` — which is why it is a
+# separate target you have to ask for.
+test-browser:
+	cd test/browser && npm install --no-audit --no-fund --loglevel=error && npm test
 
 # llms.txt is the source of truth at the repo root. `howl mcp` embeds a copy so
 # the conventions tool answers the same way from a downloaded module as from a
