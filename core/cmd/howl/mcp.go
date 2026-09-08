@@ -309,6 +309,9 @@ func tools() []tool {
 					"description": "endpoint only; defaults to GET"},
 				"client": map[string]any{"type": "boolean", "description": "page only: also render it in the browser (.client), " +
 					"with Mount, a delegated listener, an auto-tracked effect and a one-line repaint"},
+				"modal": map[string]any{"type": "boolean", "description": "page only, with a store: also generate an edit " +
+					"modal — one signal, one effect, every way in and out writing the signal. The recipe models get " +
+					"wrong most, written for them"},
 				"store": str("page only: the store this page renders, e.g. todos — wires the signal, the repaint and the " +
 					"hydrate call to client/store/<name>.go. Scaffold the store first."),
 				"roles": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "endpoint only: role strings your Authorize will interpret"},
@@ -331,6 +334,7 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 		Name    string   `json:"name"`
 		Method  string   `json:"method"`
 		Client  bool     `json:"client"`
+		Modal   bool     `json:"modal"`
 		Roles   []string `json:"roles"`
 		Store   string   `json:"store"`
 		Fields  []string `json:"fields"`
@@ -366,7 +370,7 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 	case "howl_scaffold":
 		return scaffold(dir, request{
 			Kind: args.Kind, Path: args.Path, Name: args.Name, Method: args.Method,
-			Store: args.Store, Client: args.Client, Roles: args.Roles, Fields: args.Fields,
+			Store: args.Store, Client: args.Client, Modal: args.Modal, Roles: args.Roles, Fields: args.Fields,
 		})
 	}
 	return "", fmt.Errorf("unknown tool %q", name)

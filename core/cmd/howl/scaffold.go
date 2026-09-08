@@ -28,6 +28,7 @@ type request struct {
 	Method string
 	Store  string   // page only: the store it renders, wired for real
 	Client bool     // page only: also rendered in the browser
+	Modal  bool     // page only, with a store: an edit modal on one signal and one effect
 	Roles  []string // endpoint only
 	Fields []string // store and collection only
 }
@@ -44,7 +45,7 @@ func scaffold(root string, req request) (string, error) {
 	}
 	switch req.Kind {
 	case "page":
-		return scaffoldPage(root, req.Path, req.Name, req.Store, req.Client)
+		return scaffoldPage(root, req.Path, req.Name, req.Store, req.Client, req.Modal)
 	case "endpoint":
 		return scaffoldEndpoint(root, req.Path, req.Name, req.Method, req.Roles)
 	}
@@ -395,12 +396,26 @@ func (s *$ITEMStore) Del(id int) {
 }
 
 // Apply runs one op. The server and the browser call this same method.
+func (s *$ITEMStore) Edit(id int, v string) {
+	s.mu.Lock()
+	for i := range s.items {
+		if s.items[i].ID == id {
+			s.items[i].$FIRST = v
+		}
+	}
+	s.mu.Unlock()
+	s.publish()
+}
+
+// Apply runs one op. Server and client call this same method.
 func (s *$ITEMStore) Apply(op $ITEMOp) {
 	switch op.Kind {
 	case "add":
 		s.Add(op.$FIRST)
 	case "del":
 		s.Del(op.ID)
+	case "edit":
+		s.Edit(op.ID, op.$FIRST)
 	}
 }
 `
@@ -607,7 +622,7 @@ func $LOWERReplay(sn $ITEMSnapshot, ops ...$ITEMOp) $ITEMSnapshot {
 }
 `
 
-func scaffoldPage(root, urlPath, label, store string, client bool) (string, error) {
+func scaffoldPage(root, urlPath, label, store string, client, modal bool) (string, error) {
 	segments := splitPath(urlPath)
 	if len(segments) == 0 {
 		return "", fmt.Errorf("scaffold: / already exists as client/pages/index.templ")
@@ -666,7 +681,7 @@ templ %s() {
 
 	note := "Re-run the generators (make, or howl dev picks it up on save)."
 	if client {
-		body = clientPage(root, pkg, label, component, store)
+		body = clientPage(root, pkg, label, component, store, modal)
 		note = "Re-run the generators, then build the wasm binary — a .client route needs it:\n" +
 			"  GOOS=js GOARCH=wasm go build -o client/public/views.wasm ./wasm\n\n" +
 			"Mount runs in a scope: what it registers is released when the page leaves, so it " +
@@ -693,7 +708,7 @@ templ %s() {
 // the part with no analogue in a JS framework: no hooks, no re-render, no
 // virtual DOM — a plain func, an auto-tracked effect, and one component
 // rendered by the same templ code the server ran.
-func clientPage(root, pkg, label, component, store string) string {
+func clientPage(root, pkg, label, component, store string, modal bool) string {
 	// Wired to a store when there is one to wire to: the signal, the hydrate
 	// call and the repaint then all refer to something real, which is the
 	// difference between an example and a working page.
@@ -756,11 +771,92 @@ func Mount() {
 	}
 	storeImport := modulePath(root) + "/client/store"
 
+	// The modal is the recipe models get wrong most, so it is generated whole
+	// when asked for: one signal, one effect, every way in and out writing the
+	// signal. Empty strings otherwise, so the page reads clean without it.
+	row := `		<li data-key={ strconv.Itoa(it.ID) }>{ it.$FIRSTFIELD }</li>`
+	markup, state, mount, funcs := "", "", "", ""
+	if modal {
+		row = `		<li data-key={ strconv.Itoa(it.ID) }>
+			<span>{ it.$FIRSTFIELD }</span>
+			<button data-edit={ strconv.Itoa(it.ID) }>edit</button>
+		</li>`
+		markup = `		<!-- The modal lives OUTSIDE the repainted list. One signal decides
+		     whether it is open; one effect toggles hidden, fills the field and
+		     focuses it. Every way in and out writes that signal. -->
+		<div data-modal hidden>
+			<div data-close></div>
+			<div role="dialog" aria-modal="true">
+				<input data-edit-text autocomplete="off"/>
+				<button data-save>save</button>
+				<button data-close>cancel</button>
+			</div>
+		</div>
+`
+		state = `// editing is the modal's whole state: the id being edited, 0 when closed.
+// Open, close, Escape, backdrop and save all write this one signal; the
+// effect in Mount is the only thing that touches the modal's DOM.
+var editing = signal.Of(0)
+
+`
+		mount = `	// The modal. Edit buttons are in the repainted list, so they are
+	// delegated; the field is outside it, so it gets On.
+	modal := root.Query("[data-modal]")
+	field := modal.Query("[data-edit-text]")
+	root.Delegate("click", "[data-edit]", func(e dom.Event) {
+		id, _ := strconv.Atoi(e.Target().Attr("data-edit"))
+		editing.Set(id)
+	})
+	root.Delegate("click", "[data-close]", func(dom.Event) { editing.Set(0) })
+	root.Delegate("click", "[data-save]", func(dom.Event) { saveEdit(field.Value()) })
+	field.On("keydown", func(e dom.Event) {
+		switch e.Key() {
+		case "Enter":
+			saveEdit(e.Value())
+		case "Escape":
+			editing.Set(0)
+		}
+	})
+	signal.Effect(func() {
+		id := editing.Get()
+		modal.Hide(id == 0)
+		if id == 0 {
+			return
+		}
+		// Peek: the field is filled when the modal opens, not on every
+		// change of the list underneath — reading it would re-fill mid-typing.
+		for _, it := range store.$PLURAL.Peek() {
+			if it.ID == id {
+				field.SetValue(it.$FIRSTFIELD)
+			}
+		}
+		field.Focus()
+	})
+
+`
+		funcs = `// saveEdit commits the edit and closes the modal in one Batch: one repaint.
+func saveEdit(text string) {
+	id := editing.Peek()
+	if id == 0 || text == "" {
+		return
+	}
+	signal.Batch(func() {
+		store.Commit$ITEM(store.$ITEMOp{Kind: "edit", ID: id, $FIRSTFIELD: text}, send)
+		editing.Set(0)
+	})
+}
+
+`
+	}
+
+	// The modal snippets are spliced in first, so the names are substituted
+	// inside them too.
+	modals := strings.NewReplacer("$MODALROW", row, "$MODALMARKUP", markup, "$MODALSTATE", state, "$MODALMOUNT", mount, "$MODALFUNCS", funcs)
 	return strings.NewReplacer(
 		"$PKG", pkg, "$LABEL", label, "$COMPONENT", component,
 		"$ITEMLIST", item+"List", "$ITEM", item, "$PLURAL", plural, "$IMPORT", storeImport, "$LOWER", base,
 		"$FIRSTFIELD", storeFirstField(root, base, item),
-	).Replace(`package $PKG
+	).Replace(modals.Replace(`package $PKG
 
 import (
 	"strconv"
@@ -792,7 +888,7 @@ templ $COMPONENT() {
 		<!-- While the server is unreachable, ops stay applied and queued in
 		     order; one sender retries with backoff and this line says so. -->
 		<p data-offline hidden></p>
-		<!-- The snapshot the server rendered from, serialised for the browser
+$MODALMARKUP		<!-- The snapshot the server rendered from, serialised for the browser
 		     store. Mount restores it: no fetch, no empty-then-full flash. -->
 		@templ.JSONScript("$LOWER", store.$PLURALSnapshotFrom(ctx))
 	</section>
@@ -800,11 +896,11 @@ templ $COMPONENT() {
 
 templ $ITEMLIST(items []store.$ITEM) {
 	for _, it := range items {
-		<li data-key={ strconv.Itoa(it.ID) }>{ it.$FIRSTFIELD }</li>
+$MODALROW
 	}
 }
 
-// Mount hydrates the browser's store from the server, then renders from it.
+$MODALSTATE// Mount hydrates the browser's store from the server, then renders from it.
 // After this runs the server is out of the loop: a mutation repaints locally
 // and is reported afterwards, so nobody waits on a round trip.
 //
@@ -850,7 +946,7 @@ func Mount() {
 		}
 	})
 
-	// The rollback message: its own element, its own effect. The list's
+$MODALMOUNT	// The rollback message: its own element, its own effect. The list's
 	// repaint does not depend on it and it does not depend on the list.
 	signal.Effect(func() {
 		r := store.$ITEMRejected.Get()
@@ -862,7 +958,7 @@ func Mount() {
 	})
 }
 
-// send tells the server about one op. Commit runs it in a goroutine, so it
+$MODALFUNCS// send tells the server about one op. Commit runs it in a goroutine, so it
 // may block; a non-nil error rolls the op back. Until the endpoint exists it
 // accepts everything — scaffold it (kind:"endpoint"), run fsapis, add
 // "context" to the imports, and replace the body with:
@@ -884,7 +980,7 @@ func repaint() {
 		dom.Warn("[$PKG] render failed:", err.Error())
 	}
 }
-`)
+`))
 }
 
 // storeFirstField finds the field the store's Add takes, so the generated page

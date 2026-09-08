@@ -1304,6 +1304,37 @@ Watched in a browser with the server killed: two adds stayed on screen, the
 page said two were queued, and within the first retry after the server came
 back both were on it, in order, with the ids the browser had already shown.
 
+## Rows that arrive and leave
+
+With the morph knowing exactly which nodes it inserts and removes, enter and
+leave motion is two attributes and no Go. A list opts in with
+`data-animate-rows`; an inserted row carries `data-entering` for a frame, a
+removed one carries `data-leaving` until its transition ends or 400 ms, and
+the CSS says what those states look like. `prefers-reduced-motion` turns the
+transition off in the same stylesheet, which is where every other transition
+in this framework is switched off too.
+
+The part that needed thought is that a leaving row is still in the document.
+The diff has to not see it: not match it by key, not count it as the cursor,
+not remove it a second time. So a row deleted and re-added while it is still
+fading is a new row beside a fading one — which is also what the eye
+expects. Two frames rather than one for the entering state, because the
+browser coalesces a set-and-remove inside a single frame into nothing; and a
+100 ms timer beside the frames, because a tab that is not visible gets no
+frames, and a row must not sit at opacity 0 waiting for the user to look.
+
+## The modal, scaffolded
+
+The recipe was the modal written out; the scaffold now writes it, behind
+`modal: true` on a client page with a store. One signal, one effect, five
+ways in and out that all write the signal, an `edit` op the store applies on
+both sides, and `Peek` in the effect so the list changing underneath does
+not re-fill a field mid-typing. It is generated whole rather than offered as
+a snippet because the failure mode was never a missing piece — it was the
+pieces assembled from the wrong framework's habits. The snippets are
+spliced into the page before the names are substituted, which is the one
+thing the first version got backwards.
+
 ## 17. Open questions
 
 - **TinyGo** — would it bring 1.71 MB gzipped down to the 200–800 KB range, and

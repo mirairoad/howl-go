@@ -191,6 +191,51 @@ func TestScaffoldClientPageIsReactive(t *testing.T) {
 	}
 }
 
+// The modal is generated whole when asked for: one signal, one effect, and an
+// "edit" op the store applies on both sides.
+func TestScaffoldClientPageWithModal(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/myapp\n\ngo 1.25\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scaffold(root, request{Kind: "store", Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scaffold(root, request{Kind: "page", Path: "/notes", Client: true, Store: "notes", Modal: true}); err != nil {
+		t.Fatal(err)
+	}
+	page, _ := os.ReadFile(filepath.Join(root, "client/pages/notes/index.client.templ"))
+	for _, want := range []string{
+		"var editing = signal.Of(0)",           // one signal
+		"modal.Hide(id == 0)",                  // one effect owns the DOM
+		`root.Delegate("click", "[data-edit]"`, // buttons in the list: delegated
+		`field.On("keydown"`,                   // the field outside it: On
+		"store.Notes.Peek()",                   // filled on open, not on every change
+		`Kind: "edit"`,                         // saved through the store
+		"data-modal hidden",                    // rendered closed by the server
+	} {
+		if !strings.Contains(string(page), want) {
+			t.Errorf("modal page is missing %q\n%s", want, page)
+		}
+	}
+	domain, _ := os.ReadFile(filepath.Join(root, "client/store/notes.go"))
+	if !strings.Contains(string(domain), `case "edit":`) {
+		t.Error("the store does not apply the edit op")
+	}
+	if result := runCheck(root, false); result.Errors > 0 {
+		t.Errorf("the modal scaffold does not pass howl check: %#v", result.Diagnostics)
+	}
+	// Without the flag, none of it.
+	plain := t.TempDir()
+	os.WriteFile(filepath.Join(plain, "go.mod"), []byte("module example.com/myapp\n\ngo 1.25\n"), 0o644) //nolint:errcheck
+	scaffold(plain, request{Kind: "store", Name: "notes"})                                               //nolint:errcheck
+	scaffold(plain, request{Kind: "page", Path: "/notes", Client: true, Store: "notes"})                 //nolint:errcheck
+	body, _ := os.ReadFile(filepath.Join(plain, "client/pages/notes/index.client.templ"))
+	if strings.Contains(string(body), "editing") || strings.Contains(string(body), "$MODAL") {
+		t.Error("a page scaffolded without modal:true carries modal code or an unreplaced placeholder")
+	}
+}
+
 // Without a store there is nothing real to wire, so the page owns its signal —
 // and still demonstrates the whole cycle.
 func TestScaffoldClientPageWithoutAStore(t *testing.T) {

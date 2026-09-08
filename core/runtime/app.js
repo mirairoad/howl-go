@@ -890,9 +890,40 @@ function morph(target, html) {
   morphChildren(target, tpl.content);
 }
 
+// Row transitions are opt-in per container with data-animate-rows. An
+// inserted element carries data-entering for one frame, so a CSS transition
+// from that state plays on the way in; a removed one carries data-leaving and
+// stays in the document until its transition ends (or 400ms, whichever comes
+// first), then goes. A leaving node is invisible to the diff — not matched,
+// not counted, not removed twice — so a row deleted and re-added while it is
+// still fading is a new row beside a fading one, not a resurrected one.
+const leaving = (n) => n.nodeType === 1 && n.hasAttribute("data-leaving");
+
+function enter(node) {
+  node.setAttribute("data-entering", "");
+  // Two frames: the first paints the entering state, the second removes it so
+  // the transition has somewhere to go. One frame and the browser coalesces
+  // set-and-remove into nothing. The timer is for a tab that is not visible,
+  // where frames do not fire at all: the row must not stay at opacity 0
+  // until the user comes back to look at it.
+  const done = () => node.removeAttribute("data-entering");
+  requestAnimationFrame(() => requestAnimationFrame(done));
+  setTimeout(done, 100);
+}
+
+function leave(node) {
+  node.setAttribute("data-leaving", "");
+  const done = () => node.remove();
+  node.addEventListener("transitionend", done, { once: true });
+  node.addEventListener("animationend", done, { once: true });
+  setTimeout(done, 400); // a row with no transition declared must still go
+}
+
 function morphChildren(oldParent, newParent) {
+  const animate = oldParent.nodeType === 1 && oldParent.hasAttribute("data-animate-rows");
   const keyed = new Map();
   for (const c of oldParent.childNodes) {
+    if (leaving(c)) continue;
     const k = keyOf(c);
     if (k && !keyed.has(k)) keyed.set(k, c);
   }
@@ -902,6 +933,7 @@ function morphChildren(oldParent, newParent) {
   // when the incoming list is exhausted was not wanted.
   let cursor = oldParent.firstChild;
   for (const incoming of [...newParent.childNodes]) {
+    while (cursor && leaving(cursor)) cursor = cursor.nextSibling;
     const k = keyOf(incoming);
     let match = null;
     if (k) {
@@ -914,6 +946,7 @@ function morphChildren(oldParent, newParent) {
     }
     if (!match) {
       oldParent.insertBefore(incoming, cursor); // adopts the template's node
+      if (animate && incoming.nodeType === 1) enter(incoming);
       continue;
     }
     if (match === cursor) cursor = cursor.nextSibling;
@@ -922,7 +955,13 @@ function morphChildren(oldParent, newParent) {
   }
   while (cursor) {
     const next = cursor.nextSibling;
-    oldParent.removeChild(cursor);
+    if (leaving(cursor)) {
+      // already on its way out
+    } else if (animate && cursor.nodeType === 1) {
+      leave(cursor);
+    } else {
+      oldParent.removeChild(cursor);
+    }
     cursor = next;
   }
 }

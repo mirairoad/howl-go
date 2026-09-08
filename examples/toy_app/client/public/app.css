@@ -113,6 +113,15 @@ h3 { font-size: 0.95rem; margin: 0 0 0.35rem; color: var(--accent); }
 .del { background: none; border: 0; color: var(--muted); font-size: 18px; cursor: pointer; line-height: 1; }
 .del:hover { color: #f87171; }
 
+/* row transitions: opt-in per list with data-animate-rows; the morph sets the
+   attributes, this is the only place motion is declared */
+.todos[data-animate-rows] li { transition: opacity 0.18s ease, transform 0.18s ease; }
+.todos[data-animate-rows] li[data-entering] { opacity: 0; transform: translateY(-6px); }
+.todos[data-animate-rows] li[data-leaving] { opacity: 0; transform: translateX(10px); }
+@media (prefers-reduced-motion: reduce) {
+  .todos[data-animate-rows] li { transition: none; }
+}
+
 /* modal: state-driven, markup outside the repainted region, hidden attribute toggled by an effect */
 .modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; }
 .modal[hidden] { display: none; }

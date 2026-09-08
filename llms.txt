@@ -513,6 +513,7 @@ Markup attributes the client runtime understands:
 | `data-island="name" data-props='{…}'` | hydrated by a registered island |
 | `data-no-prefetch` | do not warm this link (or subtree) |
 | `data-no-spa` | full page load, do not intercept |
+| `data-animate-rows` | on a list: the morph marks inserted rows `data-entering` for a frame and removed rows `data-leaving` until their transition ends; declare the motion in CSS |
 
 Every response carries `X-Howl-Build`, the id of the build that produced it, and the shell
 embeds the same id in `howl-client`. The client compares them on each fragment and data
@@ -1138,7 +1139,7 @@ served over stdio by `howl mcp`, configured in
 `.mcp.json` at the project root. `howl_scaffold` takes `kind: "page" | "endpoint" | "store" |
 "collection"`; the store kind writes the reactive store — the domain half that compiles for
 wasm and the signals half that does not — and a page with `client: true, store: "todos"`
-comes out already wired to it, with `Mount`, a delegated listener, the effect and a one-line repaint; the collection kind writes `server/store/<table>.go` with the envelope
+comes out already wired to it, with `Mount`, a delegated listener, the effect and a one-line repaint, and with `modal: true` an edit modal on one signal and one effect; the collection kind writes `server/store/<table>.go` with the envelope
 embedded and the pointer-receiver `Defaults` already correct, and its output is
 gofmt-clean. Prefer `howl_routes` / `howl_endpoints` over guessing what
 a URL maps to: they read the generated tables, so they answer with what the project

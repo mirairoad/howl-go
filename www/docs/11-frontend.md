@@ -203,6 +203,7 @@ root.Delegate("change", "[data-toggle]", func(e dom.Event) {      // inside the 
 - The effect calls `Render(component)` on the container. That is the entire repaint.
 - Per-row actions carry their id in a `data-` attribute and are delegated on the root.
 - Equality on the slice signal (`signal.WithEq`) so a restore that changed nothing does not repaint.
+- Enter and leave motion is one attribute on the list, `data-animate-rows`, and CSS on `[data-entering]` / `[data-leaving]`. The morph sets the attributes; nothing in Go knows. A row that is leaving stays until its transition ends, and the diff ignores it meanwhile.
 - Derived counts with `DeriveEq`, read by their own small effect, so a rename does not rewrite the count.
 
 **Example**
@@ -339,7 +340,7 @@ func saveEdit(text string) {
 
 **Wrong** — the open button calls `modal.Hide(false)` directly and the close button calls `modal.Hide(true)` (two writers, and the next repaint of the page around them does not know it is open); the modal inside the `Render`ed list (it vanishes on the first repaint); `items.Get()` in the modal effect (every edit of the list re-fills the field mid-typing); a `visible` bool in a Go var (nothing observes it).
 
-**Check** — open, type, toggle a checkbox in the list behind it: the field keeps its text and focus. Escape closes. Open again: the field shows the current text.
+**Check** — open, type, toggle a checkbox in the list behind it: the field keeps its text and focus. Escape closes. Open again: the field shows the current text. `howl_scaffold kind:"page"` with `client: true, store: "<name>", modal: true` writes exactly this, wired to the store's `edit` op.
 
 ## filter
 

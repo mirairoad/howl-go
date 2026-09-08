@@ -27,7 +27,9 @@ templ Page() {
 			<button type="submit">Add</button>
 		</form>
 		@Counter(store.TodosFrom(ctx))
-		<ul class="todos" id="todo-list">
+		<!-- data-animate-rows: the morph marks rows entering and leaving, and
+		     app.css declares the transition. Nothing in Go knows. -->
+		<ul class="todos" id="todo-list" data-animate-rows>
 			@ui.TodoList(store.TodosFrom(ctx))
 		</ul>
 		<p class="hint" id="todo-count">{ fmt.Sprintf("%d item(s) in server memory", len(store.TodosFrom(ctx))) }</p>
