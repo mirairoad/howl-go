@@ -52,6 +52,44 @@ func TestConventionsUnknownSection(t *testing.T) {
 	}
 }
 
+// Every frontend topic has the same five parts, and that shape is the point:
+// an agent that reads "Rules" without "Wrong" writes the wrong thing with
+// confidence. The test is what keeps a topic from being added without it.
+func TestFrontendTopicsAreStructured(t *testing.T) {
+	topics := []string{"checklist", "page", "store", "events", "list", "form", "modal", "filter", "navigation", "animation", "islands"}
+	for _, topic := range topics {
+		got := frontend(topic)
+		if !strings.HasPrefix(strings.TrimSpace(got), "## "+topic) {
+			t.Errorf("%s: wrong section:\n%.80s", topic, got)
+			continue
+		}
+		for _, part := range []string{"**When**", "**Rules**", "**Wrong**", "**Check**"} {
+			if !strings.Contains(got, part) {
+				t.Errorf("%s is missing %s", topic, part)
+			}
+		}
+		if topic != "checklist" && topic != "navigation" && topic != "islands" && !strings.Contains(got, "**Example**") {
+			t.Errorf("%s is missing an example", topic)
+		}
+		if strings.Count(got, "\n## ") > 0 {
+			t.Errorf("%s ran into the next topic", topic)
+		}
+	}
+	// The two that models get wrong most carry the rule that fixes it.
+	if got := frontend("modal"); !strings.Contains(got, "one signal") || !strings.Contains(got, "showModal") {
+		t.Error("the modal recipe must state the one-signal rule and name showModal as the wrong turn")
+	}
+	if got := frontend("store"); !strings.Contains(got, "dom.Embedded") || !strings.Contains(got, "templ.JSONScript") {
+		t.Error("the store recipe must show the embedded snapshot on both sides")
+	}
+}
+
+func TestFrontendUnknownTopic(t *testing.T) {
+	if got := frontend("hooks"); !strings.HasPrefix(got, "no section matching") || !strings.Contains(got, "modal") {
+		t.Errorf("an unknown topic should list the real ones, got %q", got)
+	}
+}
+
 // A '#' at the start of a line inside a code fence is a shell comment, not an
 // h1, and must not end the section it sits in.
 func TestHeadingLevelIgnoresFences(t *testing.T) {

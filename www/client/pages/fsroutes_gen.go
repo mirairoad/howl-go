@@ -9,13 +9,14 @@ import (
 	p1 "github.com/mirairoad/howl-go/www/client/pages/docs/constraints"
 	p2 "github.com/mirairoad/howl-go/www/client/pages/docs/database"
 	p3 "github.com/mirairoad/howl-go/www/client/pages/docs/dev"
-	p4 "github.com/mirairoad/howl-go/www/client/pages/docs/getting-started"
-	p5 "github.com/mirairoad/howl-go/www/client/pages/docs/http"
-	p6 "github.com/mirairoad/howl-go/www/client/pages/docs/lifecycle"
-	p7 "github.com/mirairoad/howl-go/www/client/pages/docs/navigation"
-	p8 "github.com/mirairoad/howl-go/www/client/pages/docs/reactivity"
-	p9 "github.com/mirairoad/howl-go/www/client/pages/docs/rendering"
-	p10 "github.com/mirairoad/howl-go/www/client/pages/docs/routing"
+	p4 "github.com/mirairoad/howl-go/www/client/pages/docs/frontend"
+	p5 "github.com/mirairoad/howl-go/www/client/pages/docs/getting-started"
+	p6 "github.com/mirairoad/howl-go/www/client/pages/docs/http"
+	p7 "github.com/mirairoad/howl-go/www/client/pages/docs/lifecycle"
+	p8 "github.com/mirairoad/howl-go/www/client/pages/docs/navigation"
+	p9 "github.com/mirairoad/howl-go/www/client/pages/docs/reactivity"
+	p10 "github.com/mirairoad/howl-go/www/client/pages/docs/rendering"
+	p11 "github.com/mirairoad/howl-go/www/client/pages/docs/routing"
 )
 
 // FsClientRoutes is the route table derived from the page tree.
@@ -26,12 +27,13 @@ func FsClientRoutes() []router.Route {
 		{Pattern: "/docs/constraints", Label: "Constraints", Page: p1.Page, Head: p1.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
 		{Pattern: "/docs/database", Label: "Database", Page: p2.Page, Head: p2.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
 		{Pattern: "/docs/dev", Label: "Dev", Page: p3.Page, Head: p3.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
-		{Pattern: "/docs/getting-started", Label: "Getting-started", Page: p4.Page, Head: p4.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
-		{Pattern: "/docs/http", Label: "Http", Page: p5.Page, Head: p5.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
-		{Pattern: "/docs/lifecycle", Label: "Lifecycle", Page: p6.Page, Head: p6.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
-		{Pattern: "/docs/navigation", Label: "Navigation", Page: p7.Page, Head: p7.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
-		{Pattern: "/docs/reactivity", Label: "Reactivity", Page: p8.Page, Head: p8.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
-		{Pattern: "/docs/rendering", Label: "Rendering", Page: p9.Page, Head: p9.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
-		{Pattern: "/docs/routing", Label: "Routing", Page: p10.Page, Head: p10.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/frontend", Label: "Frontend", Page: p4.Page, Head: p4.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/getting-started", Label: "Getting-started", Page: p5.Page, Head: p5.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/http", Label: "Http", Page: p6.Page, Head: p6.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/lifecycle", Label: "Lifecycle", Page: p7.Page, Head: p7.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/navigation", Label: "Navigation", Page: p8.Page, Head: p8.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/reactivity", Label: "Reactivity", Page: p9.Page, Head: p9.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/rendering", Label: "Rendering", Page: p10.Page, Head: p10.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/docs/routing", Label: "Routing", Page: p11.Page, Head: p11.Head, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
 	}
 }

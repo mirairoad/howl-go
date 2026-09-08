@@ -136,6 +136,7 @@ Each app's `Makefile` runs the same three steps: generate the route table,
 | [Rendering](www/docs/03-rendering.md) | SSR, SPA, wasm, static — one component |
 | [Lifecycle](www/docs/04-lifecycle.md) | `Mount` / `Unmount`, fetching from Go |
 | [Reactivity](www/docs/05-reactivity.md) | signals, computed, effects, watch |
+| [Frontend recipes](www/docs/11-frontend.md) | page, store, events, list, form, modal, filter, animation — as When / Rules / Example / Wrong / Check; also the `howl_frontend` MCP tool |
 | [Navigation](www/docs/06-navigation.md) | prefetch on intent, transitions, scroll |
 | [Constraints](www/docs/07-constraints.md) | what the Go toolchain refuses |
 | [HTTP layer](www/docs/08-http.md) | middleware, static, status, errors, state |

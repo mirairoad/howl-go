@@ -106,7 +106,7 @@ func TestScaffoldStore(t *testing.T) {
 		"client/store/todos.go": {
 			"type Todo struct {",
 			"Text string `json:\"text\"`",
-			"func WithTodos(ctx context.Context, items []Todo) context.Context",
+			"func WithTodos(ctx context.Context, sn TodoSnapshot) context.Context",
 			"func TodosFrom(ctx context.Context) []Todo",
 			"type TodoSnapshot struct {",
 			"func (s *TodoStore) Apply(op TodoOp)",
@@ -164,15 +164,16 @@ func TestScaffoldClientPageIsReactive(t *testing.T) {
 	}
 	source := string(body)
 	for _, want := range []string{
-		"package todos",                       // a directory is a package, and Todos is a type name
-		`"example.com/myapp/client/store"`,    // the real module path, or it compiles nowhere
-		"func Mount()",                        // a plain func — templ has no lifecycle
-		"func Unmount()",                      // ...and its pair, or every visit leaks
-		"release = append(release, signal.Effect(repaint))", // the stop func is kept, not discarded
-		"dom.Off(release...)",                              // ...and released
-		"release, dom.Root().Query(\"[data-add]\").On(",     // On's handle is kept too
-		"store.Todos.Get()",                   // read through the signal, not the store
-		"it.Text",                             // the field the store actually declares
+		"package todos",                    // a directory is a package, and Todos is a type name
+		`"example.com/myapp/client/store"`, // the real module path, or it compiles nowhere
+		"func Mount()",                     // a plain func — templ has no lifecycle
+		"signal.Effect(repaint)",           // registered bare: the scope releases it
+		`@templ.JSONScript("todos", store.TodosSnapshotFrom(ctx))`, // the server serialises what it rendered from
+		`dom.Embedded("todos", &sn)`,                               // ...and the browser store restores it without a request
+		"root.Delegate(\"click\", \"[data-add]\"",                  // delegated, so a repaint never rebinds
+		".Render(TodoList(items))",                                 // the repaint is the component, rendered again
+		"store.Todos.Get()",                                        // read through the signal, not the store
+		"it.Text",                                                  // the field the store actually declares
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("the client page is missing %q\n%s", want, source)
@@ -186,7 +187,7 @@ func TestScaffoldClientPageIsReactive(t *testing.T) {
 }
 
 // Without a store there is nothing real to wire, so the page owns its signal —
-// and still demonstrates the whole cycle, release included.
+// and still demonstrates the whole cycle.
 func TestScaffoldClientPageWithoutAStore(t *testing.T) {
 	root := t.TempDir()
 	if _, err := scaffold(root, request{Kind: "page", Path: "/counter", Client: true}); err != nil {
@@ -197,9 +198,9 @@ func TestScaffoldClientPageWithoutAStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"var count = signal.Of(0)", "func Mount()", "func Unmount()",
-		"release = append(release, signal.Effect(repaint))",
-		"dom.Off(release...)",
+		"var count = signal.Of(0)", "func Mount()",
+		"dom.Root().Delegate(\"click\", \"[data-inc]\"",
+		"signal.Effect(func() {",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("missing %q\n%s", want, body)

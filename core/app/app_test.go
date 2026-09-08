@@ -513,3 +513,31 @@ func TestClientConfigCarriesRawRoutes(t *testing.T) {
 		t.Fatalf("Raw = %v, want [/status]", got.Raw)
 	}
 }
+
+// An open tab never refetches its document, so after a deploy it would keep
+// the old wasm and config forever. The shell embeds the build id and every
+// response repeats it; the client reloads on the first mismatch it sees.
+func TestBuildIDIsPublishedAndStamped(t *testing.T) {
+	rt := router.Route{
+		Pattern: "/",
+		Label:   "Home",
+		Page: func() templ.Component {
+			return comp(func(ctx context.Context, w io.Writer) error {
+				_, err := io.WriteString(w, router.ClientConfig(ctx).Build)
+				return err
+			})
+		},
+	}
+	a := testApp(rt)
+	rec := get(a.Handler(), "/", nil)
+	stamped := rec.Header().Get("X-Howl-Build")
+	if len(stamped) != 8 {
+		t.Fatalf("X-Howl-Build = %q, want an 8-char id", stamped)
+	}
+	if !strings.Contains(rec.Body.String(), stamped) {
+		t.Fatalf("shell published %q, response stamped %q", rec.Body.String(), stamped)
+	}
+	if again := get(a.Handler(), "/static/app.css", nil).Header().Get("X-Howl-Build"); again != stamped {
+		t.Fatalf("static response stamped %q, page %q — an id that varies per response reloads every tab", again, stamped)
+	}
+}

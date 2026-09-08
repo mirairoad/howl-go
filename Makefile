@@ -28,6 +28,7 @@ test-db-pg:
 # checkout, and www serves one at /llms.txt. Both are copies of this file.
 sync-llms:
 	@cp llms.txt core/cmd/howl/llms.txt
+	@cp core/cmd/howl/frontend.md www/docs/11-frontend.md
 
 toy:
 	$(MAKE) -C examples/toy_app

@@ -1,0 +1,365 @@
+package lab
+
+import (
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mirairoad/howl-go/core/dom"
+	"github.com/mirairoad/howl-go/core/signal"
+)
+
+// This page exists to exercise every browser primitive on one screen, with
+// nothing else in the way: no store, no endpoint, no data. The state is
+// package-level signals in the page itself, which is the right shape for state
+// that no other page reads.
+
+templ Head() {
+	<title>Lab — howl-go</title>
+}
+
+templ Page() {
+	<section class="page">
+		<h1>The primitives, on one screen</h1>
+		<p class="lede">
+			A typed filter, delegated checkboxes, an edit modal driven by one
+			signal, one batched write against two unbatched ones, a ticker that
+			<code>Unmount</code> cancels — and a repaint counter so you can see what
+			each of them cost. Nothing here touches the server; leave and come back
+			and watch nothing leak.
+		</p>
+		<div class="todo-form">
+			<input placeholder="filter — Enter adds it, Esc clears" autocomplete="off" data-filter/>
+		</div>
+		<div class="controls">
+			<button class="chip" data-batch>flip all + reverse, batched</button>
+			<button class="chip" data-unbatched>same, unbatched</button>
+			<span class="pill cold" data-last>click one</span>
+		</div>
+		<ul class="todos" data-list>
+			@Items(seed, "", false)
+		</ul>
+		<p class="hint">
+			<span data-stats>{ stats(seed) }</span>
+			· <span data-repaints>repaints: 0</span>
+			· <span data-clock>tick 0</span>
+		</p>
+		<!-- Driven by dom.Frame: one callback per paint, width set directly,
+		     no signal and no repaint involved. -->
+		<div class="lab-bar"><div data-bar></div></div>
+		<!-- The modal lives OUTSIDE the repainted list, so its input keeps
+		     focus while the list behind it re-renders. One signal decides
+		     whether it is open; an effect toggles `hidden`. No showModal. -->
+		<div class="modal" data-modal hidden>
+			<div class="modal-backdrop" data-close></div>
+			<div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="edit-title">
+				<h2 id="edit-title">Edit item</h2>
+				<input data-edit-text autocomplete="off" placeholder="Enter saves, Esc closes"/>
+				<div class="controls">
+					<button class="chip" data-save>save</button>
+					<button class="chip" data-close>cancel</button>
+				</div>
+			</div>
+		</div>
+	</section>
+}
+
+// Items is rendered by the server for the first paint and by repaint for every
+// one after — the same component, so the markup cannot drift.
+templ Items(items []Item, filter string, desc bool) {
+	for _, it := range visible(items, filter, desc) {
+		<li class={ "lab-item", templ.KV("done", it.Done) }>
+			<label>
+				<input type="checkbox" data-toggle={ strconv.Itoa(it.ID) } checked?={ it.Done }/>
+				<span>{ it.Text }</span>
+			</label>
+			<button class="chip" data-edit={ strconv.Itoa(it.ID) }>edit</button>
+			<button class="del" data-del={ strconv.Itoa(it.ID) } aria-label="delete">×</button>
+		</li>
+	}
+}
+
+type Item struct {
+	ID   int
+	Text string
+	Done bool
+}
+
+var seed = []Item{
+	{1, "read the filter as you type — e.Value()", false},
+	{2, "toggle me — the click is not prevented, so the box still ticks", false},
+	{3, "delete me — the row was rendered by a repaint, Delegate still finds it", false},
+	{4, "press Enter in the box to add a row", true},
+}
+
+// ---------------------------------------------------------------------------
+// State. Package-level signals: one tab, one user, and any handler can reach
+// them. The server never writes these — it renders from seed.
+// ---------------------------------------------------------------------------
+
+var (
+	items  = signal.WithEq(seed, sameItems)
+	filter = signal.Of("")
+	desc   = signal.Of(false)
+	ticks  = signal.Of(0)
+	// editing is the modal's whole state: the id being edited, 0 when closed.
+	// Open, close, Escape, backdrop and save all just write this one signal;
+	// the effect in Mount is the only thing that touches the modal's DOM.
+	editing = signal.Of(0)
+	// doneCount is derived. DeriveEq: toggling one item changes it, renaming
+	// one does not, and only a change wakes what reads it.
+	doneCount = signal.DeriveEq(func() int {
+		n := 0
+		for _, it := range items.Get() {
+			if it.Done {
+				n++
+			}
+		}
+		return n
+	})
+
+	nextID   = len(seed) + 1
+	repaints int
+	stop     chan struct{} // the ticker's cancel — the one thing Unmount is for
+)
+
+func sameItems(a, b []Item) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func visible(all []Item, f string, reverse bool) []Item {
+	f = strings.ToLower(strings.TrimSpace(f))
+	out := make([]Item, 0, len(all))
+	for _, it := range all {
+		if f == "" || strings.Contains(strings.ToLower(it.Text), f) {
+			out = append(out, it)
+		}
+	}
+	if reverse {
+		sort.SliceStable(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	}
+	return out
+}
+
+func stats(all []Item) string {
+	done := 0
+	for _, it := range all {
+		if it.Done {
+			done++
+		}
+	}
+	return strconv.Itoa(done) + " of " + strconv.Itoa(len(all)) + " done"
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle. Mount runs in a scope: every listener and effect below is released
+// when the page leaves. Unmount exists here for exactly one thing, the ticker,
+// because a goroutine is not a registration and nothing else can stop it.
+// ---------------------------------------------------------------------------
+
+func Mount() {
+	root := dom.Root()
+	repaints = 0
+
+	// The filter box is OUTSIDE the element the repaint renders, so typing
+	// keeps focus while the list under it re-renders on every keystroke.
+	box := root.Query("[data-filter]")
+	box.On("input", func(e dom.Event) { filter.Set(e.Value()) })
+	box.On("keydown", func(e dom.Event) {
+		switch e.Key() {
+		case "Enter":
+			text := strings.TrimSpace(e.Value())
+			if text == "" {
+				return
+			}
+			// Two writes, one repaint: the list gains a row and the filter
+			// clears so the row is visible.
+			signal.Batch(func() {
+				items.Update(func(all []Item) []Item {
+					out := append(append([]Item(nil), all...), Item{ID: nextID, Text: text})
+					nextID++
+					return out
+				})
+				filter.Set("")
+			})
+			e.Target().SetValue("")
+		case "Escape":
+			e.Target().SetValue("")
+			filter.Set("")
+		}
+	})
+
+	// Delegated: one listener each on the root, matching rows that exist now
+	// and rows a later repaint renders. Neither is prevented — a change on a
+	// checkbox must still tick the box.
+	root.Delegate("change", "[data-toggle]", func(e dom.Event) {
+		id, _ := strconv.Atoi(e.Target().Attr("data-toggle"))
+		items.Update(func(all []Item) []Item {
+			out := append([]Item(nil), all...)
+			for i := range out {
+				if out[i].ID == id {
+					out[i].Done = !out[i].Done
+				}
+			}
+			return out
+		})
+	})
+	root.Delegate("click", "[data-del]", func(e dom.Event) {
+		id, _ := strconv.Atoi(e.Target().Attr("data-del"))
+		items.Update(func(all []Item) []Item {
+			out := make([]Item, 0, len(all))
+			for _, it := range all {
+				if it.ID != id {
+					out = append(out, it)
+				}
+			}
+			return out
+		})
+	})
+
+	// The modal. Every way in and out writes `editing`; nothing else touches
+	// the dialog. Delegated, because the edit buttons live in the repainted
+	// list; the modal's own field gets a direct On, because it is outside it.
+	modal := root.Query("[data-modal]")
+	field := modal.Query("[data-edit-text]")
+	root.Delegate("click", "[data-edit]", func(e dom.Event) {
+		id, _ := strconv.Atoi(e.Target().Attr("data-edit"))
+		editing.Set(id)
+	})
+	root.Delegate("click", "[data-close]", func(dom.Event) { editing.Set(0) })
+	root.Delegate("click", "[data-save]", func(dom.Event) { saveEdit(field.Value()) })
+	field.On("keydown", func(e dom.Event) {
+		switch e.Key() {
+		case "Enter":
+			saveEdit(e.Value())
+		case "Escape":
+			editing.Set(0)
+		}
+	})
+	signal.Effect(func() {
+		id := editing.Get()
+		modal.Hide(id == 0)
+		if id == 0 {
+			return
+		}
+		// Peek: the field is filled when the modal opens, not on every edit
+		// of the list underneath — reading items here would re-fill it.
+		for _, it := range items.Peek() {
+			if it.ID == id {
+				field.SetValue(it.Text)
+			}
+		}
+		field.Focus()
+	})
+
+	// The same two writes, with and without Batch. The repaint counter is the
+	// whole demonstration: 1 versus 2.
+	root.Delegate("click", "[data-batch]", func(dom.Event) {
+		before := repaints
+		signal.Batch(func() {
+			items.Update(flipAll)
+			desc.Update(func(d bool) bool { return !d })
+		})
+		root.Query("[data-last]").SetText("batched: " + strconv.Itoa(repaints-before) + " repaint")
+	})
+	root.Delegate("click", "[data-unbatched]", func(dom.Event) {
+		before := repaints
+		items.Update(flipAll)
+		desc.Update(func(d bool) bool { return !d })
+		root.Query("[data-last]").SetText("unbatched: " + strconv.Itoa(repaints-before) + " repaints")
+	})
+
+	// The repaint reads items, filter and desc, so it depends on all three —
+	// discovered by running, not declared. doneCount is read by the stats
+	// line only, so a rename would not wake it.
+	signal.Effect(repaint)
+	signal.Effect(func() {
+		root.Query("[data-stats]").SetText(strconv.Itoa(doneCount.Get()) + " of " + strconv.Itoa(len(items.Get())) + " done")
+	})
+	signal.Effect(func() {
+		root.Query("[data-clock]").SetText("tick " + strconv.Itoa(ticks.Get()))
+	})
+
+	// Per-frame animation: the bar sweeps once per second. Nothing here writes
+	// a signal — a repaint per frame is exactly the cost to avoid — the width
+	// is set directly, and the loop is released with the scope like a listener.
+	bar := root.Query("[data-bar]")
+	dom.Frame(func(t float64) bool {
+		pct := int(t) % 1000 / 10
+		bar.SetAttr("style", "width: "+strconv.Itoa(pct)+"%")
+		return true
+	})
+
+	// A goroutine outlives Mount's scope by definition, so it is the one
+	// thing that still needs Unmount. It only writes a signal; the effect
+	// above does the DOM work, and that effect IS released with the scope.
+	stop = make(chan struct{})
+	go func(stop chan struct{}) {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				ticks.Update(func(n int) int { return n + 1 })
+			case <-stop:
+				return
+			}
+		}
+	}(stop)
+
+	dom.Log("[lab] mounted")
+}
+
+func Unmount() {
+	close(stop)
+	dom.Log("[lab] unmounted — ticker cancelled; everything else the scope released")
+}
+
+func repaint() {
+	repaints++
+	root := dom.Root()
+	if err := root.Query("[data-list]").Render(Items(items.Get(), filter.Get(), desc.Get())); err != nil {
+		dom.Warn("[lab] render failed:", err.Error())
+		return
+	}
+	root.Query("[data-repaints]").SetText("repaints: " + strconv.Itoa(repaints))
+}
+
+// saveEdit writes the text and closes the modal: two signals, one Batch, one
+// repaint of the list — and the modal's effect runs once, to hide it.
+func saveEdit(text string) {
+	id := editing.Peek()
+	text = strings.TrimSpace(text)
+	if id == 0 || text == "" {
+		return
+	}
+	signal.Batch(func() {
+		items.Update(func(all []Item) []Item {
+			out := append([]Item(nil), all...)
+			for i := range out {
+				if out[i].ID == id {
+					out[i].Text = text
+				}
+			}
+			return out
+		})
+		editing.Set(0)
+	})
+}
+
+func flipAll(all []Item) []Item {
+	out := append([]Item(nil), all...)
+	for i := range out {
+		out[i].Done = !out[i].Done
+	}
+	return out
+}

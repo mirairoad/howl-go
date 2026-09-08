@@ -71,7 +71,15 @@ func Page() templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "</p></section>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "</p><!-- The snapshot this page was rendered from, serialised for the\n\t\t     browser store. Mount restores it: the store starts with exactly\n\t\t     what is on screen, and no request is made to get there. -->")
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		templ_7745c5c3_Err = templ.JSONScript("todos", store.SnapshotFrom(ctx)).Render(ctx, templ_7745c5c3_Buffer)
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 5, "</section>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -80,75 +88,77 @@ func Page() templ.Component {
 }
 
 // ---------------------------------------------------------------------------
-// This page has no JavaScript island. Mount hydrates the browser store, renders
-// with the same templ component the server uses, and wires the handlers — all
-// in Go. Unmount releases the subscription, which is the entire reason it
-// exists: a subscription that outlives its DOM keeps firing against nodes that
-// were thrown away, and every visit adds another one.
+// This page has no JavaScript island. Mount hydrates the browser store from
+// the document, renders with the same templ component the server uses, and
+// wires the handlers — all in Go.
+//
+// Mount runs inside a scope. Every listener, effect and watcher registered here
+// is released when the page is swapped out, so there is no release slice, no
+// stop func to keep, and no Unmount — the runtime does the bookkeeping the page
+// used to. Unmount still exists for teardown that is not a registration: a
+// timer to cancel, a draft to save.
 // ---------------------------------------------------------------------------
-
-// release holds everything Mount registered; rows holds the per-row listeners,
-// which are re-bound on every repaint and so are released separately. Both are
-// func() — a signal's stop func and a listener's release func are the same
-// shape, which is what lets Unmount treat them alike.
-var release, rows []func()
 
 func Mount() {
 	root := dom.Root()
 
-	// Any handler can reach the browser's store directly — it is a
-	// package-level instance, not something threaded through a component tree.
-	release = append(release, root.Query("[data-add]").On("click", func() {
+	// Hydrate from the document, not from a fetch. The server serialised the
+	// snapshot it rendered from into this fragment, so the browser store
+	// starts with exactly what the user is looking at: no request, no
+	// empty-then-full flash, and it works on a cold load and after a
+	// client-side navigation alike. Restore publishes to the signal; the
+	// effect below then renders from it on its first run.
+	var sn store.Snapshot
+	if err := dom.Embedded("todos", &sn); err != nil {
+		dom.Warn("[todos] no embedded snapshot:", err.Error())
+	} else {
+		store.Client().Restore(sn)
+		dom.Log("[todos] hydrated from the document,", len(sn.Items), "items")
+	}
+
+	// One delegated listener per action, on the page root. A delegated listener
+	// matches descendants that exist now and descendants a later repaint
+	// renders, so the delete buttons are covered without ever rebinding — and
+	// there is one js.Func per action for the life of the page, not one per row
+	// per repaint.
+	root.Delegate("click", "[data-add]", func(dom.Event) {
 		mutate(store.Op{Kind: "add", Text: "added from a Go click handler"})
-	}))
-	release = append(release, root.Query("[data-todo-form]").On("submit", func() {
-		text := strings.TrimSpace(root.Query("[data-todo-input]").Value())
+	})
+	root.Delegate("click", "[data-del]", func(e dom.Event) {
+		if n, err := strconv.Atoi(e.Target().Attr("data-del")); err == nil {
+			mutate(store.Op{Kind: "del", ID: n})
+		}
+	})
+	// submit is prevented before the handler runs: the form would otherwise
+	// post to /api/todos and reload the document.
+	root.Query("[data-todo-form]").On("submit", func(e dom.Event) {
+		input := e.Target().Query("[data-todo-input]")
+		text := strings.TrimSpace(input.Value())
 		if text == "" {
 			return
 		}
 		mutate(store.Op{Kind: "add", Text: text})
-		root.Query("[data-todo-input]").SetValue("")
-	}))
+		input.SetValue("")
+	})
 
 	// repaint reads store.Todos inside itself, so the effect discovers that
 	// dependency by running — there is no list of values to declare. This is the
 	// difference from useEffect(fn, [deps]): reads here are observable, so the
 	// dependency list cannot be wrong.
-	release = append(release, signal.Effect(repaint))
+	signal.Effect(repaint)
 
 	// A watcher on one derived value. Fires only on a transition, with both
 	// values — and not on the initial run.
-	release = append(release, signal.Watch(store.TodoCount.Get, func(now, before int) {
+	signal.Watch(store.TodoCount.Get, func(now, before int) {
 		dom.Log("[todos] count changed", before, "->", now)
-	}))
-
-	// Hydrate from the server, then render from the local store.
-	go func() {
-		sn, err := apiclient.New("").Todos(context.Background())
-		if err != nil {
-			dom.Warn("[todos] hydrate failed:", err.Error())
-			return
-		}
-		store.Client().Restore(sn) // publishes to the signal, which repaints
-		dom.Log("[todos] hydrated", len(sn.Items), "items")
-	}()
+	})
 
 	dom.Log("[todos] mounted")
 }
 
-func Unmount() {
-	// Every registration made in Mount is released here — effects, watchers and
-	// DOM listeners alike. An effect that outlives its DOM keeps firing against
-	// nodes that were thrown away, and a listener's js.Func stays alive on the
-	// JS side until it is released, so both leak once per visit otherwise.
-	dom.Off(rows...)
-	dom.Off(release...)
-	rows, release = nil, nil
-	dom.Log("[todos] unmounted")
-}
-
 // mutate applies an op locally for an instant repaint, then tells the server.
-// The user never waits on the round-trip.
+// The user never waits on the round-trip, and this is the only request the
+// page makes.
 func mutate(op store.Op) {
 	store.Client().Apply(op)
 	go func() {
@@ -158,41 +168,19 @@ func mutate(op store.Op) {
 	}()
 }
 
+// repaint is the whole "update the screen": read through the signal — that is
+// what registers this effect as a dependent — and render the same templ
+// component the server used into the same element. Render on an element the
+// navigation has already thrown away is a no-op, which is how an effect ends.
 func repaint() {
 	root := dom.Root()
-	if !root.Query("#todo-list").Valid() {
-		return // page already swapped away
-	}
-	// Read through the signal, not the store: that is what registers this
-	// effect as a dependent.
 	items := store.Todos.Get()
-
-	var sb strings.Builder
-	if err := ui.TodoList(items).Render(context.Background(), &sb); err != nil {
+	if err := root.Query("#todo-list").Render(ui.TodoList(items)); err != nil {
 		dom.Warn("[todos] render failed:", err.Error())
 		return
 	}
-	// Rendered by the same templ component the server uses, inside the browser.
-	root.Query("#todo-list").SetHTML(sb.String())
 	root.Query("[data-todo-count]").SetText(countText(len(items)))
 	root.Query("[data-watchers]").SetText("computed count: " + itoa(store.TodoCount.Get()))
-
-	// Delete buttons are re-created on every repaint, so rebind each time —
-	// and release the previous batch first. SetHTML threw those elements away,
-	// but a js.Func is held alive from the JS side until it is released, so
-	// skipping this leaks one closure per row per repaint for the life of the
-	// tab. It is the one leak that grows while the user simply uses the page.
-	dom.Off(rows...)
-	rows = rows[:0]
-	for _, btn := range root.QueryAll("[data-del]") {
-		id := btn.Attr("data-del")
-		rows = append(rows, btn.On("click", func() {
-			n, err := strconv.Atoi(id)
-			if err == nil {
-				mutate(store.Op{Kind: "del", ID: n})
-			}
-		}))
-	}
 }
 
 var _ = templruntime.GeneratedTemplate

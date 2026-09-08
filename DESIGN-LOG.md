@@ -1080,6 +1080,147 @@ framework.
 
 ---
 
+## The scope, and the end of the release slice
+
+The lifecycle contract was correct and it was eleven lines of bookkeeping per
+page: a `release` slice, a `rows` slice, `dom.Off` twice, a rebind loop after
+every `SetHTML`, and two `howl check` rules to catch the people who forgot one
+of them. Every other framework does that bookkeeping for you, and the reason
+this one did not was that nothing in it knew when a page ended — except the
+runtime, which called `Unmount`, and so did know.
+
+So the runtime now opens a scope around `Mount` and disposes it before the next
+page goes in. `signal.Effect`, `Watch` and `Derive` register their stop func
+with the open scope; `dom.On` and `Delegate` register their release func the
+same way. `Unmount` is still there for a timer or a draft, but the thing it
+existed for is gone. This is Solid's `createRoot`/`onCleanup`, and it is the
+single change that made a page read like one from a modern framework.
+
+The scope is lexical, and that was a deliberate choice against a page-lifetime
+scope that stays open until `Unmount`. The open one is more forgiving — a
+goroutine's late registration would be swept too — but it also sweeps anything
+registered *while a page happens to be live*, which includes an app-shell
+control a script sets up after boot. The lexical one has one rule to learn:
+register in `Mount`, let goroutines write signals. Hydration already had that
+shape.
+
+Three things fell out of it, each earning its place by deleting something:
+
+- **`Delegate`.** With release automatic, the remaining reason for the `rows`
+  slice was that `SetHTML` destroyed the nodes an `On` was bound to. One
+  listener on the root, matched by selector, survives every repaint. The rebind
+  loop is gone, and so is the one-`js.Func`-per-row-per-repaint growth that
+  DESIGN-LOG §16 measured.
+- **`Element.Render`.** The `strings.Builder` + `SetHTML` pair, written once.
+  It takes a local `Render(ctx, io.Writer) error` interface rather than
+  `templ.Component`, so `core/dom` still imports nothing. Its implementation is
+  `innerHTML` today; if it becomes a morph that preserves focus, no page changes.
+- **`Batch`.** Effects used to run synchronously inside `Set`. Two writes in a
+  handler meant two repaints, and an effect reading `a` and `Derive(a)` ran
+  twice per change — the diamond. Writes now queue their dependents and the
+  outermost write drains the queue, lowest id first. A derived value is
+  necessarily created before anything that reads it, so creation order is a
+  topological order for free, and the diamond runs once with both inputs
+  current. Tested.
+
+Two cuts. `WatchAny` compared `any` values with a `recover` around `!=`, which
+is the kind of thing that works until it is the bug; one `Effect` reading
+several signals is what it was always the worse spelling of. `WatchImmediate`
+was `Effect` with a different name. Twelve names remain.
+
+And one behaviour fix found on the way: `On` called `preventDefault` on every
+event. That stopped a checkbox from toggling on `click` and a key from typing
+on `keydown`, and nobody had noticed because the example only used it on
+buttons and a submit. It is now prevented for `submit` and for a `click` that
+lands on a link, which are the two that would navigate away mid-handler, and
+for nothing else.
+
+Verified in a real browser against the todos page: a delegated delete on a row
+a repaint had rendered; a form submit that did not reload the document; and
+three away-and-back navigations followed by one mutation, whose watcher logged
+once. Before the scope, the same sequence with one line forgotten logged four.
+
+## A tab outlives its build
+
+The report was "after updating the app I need a hard refresh", and the wasm
+URL was already content-hashed and immutable, so it took a moment to see how.
+Measured: append a byte to `views.wasm` under a dev server and the shell
+publishes a new name on the next request. A cold load could not be stale.
+
+An open tab could. Nothing in it is refetched for as long as it lives — not the
+wasm instance, not `app.js`, not the shell's config — and a `.client` route
+renders locally on purpose, "server not contacted". After a deploy the
+fragments and data come from the new build and the pages come from the old
+one, coherently wrong, until someone reloads. `howl dev` never showed it
+because its revision stream reloads the tab on every rebuild; `make run`, a
+production deploy and a desktop window without `Attach` all did.
+
+Every response now carries `X-Howl-Build` and the shell embeds the same id in
+`howl-client`. The client compares on each fragment and data response, marks
+the tab stale on the first mismatch, and turns the *next* navigation into a
+full document load — the swap the user is looking at completes. The id is a
+hash of the executable plus the wasm's content hash, never a start time: a
+restart of the same build, or two instances of it behind one balancer, must
+not tell every open tab to reload. Verified by changing the wasm under a
+running server and navigating twice: the second one was a document load, and
+`howl.config.build` came back as the new id.
+
+## The snapshot rides in the page
+
+The store's hydrate step was a fetch: `Mount` called the typed client, got a
+`Snapshot`, called `Restore`. It worked, and it was wrong in three small ways
+that added up. The server had just rendered the page *from that snapshot* and
+was now being asked for it again; the browser store was empty until the
+request returned, so a mutation in that window was applied to nothing; and
+every page with a store needed an endpoint whose only job was to repeat the
+render's input.
+
+Now the page serialises the snapshot into its own markup —
+`@templ.JSONScript("todos", store.SnapshotFrom(ctx))`, templ's own element,
+nothing new — and `Mount` reads it back with `dom.Embedded("todos", &sn)`.
+The fragment carries the script, so a client-side navigation hydrates the
+same way a cold load does, and the wasm-rendered path emits it from the same
+ctx. The context pair changed shape to make this possible: `WithTodos` takes
+the whole `Snapshot`, `TodosFrom` returns its items, `SnapshotFrom` returns
+the thing the browser needs. Measured on `/todos`: zero requests before the
+first mutation, where there was one.
+
+It is mandatory for a store page, and `howl check` says so with a warning on
+a `Restore` that has no `Embedded` beside it. The reason to insist is the
+mid-turn message that prompted it: models writing this framework "screw up
+the state", and the state they screw up is the one that arrives late. A store
+that starts full has nothing to be early or late about.
+
+## Recipes, because rules were not enough
+
+`llms.txt` states the rules and the models still wrote `showModal()`, toggled
+classes from click handlers, kept `open` in a Go bool, bound a listener per
+row, and fetched what they had just rendered. The rules were all there. What
+was missing was the *shape*: a model pattern-matches to the nearest framework
+it knows, and a rule that contradicts the pattern loses to the pattern.
+
+`core/cmd/howl/frontend.md` is the same knowledge as recipes, and every recipe
+has the same five parts by test: **When**, **Rules**, a complete **Example**
+that compiles and runs on `/lab` or `/todos`, what goes **Wrong** — the exact
+JS-framework habit, named — and the **Check** that proves it worked. The
+"Wrong" section is the one that does the work: it is the pattern the model
+was about to reach for, described in its own terms, and the example beside it
+is what to reach for instead. `howl_frontend topic="modal"` is the whole
+modal, and the MCP instructions tell the agent to call `checklist` before
+writing anything that runs in a browser.
+
+Two additions came out of writing the recipes, because the examples needed
+them. `Element.Focus`, because a modal that opens without focusing its field
+is a modal the keyboard cannot use. And `dom.Frame`, a `requestAnimationFrame`
+loop released with the scope, because "animate per frame" was the next thing
+asked for and the honest answer is that a signal per frame is sixty repaints
+a second of whatever effect reads it. `Frame` sets width and transform
+directly and leaves signals for state; the bar on `/lab` moves the repaint
+counter by zero. Its first version leaked one "call to released function" per
+page leave, because the browser already held the next frame when the scope
+released the callback. `cancelAnimationFrame` before `Release` — measured in
+the browser, then fixed.
+
 ## 17. Open questions
 
 - **TinyGo** — would it bring 1.71 MB gzipped down to the 200–800 KB range, and

@@ -29,7 +29,7 @@ var db = store.New()
 // how they receive everything.
 func data(ctx context.Context, path string) context.Context {
 	ctx = store.WithMetrics(ctx, apistore.Metrics())
-	ctx = store.WithTodos(ctx, db.List())
+	ctx = store.WithTodos(ctx, db.Snapshot())
 	return store.WithMeta(ctx, store.Meta{
 		RenderedAt: time.Now().Format("15:04:05.000"),
 		GoVersion:  runtime.Version(),

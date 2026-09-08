@@ -6,6 +6,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"io"
@@ -96,6 +98,9 @@ type App struct {
 	// params maps a route pattern to the names of its {placeholders}, so a
 	// request reads them from the mux instead of re-matching the table.
 	params map[string][]string
+
+	exeOnce sync.Once
+	exeHash string // sha256 of the running binary, hex; see build
 }
 
 type mount struct {
@@ -197,6 +202,7 @@ func (a *App) context(ctx context.Context, path string, params map[string]string
 		client.Binary = a.asset("views.wasm")
 		client.Exec = a.asset("wasm_exec.js")
 	}
+	client.Build = a.build()
 	// Data has historically been able to inspect ClientConfig. Install the
 	// static part first, then replace it below with the per-request bootstrap.
 	ctx = router.WithClient(ctx, client)
@@ -413,7 +419,7 @@ func strip(prefix string, h http.Handler) http.Handler {
 
 // Handler is Mux wrapped in the configured middleware. Use it when you want the
 // full chain but not Listen — tests, a custom http.Server, a cloud runtime.
-func (a *App) Handler() http.Handler { return a.Wrap(a.Mux()) }
+func (a *App) Handler() http.Handler { return a.withBuild(a.Wrap(a.Mux())) }
 
 // Wrap applies the middleware chain to any handler, so an application that
 // builds its own mux still gets the same treatment.
@@ -421,6 +427,51 @@ func (a *App) Wrap(h http.Handler) http.Handler { return mw.Chain(h, a.cfg.Use..
 
 // asset is the content-hashed URL for a static file. See Static.Name.
 func (a *App) asset(name string) string { return "/static/" + a.static.Name(name) }
+
+// build identifies the running build: the binary plus the wasm renderer.
+//
+// A tab that is already open never refetches the document, so it keeps the
+// wasm instance, app.js and the shell's config for as long as it lives — and
+// after a deploy it keeps rendering .client routes from the old binary while
+// the server answers from the new one. Every response carries this id in
+// X-Howl-Build and the shell embeds it in howl-client; the client compares the
+// two on each fragment or data response and turns the next navigation into a
+// full load when they differ. That is the only reload a deploy needs, and it
+// is what the dev server's revision stream does for a rebuild.
+//
+// Hashed from the executable rather than taken from a start time, so a
+// restart of the same build — or two instances of it behind one balancer —
+// does not tell every open tab to reload.
+func (a *App) build() string {
+	a.exeOnce.Do(func() {
+		if exe, err := os.Executable(); err == nil {
+			if raw, err := os.ReadFile(exe); err == nil {
+				sum := sha256.Sum256(raw)
+				a.exeHash = hex.EncodeToString(sum[:])
+			}
+		}
+		if a.exeHash == "" {
+			a.exeHash = time.Now().Format(time.RFC3339Nano) // unreadable binary: fall back to the process
+		}
+	})
+	if len(a.client.Wasm) == 0 {
+		return a.exeHash[:8]
+	}
+	// The wasm can change under a dev server without the binary changing, so
+	// its content hash is part of the id. A map lookup, like asset.
+	sum := sha256.Sum256([]byte(a.exeHash + a.static.Name("views.wasm")))
+	return hex.EncodeToString(sum[:4])
+}
+
+// withBuild stamps every response with the build id. Every response, not just
+// fragments: a .client route's data endpoint is the application's own handler,
+// and it is the response an open tab is most likely to see after a deploy.
+func (a *App) withBuild(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Howl-Build", a.build())
+		next.ServeHTTP(w, r)
+	})
+}
 
 // Log is the logger the runtime itself uses: Config.Log, or slog.Default().
 // Install core/console at startup and this comes out tinted and aligned.
@@ -474,7 +525,7 @@ func (a *App) Serve(ln net.Listener, h http.Handler) error {
 			)
 		}
 	}()
-	return http.Serve(ln, Latency(a.Wrap(h)))
+	return http.Serve(ln, Latency(a.withBuild(a.Wrap(h))))
 }
 
 // liveEndpoint is where the browser subscribes to rebuild notifications. Only

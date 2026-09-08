@@ -504,10 +504,10 @@ type User struct {
 // Reactivity and lifecycle
 // ---------------------------------------------------------------------------
 
-// The leak the docs warn about, made into a rule. A Mount that subscribes and
-// never releases keeps working — it just also keeps firing at the DOM of every
-// page that has since been replaced, one more listener per visit.
-func TestMountThatRegistersNeedsUnmount(t *testing.T) {
+// Mount runs in a scope, so an effect or a listener registered there is
+// released when the page leaves. No Unmount, no kept stop func — and no
+// diagnostic for their absence, because there is nothing to leak.
+func TestMountThatRegistersNeedsNoUnmount(t *testing.T) {
 	root := project(t, map[string]string{
 		"client/pages/app.templ": goodShell,
 		"client/pages/todos/index.client.templ": `package todos
@@ -516,21 +516,14 @@ templ Page() {
 	<ul id="list"></ul>
 }
 
-var stop func()
-
 func Mount() {
-	stop = signal.Effect(repaint)
-	dom.Root().Query("[data-add]").On("click", add)
+	signal.Effect(repaint)
+	dom.Root().Delegate("click", "[data-add]", add)
 }
 `,
 	})
-	got := rules(runCheck(root, false))
-	d, ok := got["mount-without-unmount"]
-	if !ok {
-		t.Fatalf("no diagnostic; got %#v", got)
-	}
-	if d.Level != "error" {
-		t.Errorf("level = %q, want error", d.Level)
+	if result := runCheck(root, false); !result.OK || result.Warnings != 0 {
+		t.Fatalf("reported %#v", result.Diagnostics)
 	}
 }
 
@@ -556,9 +549,10 @@ func Mount() {
 	}
 }
 
-// A stop func that is never bound cannot be called, so the subscription it
-// represents outlives the page by definition.
-func TestDiscardedEffectIsAnError(t *testing.T) {
+// The pre-scope habit: SetHTML, then loop over the new rows binding a
+// listener to each. It still works, it just does per repaint what one
+// delegated listener does once.
+func TestListenerReboundPerRowIsAWarning(t *testing.T) {
 	root := project(t, map[string]string{
 		"client/pages/app.templ": goodShell,
 		"client/pages/x/index.client.templ": `package x
@@ -571,11 +565,21 @@ func Mount() {
 	signal.Effect(repaint)
 }
 
-func Unmount() {}
+func repaint() {
+	dom.Root().Query("[data-list]").SetHTML(html)
+	for _, btn := range dom.Root().QueryAll("[data-del]") {
+		id := btn.Attr("data-del")
+		btn.On("click", func(dom.Event) { del(id) })
+	}
+}
 `,
 	})
-	if _, ok := rules(runCheck(root, false))["effect-not-released"]; !ok {
-		t.Fatal("a discarded stop func was accepted")
+	d, ok := rules(runCheck(root, false))["listener-rebound-per-row"]
+	if !ok {
+		t.Fatal("per-row rebinding was not reported")
+	}
+	if d.Level != "warning" {
+		t.Errorf("level = %q, want warning", d.Level)
 	}
 }
 
