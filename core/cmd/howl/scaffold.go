@@ -455,6 +455,106 @@ func (s *$ITEMStore) publish() {
 		$PLURAL.Set(s.List())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Optimistic commits, and taking them back. A mutation is applied locally
+// first and the server told afterwards; when the server refuses, the op is
+// dropped and the visible state rebuilt from the last snapshot the server
+// agreed to plus the ops still in flight. Ops are deterministic, so a later
+// op that succeeded keeps the id the server gave it.
+// ---------------------------------------------------------------------------
+
+// $ITEMRejected is the last op the server refused, and why. Zero when none;
+// the next confirmed commit clears it. A page shows it in its own element.
+var $ITEMRejected = signal.Of($ITEMRejection{})
+
+type $ITEMRejection struct {
+	Op  $ITEMOp
+	Err string
+}
+
+func (r $ITEMRejection) Empty() bool { return r.Err == "" }
+
+var (
+	$LOWERConfirmed $ITEMSnapshot
+	$LOWERPending   []$LOWERInflight
+	$LOWERSeq       int
+)
+
+type $LOWERInflight struct {
+	seq int
+	op  $ITEMOp
+}
+
+// Hydrate$PLURAL installs the server's snapshot as both the visible state and
+// the confirmed one. Mount calls it with what dom.Embedded read from the page.
+func Hydrate$PLURAL(sn $ITEMSnapshot) {
+	$LOWERConfirmed = sn
+	$LOWERPending = nil
+	$LOWERClient.Restore(sn)
+}
+
+// Commit$ITEM applies op now, then sends it from a goroutine. On an error the
+// op is rolled back and $ITEMRejected is set. The page passes the network call
+// in: the store cannot import the generated client without a cycle.
+func Commit$ITEM(op $ITEMOp, send func($ITEMOp) error) {
+	$LOWERSeq++
+	entry := $LOWERInflight{seq: $LOWERSeq, op: op}
+	$LOWERPending = append($LOWERPending, entry)
+	$LOWERClient.Apply(op)
+	go func() {
+		if err := send(op); err != nil {
+			$LOWERReject(entry, err)
+			return
+		}
+		$LOWERConfirm(entry)
+	}()
+}
+
+func $LOWERConfirm(e $LOWERInflight) {
+	if !$LOWERDrop(e.seq) {
+		return
+	}
+	$LOWERConfirmed = $LOWERReplay($LOWERConfirmed, e.op)
+	if !$ITEMRejected.Peek().Empty() {
+		$ITEMRejected.Set($ITEMRejection{})
+	}
+}
+
+func $LOWERReject(e $LOWERInflight, err error) {
+	if !$LOWERDrop(e.seq) {
+		return
+	}
+	sn := $LOWERConfirmed
+	for _, p := range $LOWERPending {
+		sn = $LOWERReplay(sn, p.op)
+	}
+	signal.Batch(func() { // one repaint for the rollback and the message
+		$LOWERClient.Restore(sn)
+		$ITEMRejected.Set($ITEMRejection{Op: e.op, Err: err.Error()})
+	})
+}
+
+func $LOWERDrop(seq int) bool {
+	for i, p := range $LOWERPending {
+		if p.seq == seq {
+			$LOWERPending = append($LOWERPending[:i], $LOWERPending[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// $LOWERReplay applies ops to a copy of sn on a scratch store, so publish —
+// guarded on the client instance — stays silent.
+func $LOWERReplay(sn $ITEMSnapshot, ops ...$ITEMOp) $ITEMSnapshot {
+	tmp := New$ITEMStore()
+	tmp.Restore(sn)
+	for _, op := range ops {
+		tmp.Apply(op)
+	}
+	return tmp.Snapshot()
+}
 `
 
 func scaffoldPage(root, urlPath, label, store string, client bool) (string, error) {
@@ -634,6 +734,9 @@ templ $COMPONENT() {
 		<ul data-list>
 			@$ITEMLIST(store.$PLURALFrom(ctx))
 		</ul>
+		<!-- Shown when the server refuses an op the browser already applied.
+		     The store rolled it back; this only says why. -->
+		<p data-error hidden></p>
 		<!-- The snapshot the server rendered from, serialised for the browser
 		     store. Mount restores it: no fetch, no empty-then-full flash. -->
 		@templ.JSONScript("$LOWER", store.$PLURALSnapshotFrom(ctx))
@@ -664,14 +767,15 @@ func Mount() {
 	if err := dom.Embedded("$LOWER", &sn); err != nil {
 		dom.Warn("[$PKG] no embedded snapshot:", err.Error())
 	} else {
-		store.$PLURALClient().Restore(sn)
+		store.Hydrate$PLURAL(sn) // visible state and confirmed state, in one
 	}
 
 	// One delegated listener on the page root covers every [data-add] there
 	// is now and every one a later repaint renders — nothing to rebind.
 	root.Delegate("click", "[data-add]", func(dom.Event) {
-		// Local first: apply, which publishes to the signal, which repaints.
-		store.$PLURALClient().Apply(store.$ITEMOp{Kind: "add", $FIRSTFIELD: "new"})
+		// Local first: Commit applies, which publishes, which repaints — then
+		// sends. A refusal rolls this op back and sets $ITEMRejected.
+		store.Commit$ITEM(store.$ITEMOp{Kind: "add", $FIRSTFIELD: "new"}, send)
 	})
 
 	// repaint reads the signal inside itself, so the dependency is discovered
@@ -681,20 +785,28 @@ func Mount() {
 		dom.Log("[$PKG] count", before, "->", now)
 	})
 
-	// Telling the server about a mutation is the only request this page makes.
-	// Scaffold the endpoint (kind:"endpoint"), run fsapis, add "context" to the
-	// imports, then call it from a goroutine after Apply:
-	//
-	//	go func() {
-	//		if _, err := apiclient.New("").Sync$PLURAL(context.Background(), []store.$ITEMOp{op}); err != nil {
-	//			dom.Warn("[$PKG] sync deferred:", err.Error())
-	//		}
-	//	}()
-	//
-	// The goroutine is not optional: blocking the JS callback deadlocks the Go
-	// scheduler, because the fetch can only resolve once control returns to the
-	// event loop. It registers nothing — which is why it can outlive Mount's
-	// scope.
+	// The rollback message: its own element, its own effect. The list's
+	// repaint does not depend on it and it does not depend on the list.
+	signal.Effect(func() {
+		r := store.$ITEMRejected.Get()
+		el := root.Query("[data-error]")
+		el.Hide(r.Empty())
+		if !r.Empty() {
+			el.SetText("server refused " + r.Op.Kind + ": " + r.Err + " — rolled back")
+		}
+	})
+}
+
+// send tells the server about one op. Commit runs it in a goroutine, so it
+// may block; a non-nil error rolls the op back. Until the endpoint exists it
+// accepts everything — scaffold it (kind:"endpoint"), run fsapis, add
+// "context" to the imports, and replace the body with:
+//
+//	_, err := apiclient.New("").Sync$PLURAL(context.Background(), []store.$ITEMOp{op})
+//	return err
+func send(op store.$ITEMOp) error {
+	_ = op
+	return nil
 }
 
 // repaint is the whole "update the screen": read through the signal — that is

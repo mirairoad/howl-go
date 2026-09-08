@@ -1221,6 +1221,43 @@ page leave, because the browser already held the next frame when the scope
 released the callback. `cancelAnimationFrame` before `Release` — measured in
 the browser, then fixed.
 
+## Taking an optimistic write back
+
+"Local first, tell the server after" had one dishonest line in it: on a
+refusal, `dom.Warn` and move on. The user was looking at a row the server had
+never accepted, and would keep looking at it until a reload. Optimistic UI is
+only honest if it can be un-done.
+
+The store now keeps the last snapshot the server agreed to and the ops applied
+since, each with a sequence number. `Commit(op, send)` applies, records, and
+sends from a goroutine; a confirmation folds the op into the confirmed
+snapshot, a refusal drops it and rebuilds the visible state from confirmed
+plus the ops still in flight. Two things fall out of replaying rather than
+undoing. An op that succeeded *after* the failed one is kept. And because ops
+are deterministic on both sides, an "add" that followed a rejected "add" ends
+up with the id the server actually gave it — the local replay assigns the
+same next id the server did, since neither saw the rejected one.
+
+The network call is passed in rather than imported, because the generated
+client imports the store's types and the store cannot import it back. That
+also keeps the store's browser half free of any transport, which is what
+lets the scaffold write the whole mechanism for a store that has no endpoint
+yet: `send` returns nil until there is something to send to.
+
+`Rejected` is a signal the page shows in its own element with its own effect,
+and the next confirmed commit clears it. The toy server refuses a ninth todo,
+which is small enough to reach by clicking, and the rollback was watched in a
+browser: the row appears, the refusal arrives, the row is gone and the reason
+is on screen, and a delete then clears the message.
+
+Route data was the other candidate for embedding, and was left alone on
+purpose. The store snapshot could ride in the page because the page was
+rendered from it. A `.client` route rendered locally for a URL the user has
+not visited has no page to ride in; its data has to be fetched, and that
+fetch already happens on hover and is shared by every route naming the same
+endpoint. Embedding would have saved one request on a cold load whose first
+paint the server had already done.
+
 ## 17. Open questions
 
 - **TinyGo** — would it bring 1.71 MB gzipped down to the 200–800 KB range, and

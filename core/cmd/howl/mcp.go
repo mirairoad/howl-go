@@ -230,7 +230,8 @@ func tools() []tool {
 				"serialises its snapshot into the page, Mount restores it, no fetch. The modal topic is the one " +
 				"signal + one effect pattern that replaces showModal and class toggling. Topics: " + topics,
 			InputSchema: object(map[string]any{
-				"topic": str("one of: " + topics + ". Omit for the whole file."),
+				"topic":  str("one of: " + topics + ". Omit for the whole file."),
+				"format": str("\"json\" for {topic, when, rules, example, wrong, check} — one object, or an array when topic is omitted; default is the Markdown section"),
 			}),
 		},
 		{
@@ -323,6 +324,7 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 		Dir     string   `json:"dir"`
 		Section string   `json:"section"`
 		Topic   string   `json:"topic"`
+		Format  string   `json:"format"`
 		Build   bool     `json:"build"`
 		Kind    string   `json:"kind"`
 		Path    string   `json:"path"`
@@ -351,6 +353,9 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 	case "howl_conventions":
 		return conventions(args.Section), nil
 	case "howl_frontend":
+		if args.Format == "json" {
+			return frontendJSON(args.Topic)
+		}
 		return frontend(args.Topic), nil
 	case "howl_check":
 		return asJSON(runCheck(dir, args.Build))
@@ -384,6 +389,62 @@ func conventions(section string) string {
 func frontend(topic string) string {
 	return sectionOf(string(frontendMd), topic,
 		"topics are: checklist, page, store, events, list, form, modal, filter, navigation, animation, islands")
+}
+
+// A recipe as fields, for a client that wants to render the five parts
+// separately or feed only "Wrong" and "Example" to a model. The Markdown is
+// the source; this is a view of it, cut at the bold markers every topic has.
+type recipe struct {
+	Topic   string `json:"topic"`
+	When    string `json:"when"`
+	Rules   string `json:"rules"`
+	Example string `json:"example"`
+	Wrong   string `json:"wrong"`
+	Check   string `json:"check"`
+}
+
+var frontendTopics = []string{"checklist", "page", "store", "events", "list", "form", "modal", "filter", "navigation", "animation", "islands"}
+
+var recipePartRe = regexp.MustCompile(`(?m)^\*\*(When|Rules|Example|Wrong|Check)\*\*[ —-]*`)
+
+func frontendJSON(topic string) (string, error) {
+	if topic == "" {
+		var all []recipe
+		for _, t := range frontendTopics {
+			all = append(all, parseRecipe(t, frontend(t)))
+		}
+		return asJSON(all)
+	}
+	text := frontend(topic)
+	if strings.HasPrefix(text, "no section matching") {
+		return "", fmt.Errorf("%s", text)
+	}
+	return asJSON(parseRecipe(topic, text))
+}
+
+func parseRecipe(topic, text string) recipe {
+	r := recipe{Topic: topic}
+	locs := recipePartRe.FindAllStringSubmatchIndex(text, -1)
+	for i, loc := range locs {
+		end := len(text)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		body := strings.TrimSpace(text[loc[1]:end])
+		switch text[loc[2]:loc[3]] {
+		case "When":
+			r.When = body
+		case "Rules":
+			r.Rules = body
+		case "Example":
+			r.Example = body
+		case "Wrong":
+			r.Wrong = body
+		case "Check":
+			r.Check = body
+		}
+	}
+	return r
 }
 
 // sectionOf returns the heading whose text contains name, with everything

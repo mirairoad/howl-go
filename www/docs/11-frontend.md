@@ -101,7 +101,9 @@ func Mount() {
 - Two files: `client/store/<name>.go` (domain: types, `Snapshot`, `Op`, `Apply`, the context pair; compiles for wasm) and `client/store/<name>_client.go` (the package-level signals and `publish`).
 - The server renders from the context: `Config.Data` calls `store.WithTodos(ctx, srv.Snapshot())`, the page reads `store.TodosFrom(ctx)`.
 - **The page serialises the snapshot it rendered from**: `@templ.JSONScript("todos", store.SnapshotFrom(ctx))` in the markup. **`Mount` restores it**: `dom.Embedded("todos", &sn)` then `store.Client().Restore(sn)`. This is mandatory for a store page: the browser store must start with what is on screen, and no request is made to get there.
-- A mutation is `store.Client().Apply(op)` — local first, instant repaint — then the same `op` is sent to the server from a goroutine. The server runs the same `Apply`.
+- A mutation is `store.Commit(op, send)` — local first, instant repaint — and `send` tells the server from a goroutine. The server runs the same `Apply`. If `send` returns an error the store rolls that one op back, rebuilding the visible state from the last confirmed snapshot plus the ops still in flight, and sets `store.Rejected`.
+- `Mount` hydrates with `store.Hydrate(sn)`, not `Restore`: it is the confirmed state a rollback returns to.
+- The page shows `store.Rejected` in its own element with its own effect. The next confirmed commit clears it.
 - The server never writes a signal. `publish` guards on `s == client`.
 
 **Example** — the whole handoff, in order:
@@ -119,26 +121,32 @@ var sn store.Snapshot
 if err := dom.Embedded("todos", &sn); err != nil {
 	dom.Warn("[todos] no embedded snapshot:", err.Error())
 } else {
-	store.Client().Restore(sn)               // publishes; the effect below renders from it
+	store.Hydrate(sn)                        // visible and confirmed state; the effect below renders from it
 }
 signal.Effect(func() {
 	dom.Root().Query("[data-list]").Render(ui.TodoList(store.Todos.Get()))
 })
+signal.Effect(func() {                       // the rollback message, its own element
+	r := store.Rejected.Get()
+	el := dom.Root().Query("[data-error]")
+	el.Hide(r.Empty())
+	if !r.Empty() {
+		el.SetText("server refused " + r.Op.Kind + ": " + r.Err + " — rolled back")
+	}
+})
 
-// a mutation
+// a mutation: applied now, sent after, rolled back if refused
 func mutate(op store.Op) {
-	store.Client().Apply(op)                 // repaints now
-	go func() {                              // tells the server after; never blocks the user
-		if _, err := apiclient.New("").SyncTodos(context.Background(), []store.Op{op}); err != nil {
-			dom.Warn("[todos] sync deferred:", err.Error())
-		}
-	}()
+	store.Commit(op, func(op store.Op) error {
+		_, err := apiclient.New("").SyncTodos(context.Background(), []store.Op{op})
+		return err
+	})
 }
 ```
 
-**Wrong** — fetching the snapshot in `Mount` from an endpoint (a request, an empty-then-full flash, and `howl check` warns `store-not-embedded`); rendering the page from `store.Client().List()` on the server (the server's store is per-process, the page must read ctx); `Todos.Set(...)` in a server handler (a data race across requests); a store that imports `net/http` or `database/sql` (pages import it, pages compile to wasm).
+**Wrong** — fetching the snapshot in `Mount` from an endpoint (a request, an empty-then-full flash, and `howl check` warns `store-not-embedded`); `Apply` plus a goroutine that only logs the error (the page keeps showing an op that never happened — use `Commit`); rendering the page from `store.Client().List()` on the server (the server's store is per-process, the page must read ctx); `Todos.Set(...)` in a server handler (a data race across requests); a store that imports `net/http` or `database/sql` (pages import it, pages compile to wasm).
 
-**Check** — `howl_scaffold kind:"store"` then `kind:"page"` with `client: true, store: "<name>"` writes both files and the page already wired. Network tab on load: no request for the store's data.
+**Check** — `howl_scaffold kind:"store"` then `kind:"page"` with `client: true, store: "<name>"` writes both files and the page already wired. Network tab on load: no request for the store's data. Make the server refuse one (the toy app refuses a ninth todo): the row vanishes, the message appears, and the next accepted op clears it.
 
 ## events
 

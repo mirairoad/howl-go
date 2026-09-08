@@ -423,11 +423,61 @@ var (
 	importSignalRe = regexp.MustCompile(`"[^"]*howl-go/core/signal"`)
 	// A page that restores its store but never reads the embedded snapshot is
 	// hydrating over the network what the server already rendered from.
-	restoreRe     = regexp.MustCompile(`\.Restore\(`)
-	embeddedRe    = regexp.MustCompile(`dom\.Embedded\(`)
+	restoreRe  = regexp.MustCompile(`\.Restore\(|\bHydrate\w*\(`)
+	embeddedRe = regexp.MustCompile(`dom\.Embedded\(`)
+	// Registrations, for the goroutine rule: anything the scope would release
+	// had it been made in Mount proper.
+	registerRe    = regexp.MustCompile(`signal\.(Effect|Watch|Derive|DeriveEq)\(|\.(On|Delegate)\("|dom\.Frame\(`)
+	goFuncRe      = regexp.MustCompile(`\bgo\s+func\s*\(`)
+	funcUnmountRe = regexp.MustCompile(`(?m)^func\s+Unmount\s*\(\s*\)`)
+	closeRe       = regexp.MustCompile(`\bclose\(`)
+	nilGuardRe    = regexp.MustCompile(`!=\s*nil`)
 	importJSRe    = regexp.MustCompile(`"syscall/js"`)
 	notPortableRe = regexp.MustCompile(`"(database/sql|os|os/exec|net/http/httptest)"`)
 )
+
+// funcBody returns the body of the first function whose signature matches re,
+// and the offset of that body in src. Brace-matched, so nested closures and
+// goroutines stay inside it.
+func funcBody(src []byte, re *regexp.Regexp) (body []byte, at int, ok bool) {
+	m := re.FindIndex(src)
+	if m == nil {
+		return nil, 0, false
+	}
+	return blockAt(src, m[1])
+}
+
+// blockAt returns the {…} block that opens at or after pos, without its
+// braces, and the offset of its first byte. Strings and comments are not
+// parsed: a brace inside a string literal in a page is rare enough that a
+// wrong answer here is a missed warning, not a false one.
+func blockAt(src []byte, pos int) (body []byte, at int, ok bool) {
+	open := bytes.IndexByte(src[pos:], '{')
+	if open < 0 {
+		return nil, 0, false
+	}
+	start := pos + open + 1
+	depth := 1
+	for i := start; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[start:i], start, true
+			}
+		}
+	}
+	return nil, 0, false
+}
+
+func lineAt(src []byte, offset int) int {
+	if offset > len(src) {
+		offset = len(src)
+	}
+	return bytes.Count(src[:offset], []byte("\n")) + 1
+}
 
 func lintReactivity(root string, files []sourceFile) []Diagnostic {
 	var out []Diagnostic
@@ -448,6 +498,36 @@ func lintReactivity(root string, files []sourceFile) []Diagnostic {
 			// page leaves: there is no leak to catch here any more. What is left
 			// is the older habit that the scope makes redundant and the
 			// repaint makes expensive — re-binding a listener per row.
+			// The scope is lexical: it closes when Mount returns. A goroutine
+			// started in Mount finishes later, so an effect or a listener it
+			// registers is outside the scope and lives for the tab — one more
+			// per visit, exactly the leak the scope removed.
+			if body, at, ok := funcBody(f.Body, funcMountRe); ok {
+				for _, m := range goFuncRe.FindAllIndex(body, -1) {
+					block, blockAt0, found := blockAt(body, m[1]-1)
+					if !found {
+						continue
+					}
+					if loc := registerRe.FindIndex(block); loc != nil {
+						out = append(out, Diagnostic{
+							File: f.Rel, Line: lineAt(f.Body, at+blockAt0+loc[0]), Rule: "register-in-goroutine", Level: "error",
+							Message: "an effect, watcher, listener or frame loop is registered inside a goroutine started by Mount; the scope closed when Mount returned, so this lives for the tab and repeats every visit",
+							Fix:     "register it in Mount itself; let the goroutine write a signal and the effect react",
+						})
+					}
+				}
+			}
+			// Unmount runs for the outgoing route whether or not its Mount ran —
+			// the user can leave before the wasm has loaded — and close(nil)
+			// takes the whole wasm runtime down.
+			if body, at, ok := funcBody(f.Body, funcUnmountRe); ok && closeRe.Match(body) && !nilGuardRe.Match(body) {
+				loc := closeRe.FindIndex(body)
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: lineAt(f.Body, at+loc[0]), Rule: "unmount-close-unguarded", Level: "warning",
+					Message: "Unmount closes a channel with no nil check; it runs even when Mount never did, and close(nil) panics the wasm runtime",
+					Fix:     "if stop != nil { close(stop); stop = nil }",
+				})
+			}
 			if restoreRe.Match(f.Body) && !embeddedRe.Match(f.Body) {
 				line, _ := findLine(f.Body, restoreRe)
 				out = append(out, Diagnostic{

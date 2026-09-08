@@ -170,6 +170,9 @@ func TestScaffoldClientPageIsReactive(t *testing.T) {
 		"signal.Effect(repaint)",           // registered bare: the scope releases it
 		`@templ.JSONScript("todos", store.TodosSnapshotFrom(ctx))`, // the server serialises what it rendered from
 		`dom.Embedded("todos", &sn)`,                               // ...and the browser store restores it without a request
+		"store.HydrateTodos(sn)",                                   // as the confirmed state, so a refusal can roll back to it
+		"store.CommitTodo(",                                        // apply now, send after, roll back on refusal
+		"store.TodoRejected.Get()",                                 // and the page shows why
 		"root.Delegate(\"click\", \"[data-add]\"",                  // delegated, so a repaint never rebinds
 		".Render(TodoList(items))",                                 // the repaint is the component, rendered again
 		"store.Todos.Get()",                                        // read through the signal, not the store

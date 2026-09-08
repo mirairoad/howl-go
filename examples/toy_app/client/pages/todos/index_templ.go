@@ -71,7 +71,7 @@ func Page() templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "</p><!-- The snapshot this page was rendered from, serialised for the\n\t\t     browser store. Mount restores it: the store starts with exactly\n\t\t     what is on screen, and no request is made to get there. -->")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "</p><!-- The server can refuse an op the browser already applied. The store\n\t\t     rolls it back and says so here; the next confirmed op clears it. --><p class=\"hint\" data-error hidden></p><!-- The snapshot this page was rendered from, serialised for the\n\t\t     browser store. Mount restores it: the store starts with exactly\n\t\t     what is on screen, and no request is made to get there. -->")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -112,7 +112,7 @@ func Mount() {
 	if err := dom.Embedded("todos", &sn); err != nil {
 		dom.Warn("[todos] no embedded snapshot:", err.Error())
 	} else {
-		store.Client().Restore(sn)
+		store.Hydrate(sn) // visible state and confirmed state, in one
 		dom.Log("[todos] hydrated from the document,", len(sn.Items), "items")
 	}
 
@@ -153,19 +153,30 @@ func Mount() {
 		dom.Log("[todos] count changed", before, "->", now)
 	})
 
+	// The rollback message. The store rolled the state back already — this
+	// effect only shows why. Its own element, its own effect: the list's
+	// repaint does not depend on it and it does not depend on the list.
+	signal.Effect(func() {
+		r := store.Rejected.Get()
+		el := root.Query("[data-error]")
+		el.Hide(r.Empty())
+		if !r.Empty() {
+			el.SetText("server refused \"" + r.Op.Kind + "\": " + r.Err + " — rolled back")
+		}
+	})
+
 	dom.Log("[todos] mounted")
 }
 
 // mutate applies an op locally for an instant repaint, then tells the server.
 // The user never waits on the round-trip, and this is the only request the
-// page makes.
+// page makes. If the server refuses, the store rolls the op back and sets
+// store.Rejected; the page never has to know how.
 func mutate(op store.Op) {
-	store.Client().Apply(op)
-	go func() {
-		if _, err := apiclient.New("").SyncTodos(context.Background(), []store.Op{op}); err != nil {
-			dom.Warn("[todos] sync deferred:", err.Error())
-		}
-	}()
+	store.Commit(op, func(op store.Op) error {
+		_, err := apiclient.New("").SyncTodos(context.Background(), []store.Op{op})
+		return err
+	})
 }
 
 // repaint is the whole "update the screen": read through the signal — that is

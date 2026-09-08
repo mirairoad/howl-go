@@ -112,7 +112,7 @@ Then three wires, in the order they run:
 
 1. **SSR** — `Config.Data` puts the data on the context, the page renders from `store.TodosFrom(ctx)`. This is the first paint, and it needs no JavaScript.
 2. **Hydrate** — the page serialises the snapshot it rendered from with `@templ.JSONScript("todos", store.SnapshotFrom(ctx))`; `Mount` reads it back with `dom.Embedded` and calls `Restore`, which publishes to the signal. No request, and the browser store starts with exactly what is on screen.
-3. **Local** — a mutation calls `Apply(op)`, which publishes, which wakes the effect, which re-renders the same templ component the server used.
+3. **Local** — a mutation calls `store.Commit(op, send)`: `Apply` runs now, publishes, wakes the effect, which re-renders the same templ component the server used; `send` tells the server from a goroutine. If the server refuses, that one op is rolled back — the confirmed snapshot plus the ops still in flight — and `store.Rejected` carries the reason for the page to show.
 
 The one rule that fails silently: **read through the signal, not the store**. `store.Todos.Get()` registers the effect as a dependent; `store.TodosClient().List()` returns the same data, subscribes to nothing, and the page simply stops updating.
 

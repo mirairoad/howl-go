@@ -84,6 +84,30 @@ func TestFrontendTopicsAreStructured(t *testing.T) {
 	}
 }
 
+// The JSON view cuts at the bold markers, so every field of every topic is
+// filled — a client rendering "Wrong" beside "Example" never gets an empty pane.
+func TestFrontendJSONHasEveryPart(t *testing.T) {
+	out, err := frontendJSON("modal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"when": "`, `"rules": "`, `"example": "`, `"wrong": "`, `"check": "`} {
+		if !strings.Contains(out, key) || strings.Contains(out, key+`"`) {
+			t.Errorf("modal JSON is missing or empty at %s", key)
+		}
+	}
+	if !strings.Contains(out, "editing") {
+		t.Error("the modal example should reach the JSON view")
+	}
+	if _, err := frontendJSON("hooks"); err == nil {
+		t.Error("an unknown topic must be an error in JSON mode, not an empty object")
+	}
+	all, err := frontendJSON("")
+	if err != nil || strings.Count(all, `"topic": "`) != len(frontendTopics) {
+		t.Errorf("all topics: err=%v count=%d", err, strings.Count(all, `"topic": "`))
+	}
+}
+
 func TestFrontendUnknownTopic(t *testing.T) {
 	if got := frontend("hooks"); !strings.HasPrefix(got, "no section matching") || !strings.Contains(got, "modal") {
 		t.Errorf("an unknown topic should list the real ones, got %q", got)

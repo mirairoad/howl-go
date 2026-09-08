@@ -583,6 +583,62 @@ func repaint() {
 	}
 }
 
+// The scope closes when Mount returns. A goroutine that registers afterwards
+// is the leak the scope was meant to end, back under a different spelling.
+func TestRegistrationInGoroutineIsAnError(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/pages/x/index.client.templ": `package x
+
+templ Page() {
+	<div></div>
+}
+
+func Mount() {
+	go func() {
+		sn, _ := load()
+		store.HydrateTodos(sn)
+		signal.Effect(repaint)
+	}()
+}
+`,
+	})
+	d, ok := rules(runCheck(root, false))["register-in-goroutine"]
+	if !ok {
+		t.Fatal("a registration inside a goroutine was accepted")
+	}
+	if d.Line != 11 {
+		t.Errorf("line = %d, want 11 (the signal.Effect line)", d.Line)
+	}
+}
+
+// Unmount runs for the outgoing route even when its Mount never did.
+func TestUnmountCloseWithoutGuardIsAWarning(t *testing.T) {
+	page := func(unmount string) map[string]string {
+		return map[string]string{
+			"client/pages/app.templ": goodShell,
+			"client/pages/x/index.client.templ": `package x
+
+templ Page() {
+	<div></div>
+}
+
+var stop chan struct{}
+
+func Mount() { stop = make(chan struct{}) }
+
+` + unmount,
+		}
+	}
+	if _, ok := rules(runCheck(project(t, page("func Unmount() {\n\tclose(stop)\n}\n")), false))["unmount-close-unguarded"]; !ok {
+		t.Fatal("an unguarded close in Unmount was accepted")
+	}
+	guarded := "func Unmount() {\n\tif stop != nil {\n\t\tclose(stop)\n\t\tstop = nil\n\t}\n}\n"
+	if _, ok := rules(runCheck(project(t, page(guarded)), false))["unmount-close-unguarded"]; ok {
+		t.Fatal("a guarded close was reported")
+	}
+}
+
 // Signals are package-level. A handler writing one is not a slow path or a
 // stale read — it is two requests writing one variable.
 func TestServerImportingSignalIsAnError(t *testing.T) {

@@ -615,9 +615,13 @@ Scaffold both files with `howl_scaffold` (`kind: "store"`, `name: "todos"`).
    what is on screen, on a cold load and after a navigation alike. This is
    mandatory for a store page; `howl check` warns on a `Restore` with no
    `Embedded`.
-3. **Local.** A mutation calls `Apply(op)`, which publishes, which wakes the
-   effect, which re-renders **the same templ component the server used** and
-   swaps it in. The server is told afterwards and never blocks the user.
+3. **Local.** A mutation calls `store.Commit(op, send)`: `Apply` runs now, which
+   publishes, which wakes the effect, which re-renders **the same templ component
+   the server used** and swaps it in. `send` tells the server from a goroutine and
+   never blocks the user. If the server refuses, the store rolls that one op back —
+   the confirmed snapshot plus the ops still in flight — and sets `store.Rejected`,
+   which the page shows in its own element. `Mount` hydrates with `Hydrate(sn)` so
+   there is a confirmed state to return to.
 
 ### The lifecycle contract
 
@@ -1173,6 +1177,9 @@ actually serves.
    `Client().List()` returns the same data and subscribes to nothing.
 9. **A `switch` with a `default:` arm is not a router** — it makes every typo a 200.
 10. **`//go:embed` bakes `app.js` into the binary**; editing it does nothing until rebuild.
+14. **Mutations go through `Commit`, not `Apply` + a goroutine that logs.** A refused
+    op the page keeps showing is state that never happened. `Commit` rolls it back and
+    sets `Rejected`; the page shows it.
 12. **A store page embeds its snapshot.** `@templ.JSONScript("todos", store.SnapshotFrom(ctx))`
     in the markup, `dom.Embedded("todos", &sn)` + `Restore(sn)` in `Mount`. Fetching what
     the server just rendered from is a request, a flash, and a `howl check` warning.
@@ -1218,7 +1225,10 @@ generated table, generated client), `howl check` and `howl mcp`, `db` +
 `X-Howl-Build` (an open tab reloads itself after a deploy), `dom.Embedded` (the store
 snapshot serialised by the server into the page, restored in `Mount` without a fetch),
 `Element.Focus`, `dom.Frame` (per-paint animation, released with the scope), the
-`howl_frontend` MCP tool and `www/docs/11-frontend.md` (the browser recipes).
+`howl_frontend` MCP tool (`format: "json"` for the five parts as fields) and
+`www/docs/11-frontend.md` (the browser recipes), the store's `Hydrate`/`Commit`/
+`Rejected` (optimistic commits rolled back when the server refuses; scaffolded), the
+`register-in-goroutine` and `unmount-close-unguarded` check rules.
 
 Removed: `signal.WatchAny` and `signal.WatchImmediate` (one `Effect` reading several
 signals is the idiomatic form), and `dom.On`'s handler is now `func(dom.Event)`.
