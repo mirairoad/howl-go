@@ -42,8 +42,12 @@ func main() {
 		Title:  "howl-go — toy",
 		Width:  1180,
 		Height: 820,
-		Attach: *attach,
-		Debug:  *debug,
+		// The card grid is repeat(auto-fit, minmax(210px, 1fr)) and reflows on
+		// its own; below roughly this the header's six nav links stop fitting.
+		MinWidth:  720,
+		MinHeight: 520,
+		Attach:    *attach,
+		Debug:     *debug,
 	}); err != nil {
 		log.Fatal(err)
 	}

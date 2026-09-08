@@ -934,11 +934,13 @@ would otherwise `Listen` with, on a loopback socket nothing else can reach.
 // main.go of the desktop binary — the whole of it
 a, mux := boot.New()                       // the same app.New(...) the server uses
 if err := desktop.Run(a, mux, desktop.Options{
-	Title:  "myapp",
-	Width:  1180,
-	Height: 820,
-	Attach: *attach,                       // "" = own loopback server; ":9000" = howl dev
-	Debug:  *debug,                        // inspector + right-click menu
+	Title:     "myapp",
+	Width:     1180,
+	Height:    820,
+	MinWidth:  720,                        // without one the window drags to nothing
+	MinHeight: 520,
+	Attach:    *attach,                    // "" = own loopback server; ":9000" = howl dev
+	Debug:     *debug,                     // inspector + right-click menu
 }); err != nil {
 	log.Fatal(err)
 }
@@ -999,6 +1001,24 @@ func Public() fs.FS { sub, _ := fs.Sub(publicFS, "public"); return sub }
 
 For the same reason, the `app.Config` itself moves out of `main.go` into a `boot` package
 both mains import. The server main keeps only flags and `a.Listen`.
+
+### Sizing
+
+`Width`/`Height` are the opening size, `MinWidth`/`MinHeight` the floor, `MaxWidth`/
+`MaxHeight` the ceiling, `Fixed` forbids resizing outright. Bounds are applied before the
+size, so a `Width` under `MinWidth` lands clamped into a window the user can still drag.
+
+Set a minimum. Nothing else stops the window resizing to nothing, and a layout that reflows
+correctly at every width still has a width below which it stops reflowing and starts
+clipping. Leave the maximum at zero unless you mean it: a window that refuses to fill the
+screen it was dragged onto is worse than content that centres itself.
+
+Beyond that, adapting is the stylesheet's job and nothing about it is desktop-specific —
+the window is the viewport, there is no browser chrome to subtract, and WKWebView and
+WebKitGTK both hand the page a correct `devicePixelRatio` on a HiDPI display. Intrinsic
+rules carry a window better than breakpoints do, because a window is dragged through every
+width in between: the toy app's card grid is `repeat(auto-fit, minmax(210px, 1fr))` and
+reflows on its own, with no `@media` anywhere in its 176 lines.
 
 ### What it costs, and what it does not have
 
