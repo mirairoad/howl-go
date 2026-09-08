@@ -54,7 +54,7 @@ func Mount() {
 
 - The file is `client/pages/<dir>/index.templ` (server-rendered fragment on navigation, `Mount` runs after) or `index.client.templ` (also rendered by the wasm build). Both get `Mount`; both are plain `func`, not `templ`.
 - `Mount` runs in a scope. Register everything in it, synchronously.
-- `Unmount` is optional. Write one only to cancel a goroutine or timer that `Mount` started.
+- `Unmount` is optional. Write one only to cancel a goroutine or timer that `Mount` started — and guard it: `Unmount` runs for the outgoing route whether or not its `Mount` ever ran (the user can leave before the wasm loads), so `close(stop)` needs `if stop != nil`.
 - Read state through the signal, not through the store: `store.Todos.Get()` subscribes, `store.Client().List()` does not.
 
 **Example**

@@ -320,7 +320,13 @@ func Mount() {
 }
 
 func Unmount() {
-	close(stop)
+	// Nil when the user left before the wasm finished loading: Unmount runs
+	// for the outgoing route whether or not its Mount ever did, and closing a
+	// nil channel would take the whole wasm runtime down with it.
+	if stop != nil {
+		close(stop)
+		stop = nil
+	}
 	dom.Log("[lab] unmounted — ticker cancelled; everything else the scope released")
 }
 
