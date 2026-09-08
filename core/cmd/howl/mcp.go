@@ -156,7 +156,11 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 				"build after local navigation, not the running server. Before packaging the app as a native " +
 				"window, call howl_conventions with section=\"Native window\": desktop is a separate module " +
 				"with a separate go.mod, there is no build verb to invoke, and the dev loop attaches the window " +
-				"to `howl dev` rather than being restarted by it. " +
+				"to `howl dev` rather than being restarted by it. That section also covers `howl package`, " +
+				"which turns the built binary into a .app or a Linux install tree from one 1024px PNG at " +
+				"desktop/packaging/icon.png: do not hand-write an Info.plist or a .desktop entry, do not build " +
+				"an icns by shelling out to iconutil and sips, and do not try to cross-compile the desktop " +
+				"binary, which needs cgo and the platform's webview. " +
 				"Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
 				"collection by hand — it writes the wiring that has no analogue elsewhere. Call howl_check " +
 				"after editing.",
@@ -243,7 +247,9 @@ func tools() []tool {
 				"code — Go rejects _layout.templ and [id].templ, and there are no hooks and no re-render, so the " +
 				"answers here look different from every JS framework on purpose. Client render safety also " +
 				"defines which runtime values must be bootstrapped instead of read from Go globals. \"Native window\" " +
-				"covers shipping the app as a single binary that opens an OS webview. Sections: " + sections,
+				"covers shipping the app as a single binary that opens an OS webview, packaging it with " +
+				"`howl package` so the OS shows an icon for it, and the macOS menu bar the window installs " +
+				"(without which there is no working ⌘C anywhere in the page). Sections: " + sections,
 			InputSchema: object(map[string]any{
 				"section": str("optional heading to return on its own, e.g. \"Routing conventions\" or " +
 					"\"Making a page interactive\". One of: " + sections),

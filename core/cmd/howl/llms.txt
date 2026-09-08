@@ -1074,6 +1074,58 @@ rules carry a window better than breakpoints do, because a window is dragged thr
 width in between: the toy app's card grid is `repeat(auto-fit, minmax(210px, 1fr))` and
 reflows on its own, with no `@media` anywhere in its 176 lines.
 
+### Packaging: `howl package`
+
+A bare binary runs. What it does not have is the metadata that makes the OS treat it as an
+application — so it shows a blank sheet of paper in the Dock, and on Linux it is not in the
+launcher at all. `howl package` writes that, and only that:
+
+```bash
+go build -o myapp_desktop ./desktop           # this is still what builds
+howl package -bin ./myapp_desktop -name "My App" -id com.example.myapp -version 1.2.0
+```
+
+```
+dist/My App.app/          darwin  Info.plist, PkgInfo, MacOS/<binary>, Resources/AppIcon.icns
+dist/my-app/              linux   binary, my-app.desktop, icons/hicolor/**, install.sh
+```
+
+It does not build, and it does not cross-compile: the desktop binary needs cgo and the
+platform's webview, so build and package the Linux one on Linux. Passing a Mach-O binary
+with `-os linux` is refused rather than wrapped — the mistake otherwise produces a tree that
+installs, appears in the launcher with the right icon, and does nothing when clicked.
+
+**The only required asset is `desktop/packaging/icon.png`** — one square PNG, 1024×1024.
+Every size in both bundles is derived from it, in pure Go: no `iconutil` and no `sips`, so a
+`.app` can be assembled anywhere. Flags carry what changes per release, because that already
+lives in the caller's Makefile; the folder carries what does not, because a file location is
+how the rest of this framework holds configuration.
+
+The escape hatch is a file, not a flag. Drop an `Info.plist` or an `app.desktop` into
+`desktop/packaging/` and it is copied verbatim — that is the answer to
+`LSMinimumSystemVersion`, URL schemes, document types and MIME associations, none of which
+have flags and none of which should.
+
+Four things about the output are worth knowing before changing it:
+
+- `-id` is what Launch Services keys its icon and permission caches on. Changing it after a
+  build has been installed anywhere leaves a ghost that still claims the old icon. It
+  defaults to a reverse-DNS form of the module path and is printed on every run for that
+  reason.
+- The `.icns`'s 16px and 32px entries are `ic04`/`ic05` carrying raw **ARGB**, not PNG. The
+  `icp4`/`icp5` slots that look like the obvious home for a small PNG are read as JPEG 2000,
+  and a PNG written there produces a file that `iconutil` itself decodes into noise. This is
+  checked against `iconutil`'s own output, not inferred.
+- The `.desktop` entry's `StartupWMClass` must be the **executable's** base name, not the
+  slug: GTK sets `WM_CLASS` from the program name, and without a match the taskbar shows a
+  second, iconless item beside the pinned one.
+- `install.sh` rewrites `Exec=` to the absolute installed path. A `.desktop` launched from
+  the app grid does not inherit the login shell's `PATH`, so a bare name works from a
+  terminal and fails from the launcher.
+
+Unsigned bundles are what this produces. On macOS the first launch needs right-click ▸ Open;
+signing and notarisation are Apple's tooling and are not wrapped here.
+
 ### What it costs, and what it does not have
 
 The toy app's window binary is **17 MB** — one file, including the 7 MB wasm renderer.
@@ -1085,18 +1137,25 @@ loads on every navigation, which is exactly the signal state `.client` routes ex
 - Linux: `libwebkit2gtk-4.1` is a runtime dependency. The binary is not fully static.
 - Windows: not wired up here.
 
-The binding creates **no menu bar** (zero `NSMenu`), so macOS key equivalents that come
-from one — ⌘Q, ⌘W, and the Edit menu's ⌘C/⌘V — are not there. Fine for an internal tool or
-a dev loop; a shipped product needs a menu, which is either ~80 lines of Objective-C in
-`desktop/` or a move to wails.
+The binding creates no menu bar, so `desktop` installs one: an app menu, Edit and Window,
+with the standard key equivalents. It is not decoration. On macOS ⌘Q, ⌘W, ⌘M and — the one
+that gets reported as "the text fields are broken" — ⌘C, ⌘V, ⌘X and ⌘A are *menu item*
+behaviour, not window behaviour, so with zero `NSMenu` none of them do anything anywhere in
+the page. `Options.NoMenu` turns it off, for an application installing its own.
+
+There is deliberately no "leave an existing menu alone" guard: a **bundled** app is handed a
+one-item `mainMenu` by AppKit before any of our code runs, so such a guard fires every time
+and the menu reverts to that stub. The symptom is a menu that is correct when the binary is
+run bare and gone once it is inside a `.app`.
 
 Off by default and not worth re-deriving: the inspector (only when `Debug`), the webview's
 own right-click menu (Reload/Back/Forward — browser affordances in something that is not a
 browser), and dropped-file navigation, which would otherwise turn the app into a `file://`
 viewer with no address bar to get back from.
 
-Do not invent: `howl desktop` (there is no build verb — `go build` builds), a `.app` or
-AppImage packager, a tray icon, auto-update, or a frameless window. None of it exists.
+Do not invent: `howl desktop` (there is still no build verb — `go build` builds), an
+AppImage or `.dmg` builder, code signing or notarisation, a tray icon, auto-update, or a
+frameless window. None of it exists. Bundling a `.app` *does* — see below.
 
 ---
 
@@ -1231,7 +1290,9 @@ generated table, generated client), `howl check` and `howl mcp`, `db` +
 `signal.Batch`, `dom.Delegate`, `dom.Event`, `Element.Render`, `router.Client.Build` +
 `X-Howl-Build` (an open tab reloads itself after a deploy), `dom.Embedded` (the store
 snapshot serialised by the server into the page, restored in `Mount` without a fetch),
-`Element.Focus`, `dom.Frame` (per-paint animation, released with the scope), the
+`Element.Focus`, `dom.Frame` (per-paint animation, released with the scope), `howl package`
+(the `.app` bundle and the Linux install tree, from one 1024px PNG) and the macOS menu bar
+`desktop` now installs (`Options.NoMenu` to decline), the
 `howl_frontend` MCP tool (`format: "json"` for the five parts as fields) and
 `www/docs/11-frontend.md` (the browser recipes), the store's `Hydrate`/`Commit`/
 `Rejected` (optimistic commits rolled back when the server refuses; scaffolded), the
