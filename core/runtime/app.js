@@ -77,11 +77,26 @@ const CONFIG = (() => {
       live: c.live || null,
       binary: c.binary || "/static/views.wasm",
       exec: c.exec || "/static/wasm_exec.js",
+      build: c.build || null,
     };
   }
   return { wasm: read("howl-wasm-routes") || [], raw: [], data: null, pages: null, bootstrap: null, live: null,
-           binary: "/static/views.wasm", exec: "/static/wasm_exec.js" }; // pre-0.2 shells
+           binary: "/static/views.wasm", exec: "/static/wasm_exec.js", build: null }; // pre-0.2 shells
 })();
+
+// A document outlives its build. Nothing here is refetched for as long as the
+// tab is open — not the wasm instance, not this file, not CONFIG — so after a
+// deploy a .client route keeps rendering from the old binary while every
+// fragment and data response comes from the new one. The server stamps each
+// response with its build id; the first one that disagrees with the id this
+// document was rendered with marks the tab stale, and the next navigation is
+// a full load instead of a swap. Nothing is torn out from under the user
+// mid-page: the swap they are looking at completes, the next one reloads.
+let stale = false;
+function checkBuild(res) {
+  const build = res?.headers?.get?.("X-Howl-Build");
+  if (CONFIG.build && build && build !== CONFIG.build) stale = true;
+}
 
 // The dev client — the /_howl/alive stream, CSS swapping, the build-error
 // overlay — is served by `howl dev`, not embedded here. A production build
@@ -136,7 +151,10 @@ function fetchData(url) {
   let p = DATA.get(url);
   if (!p) {
     p = fetch(url, { credentials: "same-origin" })
-      .then((r) => r.json())
+      .then((r) => {
+        checkBuild(r);
+        return r.json();
+      })
       .then((v) => JSON.stringify(v))
       .catch((e) => {
         console.warn("howl: client data unavailable:", url, e);
@@ -261,6 +279,7 @@ function prefetch(url) {
   if (CACHE.has(url) || INFLIGHT.has(url)) return INFLIGHT.get(url);
   const p = fetch(url, { headers: { "X-Partial": "1" }, credentials: "same-origin" })
     .then(async (res) => {
+      checkBuild(res);
       const entry = { html: await res.text(), title: headerTitle(res), at: performance.now() };
       CACHE.set(url, entry);
       warmStyles(entry.html);
@@ -687,7 +706,22 @@ function applyFragment(url, entry, push, restore, transition, replace) {
   markActive();
 }
 
-async function navigate(url, { push = true, restore = 0, transition = null, replace = false } = {}) {
+async function navigate(url, { push = true, restore = 0, transition = null, replace = false, fresh = false } = {}) {
+  // A re-render of the page the caller is already on, not a navigation to it.
+  //
+  // The prefetch cache serves an entry younger than FRESH_MS without asking the
+  // server, which is right for a link and wrong for the navigation that follows
+  // a mutation: the application has just changed the thing the page describes,
+  // and the cached fragment is by definition the state before the change. An
+  // application doing form -> endpoint -> re-render sees its own writes vanish
+  // for fifteen seconds and then appear.
+  if (fresh) CACHE.delete(url);
+  // The tab has outlived its build: a swap would render the new server's
+  // fragment with the old wasm, app.js and config. Load the document instead.
+  if (stale) {
+    location.href = url;
+    return;
+  }
   // A .raw route is its own document. spaTarget already declines to intercept a
   // link to one, but howl.navigate() and a restored history entry both arrive
   // here without passing through it.
@@ -730,7 +764,7 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
     // user is still on this route and the server actually returned something new.
     if (age > FRESH_MS) {
       CACHE.delete(url);
-      const fresh = await prefetch(url);
+      const latest = await prefetch(url);
       // An innerHTML swap destroys focus, caret position, scroll and any typed
       // input. If the user is mid-interaction, keep the stale DOM — this is the
       // structural limit of swap-based rendering, and where a real VDOM wins.
@@ -738,30 +772,39 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
         /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
       if (busy) {
         navLog && (navLog.textContent = `precached nav → ${url} · 0 RTT · revalidation deferred (input focused)`);
-      } else if (fresh && seq === mine && location.pathname + location.search === url && fresh.html !== hit.html) {
+      } else if (latest && seq === mine && location.pathname + location.search === url && latest.html !== hit.html) {
         // Deliberately untransitioned: this is a background refresh of the page
         // the user is already looking at, and animating it would read as a
         // navigation they did not perform.
-        applyFragment(url, fresh, false, window.scrollY, null);
+        applyFragment(url, latest, false, window.scrollY, null);
         navLog && (navLog.textContent = `precached nav → ${url} · 0 RTT · revalidated in background`);
       }
     }
     return;
   }
 
-  document.body.classList.add("loading");
-  progressStart();
+  // A same-page re-render is not a navigation, so it does not get navigation
+  // chrome. Dimming the outlet to 55% and swapping the cursor to `progress`
+  // for the ~10ms an in-flight fragment takes on loopback reads as the page
+  // reloading on every click — which is what the caller was avoiding by using
+  // a fragment swap in the first place.
+  const chrome = !fresh;
+  if (chrome) {
+    document.body.classList.add("loading");
+    progressStart();
+  }
   try {
     const entry = await prefetch(url);
     if (seq !== mine) return; // a newer navigation won the race
     if (!entry) throw new Error("fetch failed");
+    if (stale) throw new Error("build changed"); // this fragment came from a newer build
     applyFragment(url, entry, push, restore, transition, replace);
     navLog && (navLog.textContent =
       `cold nav → ${url} · fragment ${entry.html.length} B · ${Math.round(performance.now() - t0)} ms (paid the RTT)`);
   } catch {
     location.href = url; // any failure degrades to a normal page load
   } finally {
-    if (seq === mine) {
+    if (chrome && seq === mine) {
       document.body.classList.remove("loading");
       progressDone();
     }
@@ -825,6 +868,144 @@ addEventListener("popstate", (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Morph. Element.Render on the Go side used to be innerHTML: correct, and it
+// threw away every node in the region — focus, selection, scroll, a checkbox
+// mid-toggle. This reconciles the existing DOM to the new markup instead. A
+// node of the same kind at the same position is updated in place; an element
+// with a data-key or an id is found wherever it moved to and moved, not
+// rebuilt; the element the user is typing into keeps its value. What is left
+// over is removed.
+//
+// Not a virtual DOM: there is no component tree and no state above the DOM,
+// only the markup the server would have produced, applied as a diff. Living
+// here rather than in Go because a diff is thousands of small DOM calls, and
+// each one across the wasm boundary costs more than the work it does.
+// ---------------------------------------------------------------------------
+const keyOf = (n) => (n.nodeType === 1 ? n.getAttribute("data-key") || n.id || null : null);
+const sameKind = (a, b) => a.nodeType === b.nodeType && (a.nodeType !== 1 || a.tagName === b.tagName);
+
+function morph(target, html) {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  morphChildren(target, tpl.content);
+}
+
+// Row transitions are opt-in per container with data-animate-rows. An
+// inserted element carries data-entering for one frame, so a CSS transition
+// from that state plays on the way in; a removed one carries data-leaving and
+// stays in the document until its transition ends (or 400ms, whichever comes
+// first), then goes. A leaving node is invisible to the diff — not matched,
+// not counted, not removed twice — so a row deleted and re-added while it is
+// still fading is a new row beside a fading one, not a resurrected one.
+const leaving = (n) => n.nodeType === 1 && n.hasAttribute("data-leaving");
+
+function enter(node) {
+  node.setAttribute("data-entering", "");
+  // Two frames: the first paints the entering state, the second removes it so
+  // the transition has somewhere to go. One frame and the browser coalesces
+  // set-and-remove into nothing. The timer is for a tab that is not visible,
+  // where frames do not fire at all: the row must not stay at opacity 0
+  // until the user comes back to look at it.
+  const done = () => node.removeAttribute("data-entering");
+  requestAnimationFrame(() => requestAnimationFrame(done));
+  setTimeout(done, 100);
+}
+
+function leave(node) {
+  node.setAttribute("data-leaving", "");
+  const done = () => node.remove();
+  node.addEventListener("transitionend", done, { once: true });
+  node.addEventListener("animationend", done, { once: true });
+  setTimeout(done, 400); // a row with no transition declared must still go
+}
+
+function morphChildren(oldParent, newParent) {
+  const animate = oldParent.nodeType === 1 && oldParent.hasAttribute("data-animate-rows");
+  const keyed = new Map();
+  for (const c of oldParent.childNodes) {
+    if (leaving(c)) continue;
+    const k = keyOf(c);
+    if (k && !keyed.has(k)) keyed.set(k, c);
+  }
+  // cursor is the old node at the position being filled. A match that is the
+  // cursor advances it; a match found elsewhere is moved in front of it; a new
+  // node is inserted in front of it. Whatever is still at or after the cursor
+  // when the incoming list is exhausted was not wanted.
+  let cursor = oldParent.firstChild;
+  for (const incoming of [...newParent.childNodes]) {
+    while (cursor && leaving(cursor)) cursor = cursor.nextSibling;
+    const k = keyOf(incoming);
+    let match = null;
+    if (k) {
+      if (keyed.has(k)) {
+        match = keyed.get(k);
+        keyed.delete(k);
+      }
+    } else if (cursor && !keyOf(cursor) && sameKind(cursor, incoming)) {
+      match = cursor;
+    }
+    if (!match) {
+      oldParent.insertBefore(incoming, cursor); // adopts the template's node
+      if (animate && incoming.nodeType === 1) enter(incoming);
+      continue;
+    }
+    if (match === cursor) cursor = cursor.nextSibling;
+    else oldParent.insertBefore(match, cursor);
+    morphNode(match, incoming);
+  }
+  while (cursor) {
+    const next = cursor.nextSibling;
+    if (leaving(cursor)) {
+      // already on its way out
+    } else if (animate && cursor.nodeType === 1) {
+      leave(cursor);
+    } else {
+      oldParent.removeChild(cursor);
+    }
+    cursor = next;
+  }
+}
+
+function morphNode(old, incoming) {
+  if (old.nodeType !== 1) {
+    if (old.nodeValue !== incoming.nodeValue) old.nodeValue = incoming.nodeValue;
+    return;
+  }
+  for (const a of [...old.attributes]) {
+    if (!incoming.hasAttribute(a.name)) old.removeAttribute(a.name);
+  }
+  for (const a of incoming.attributes) {
+    if (old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
+  }
+  syncProps(old, incoming);
+  morphChildren(old, incoming);
+}
+
+// Attributes are the markup; these properties are the live state the markup
+// describes, and a changed attribute does not move them once the user has.
+// The value of the element being typed into is left alone — that is the one
+// piece of state the DOM owns and the markup does not.
+function syncProps(old, incoming) {
+  const typing = old === document.activeElement;
+  switch (old.tagName) {
+    case "INPUT":
+      if (old.type === "checkbox" || old.type === "radio") {
+        if (old.checked !== incoming.checked) old.checked = incoming.checked;
+      } else if (!typing && old.value !== incoming.value) old.value = incoming.value;
+      break;
+    case "TEXTAREA":
+      if (!typing && old.value !== incoming.value) old.value = incoming.value;
+      break;
+    case "SELECT":
+      if (!typing && old.value !== incoming.value) old.value = incoming.value;
+      break;
+    case "OPTION":
+      if (old.selected !== incoming.selected) old.selected = incoming.selected;
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API. Everything an application — or Go running in wasm, through
 // core/dom — is allowed to call. Anything above this line is internal.
 //
@@ -839,6 +1020,10 @@ globalThis.howl = {
       transition: opts.transition || null,
       replace: Boolean(opts.replace),
       restore: typeof opts.scroll === "number" ? opts.scroll : 0,
+      // Skip the prefetch cache for this one. What it is for is re-rendering
+      // the current page after a write, where a cached fragment is guaranteed
+      // to be the state before it.
+      fresh: Boolean(opts.fresh),
     });
   },
   prefetch(url) {
@@ -846,6 +1031,9 @@ globalThis.howl = {
   },
   island: register,
   hydrate,
+  // morph(el, html): reconcile el's children to html. What Element.Render in
+  // Go calls; usable from an island for the same reason.
+  morph,
   config: CONFIG,
 };
 

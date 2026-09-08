@@ -28,6 +28,7 @@ type request struct {
 	Method string
 	Store  string   // page only: the store it renders, wired for real
 	Client bool     // page only: also rendered in the browser
+	Modal  bool     // page only, with a store: an edit modal on one signal and one effect
 	Roles  []string // endpoint only
 	Fields []string // store and collection only
 }
@@ -44,7 +45,7 @@ func scaffold(root string, req request) (string, error) {
 	}
 	switch req.Kind {
 	case "page":
-		return scaffoldPage(root, req.Path, req.Name, req.Store, req.Client)
+		return scaffoldPage(root, req.Path, req.Name, req.Store, req.Client, req.Modal)
 	case "endpoint":
 		return scaffoldEndpoint(root, req.Path, req.Name, req.Method, req.Roles)
 	}
@@ -244,8 +245,9 @@ signals: %s, %sCount  (browser only; package-level, so the server must never wri
 
 The three wires, in the order they run:
 
- 1. SSR    — Config.Data: ctx = store.With%s(ctx, srv.List()); the page renders from ctx.
- 2. Handoff — an endpoint returns %sSnapshot; the browser calls it once from Mount.
+ 1. SSR    — Config.Data: ctx = store.With%s(ctx, srv.Snapshot()); the page renders from ctx
+              and serialises the same snapshot into its markup with templ.JSONScript.
+ 2. Handoff — Mount reads it back with dom.Embedded and calls Restore. No request, no %sSnapshot endpoint needed.
  3. Local  — %sClient().Apply(op) mutates, publish() sets the signal, the effect repaints.
 
 Read through the signal (%s.Get()), never through the store: that is what
@@ -310,13 +312,19 @@ $FIELDS}
 
 type $LOWERKey struct{}
 
-func With$PLURAL(ctx context.Context, items []$ITEM) context.Context {
-	return context.WithValue(ctx, $LOWERKey{}, items)
+// With$PLURAL installs the server's whole snapshot: the page renders its items
+// and serialises the snapshot into its own markup, which is what the browser
+// store restores from. Call it from Config.Data with the server store's
+// Snapshot().
+func With$PLURAL(ctx context.Context, sn $ITEMSnapshot) context.Context {
+	return context.WithValue(ctx, $LOWERKey{}, sn)
 }
 
-func $PLURALFrom(ctx context.Context) []$ITEM {
-	items, _ := ctx.Value($LOWERKey{}).([]$ITEM)
-	return items
+func $PLURALFrom(ctx context.Context) []$ITEM { return $PLURALSnapshotFrom(ctx).Items }
+
+func $PLURALSnapshotFrom(ctx context.Context) $ITEMSnapshot {
+	sn, _ := ctx.Value($LOWERKey{}).($ITEMSnapshot)
+	return sn
 }
 
 // ---------------------------------------------------------------------------
@@ -388,12 +396,26 @@ func (s *$ITEMStore) Del(id int) {
 }
 
 // Apply runs one op. The server and the browser call this same method.
+func (s *$ITEMStore) Edit(id int, v string) {
+	s.mu.Lock()
+	for i := range s.items {
+		if s.items[i].ID == id {
+			s.items[i].$FIRST = v
+		}
+	}
+	s.mu.Unlock()
+	s.publish()
+}
+
+// Apply runs one op. Server and client call this same method.
 func (s *$ITEMStore) Apply(op $ITEMOp) {
 	switch op.Kind {
 	case "add":
 		s.Add(op.$FIRST)
 	case "del":
 		s.Del(op.ID)
+	case "edit":
+		s.Edit(op.ID, op.$FIRST)
 	}
 }
 `
@@ -402,7 +424,13 @@ func (s *$ITEMStore) Apply(op $ITEMOp) {
 // is package-level and therefore browser-only.
 const storeClientTemplate = `package store
 
-import "github.com/mirairoad/howl-go/core/signal"
+import (
+	"sync"
+	"time"
+
+	"github.com/mirairoad/howl-go/core/api"
+	"github.com/mirairoad/howl-go/core/signal"
+)
 
 // The browser's store, exposed reactively.
 //
@@ -448,9 +476,153 @@ func (s *$ITEMStore) publish() {
 		$PLURAL.Set(s.List())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Optimistic commits, the queue behind them, and taking one back. A mutation
+// is applied locally first and the server told afterwards, in order, by one
+// sender. Confirmed: the op folds into the confirmed snapshot. Refused (4xx):
+// the op is dropped and the visible state rebuilt from the confirmed snapshot
+// plus the ops still waiting. Unreachable (network, 5xx): nothing is dropped;
+// $ITEMOffline goes true and the sender backs off and retries the same op.
+// ---------------------------------------------------------------------------
+
+// $ITEMRejected is the last op the server refused, and why. Zero when none;
+// the next confirmed commit clears it. A page shows it in its own element.
+var $ITEMRejected = signal.Of($ITEMRejection{})
+
+// $ITEMOffline is true while the server cannot be reached; $ITEMQueued is how
+// many ops are applied locally and not yet confirmed.
+var (
+	$ITEMOffline = signal.Of(false)
+	$ITEMQueued  = signal.Of(0)
+)
+
+type $ITEMRejection struct {
+	Op  $ITEMOp
+	Err string
+}
+
+func (r $ITEMRejection) Empty() bool { return r.Err == "" }
+
+var (
+	$LOWERConfirmed $ITEMSnapshot
+	$LOWERPending   []$LOWERInflight // oldest first; [0] is being sent
+	$LOWERSeq       int
+	$LOWERKick      = make(chan struct{}, 1)
+	$LOWERSender    sync.Once
+)
+
+type $LOWERInflight struct {
+	seq  int
+	op   $ITEMOp
+	send func($ITEMOp) error
+}
+
+// Hydrate$PLURAL installs the server's snapshot as the confirmed state, with
+// any ops still waiting to be sent replayed on top. Mount calls it with what
+// dom.Embedded read from the page.
+func Hydrate$PLURAL(sn $ITEMSnapshot) {
+	$LOWERConfirmed = sn
+	view := sn
+	for _, p := range $LOWERPending {
+		view = $LOWERReplay(view, p.op)
+	}
+	$LOWERClient.Restore(view)
+}
+
+// Commit$ITEM applies op now and queues it. send is called from the sender
+// goroutine, in commit order; a refusal rolls the op back and sets
+// $ITEMRejected, anything else is retried. The page passes the network call
+// in: the store cannot import the generated client without a cycle.
+func Commit$ITEM(op $ITEMOp, send func($ITEMOp) error) {
+	$LOWERSeq++
+	$LOWERPending = append($LOWERPending, $LOWERInflight{seq: $LOWERSeq, op: op, send: send})
+	$LOWERClient.Apply(op)
+	$ITEMQueued.Set(len($LOWERPending))
+	$LOWERSender.Do(func() { go $LOWERDrain() })
+	select {
+	case $LOWERKick <- struct{}{}:
+	default:
+	}
+}
+
+func $LOWERDrain() {
+	backoff := time.Second
+	for range $LOWERKick {
+		for len($LOWERPending) > 0 {
+			e := $LOWERPending[0]
+			err := e.send(e.op)
+			switch {
+			case err == nil:
+				$LOWERConfirm(e)
+				backoff = time.Second
+			case api.Refused(err):
+				$LOWERReject(e, err)
+				backoff = time.Second
+			default:
+				$ITEMOffline.Set(true)
+				time.Sleep(backoff)
+				if backoff < 5*time.Second {
+					backoff *= 2
+				}
+			}
+		}
+	}
+}
+
+func $LOWERConfirm(e $LOWERInflight) {
+	if !$LOWERDrop(e.seq) {
+		return
+	}
+	$LOWERConfirmed = $LOWERReplay($LOWERConfirmed, e.op)
+	signal.Batch(func() {
+		$ITEMQueued.Set(len($LOWERPending))
+		$ITEMOffline.Set(false)
+		if !$ITEMRejected.Peek().Empty() {
+			$ITEMRejected.Set($ITEMRejection{})
+		}
+	})
+}
+
+func $LOWERReject(e $LOWERInflight, err error) {
+	if !$LOWERDrop(e.seq) {
+		return
+	}
+	sn := $LOWERConfirmed
+	for _, p := range $LOWERPending {
+		sn = $LOWERReplay(sn, p.op)
+	}
+	signal.Batch(func() { // one repaint for the rollback and the message
+		$LOWERClient.Restore(sn)
+		$ITEMQueued.Set(len($LOWERPending))
+		$ITEMOffline.Set(false)
+		$ITEMRejected.Set($ITEMRejection{Op: e.op, Err: err.Error()})
+	})
+}
+
+func $LOWERDrop(seq int) bool {
+	for i, p := range $LOWERPending {
+		if p.seq == seq {
+			$LOWERPending = append($LOWERPending[:i], $LOWERPending[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// $LOWERReplay applies ops to a copy of sn on a scratch store, so publish —
+// guarded on the client instance — stays silent.
+func $LOWERReplay(sn $ITEMSnapshot, ops ...$ITEMOp) $ITEMSnapshot {
+	tmp := New$ITEMStore()
+	tmp.Restore(sn)
+	for _, op := range ops {
+		tmp.Apply(op)
+	}
+	return tmp.Snapshot()
+}
 `
 
-func scaffoldPage(root, urlPath, label, store string, client bool) (string, error) {
+func scaffoldPage(root, urlPath, label, store string, client, modal bool) (string, error) {
 	segments := splitPath(urlPath)
 	if len(segments) == 0 {
 		return "", fmt.Errorf("scaffold: / already exists as client/pages/index.templ")
@@ -509,11 +681,11 @@ templ %s() {
 
 	note := "Re-run the generators (make, or howl dev picks it up on save)."
 	if client {
-		body = clientPage(root, pkg, label, component, store)
+		body = clientPage(root, pkg, label, component, store, modal)
 		note = "Re-run the generators, then build the wasm binary — a .client route needs it:\n" +
 			"  GOOS=js GOARCH=wasm go build -o client/public/views.wasm ./wasm\n\n" +
-			"Mount and Unmount are a pair. Everything Mount registers, Unmount releases; " +
-			"without that every visit adds a live effect firing at a DOM that was thrown away."
+			"Mount runs in a scope: what it registers is released when the page leaves, so it " +
+			"needs no Unmount. Write one only for teardown that is not a registration."
 		if store == "" {
 			note += "\n\nThe page owns its signal for now. Once a second page reads the same data, " +
 				"move it into client/store (howl_scaffold kind:\"store\") — signals are package-level, " +
@@ -536,7 +708,7 @@ templ %s() {
 // the part with no analogue in a JS framework: no hooks, no re-render, no
 // virtual DOM — a plain func, an auto-tracked effect, and one component
 // rendered by the same templ code the server ran.
-func clientPage(root, pkg, label, component, store string) string {
+func clientPage(root, pkg, label, component, store string, modal bool) string {
 	// Wired to a store when there is one to wire to: the signal, the hydrate
 	// call and the repaint then all refer to something real, which is the
 	// difference between an example and a working page.
@@ -567,39 +739,26 @@ templ %s() {
 	</section>
 }
 
-// release holds everything Mount registered — the effect's stop func and the
-// listener's release func are the same shape, so Unmount treats them alike.
-// This is the whole lifecycle contract: what Mount registers, Unmount releases.
-var release []func()
-
 // Mount runs in the browser after this page's markup is in the DOM — on the
 // cold load and again after every client-side navigation here. It is a plain
 // Go func, not a templ block: templ produces markup, func does something.
+//
+// It runs inside a scope: every listener and effect registered here is
+// released when the page leaves, so there is no stop func to keep and no
+// Unmount to write. Unmount exists for teardown that is not a registration.
 func Mount() {
-	// On returns the func that removes the listener. Dropping it leaks the Go
-	// closure behind it for the life of the tab, once per visit.
-	release = append(release, dom.Root().Query("[data-inc]").On("click", func() {
-		count.Set(count.Get() + 1)
-	}))
+	// One delegated listener on the page root. It matches [data-inc] whether
+	// the button is in the markup now or rendered by a later repaint.
+	dom.Root().Delegate("click", "[data-inc]", func(dom.Event) {
+		count.Update(func(n int) int { return n + 1 })
+	})
 
 	// No dependency array. The effect installs itself while it runs, so every
 	// Get() inside registers the edge — the list cannot be wrong because there
 	// is not one.
-	release = append(release, signal.Effect(repaint))
-}
-
-// Unmount runs just before this page's markup is replaced.
-func Unmount() {
-	dom.Off(release...)
-	release = nil
-}
-
-func repaint() {
-	out := dom.Root().Query("[data-count]")
-	if !out.Valid() {
-		return // the page has already been swapped away
-	}
-	out.SetText(strconv.Itoa(count.Get()))
+	signal.Effect(func() {
+		dom.Root().Query("[data-count]").SetText(strconv.Itoa(count.Get()))
+	})
 }
 `, pkg, label, component, label)
 	}
@@ -612,15 +771,95 @@ func repaint() {
 	}
 	storeImport := modulePath(root) + "/client/store"
 
+	// The modal is the recipe models get wrong most, so it is generated whole
+	// when asked for: one signal, one effect, every way in and out writing the
+	// signal. Empty strings otherwise, so the page reads clean without it.
+	row := `		<li data-key={ strconv.Itoa(it.ID) }>{ it.$FIRSTFIELD }</li>`
+	markup, state, mount, funcs := "", "", "", ""
+	if modal {
+		row = `		<li data-key={ strconv.Itoa(it.ID) }>
+			<span>{ it.$FIRSTFIELD }</span>
+			<button data-edit={ strconv.Itoa(it.ID) }>edit</button>
+		</li>`
+		markup = `		<!-- The modal lives OUTSIDE the repainted list. One signal decides
+		     whether it is open; one effect toggles hidden, fills the field and
+		     focuses it. Every way in and out writes that signal. -->
+		<div data-modal hidden>
+			<div data-close></div>
+			<div role="dialog" aria-modal="true">
+				<input data-edit-text autocomplete="off"/>
+				<button data-save>save</button>
+				<button data-close>cancel</button>
+			</div>
+		</div>
+`
+		state = `// editing is the modal's whole state: the id being edited, 0 when closed.
+// Open, close, Escape, backdrop and save all write this one signal; the
+// effect in Mount is the only thing that touches the modal's DOM.
+var editing = signal.Of(0)
+
+`
+		mount = `	// The modal. Edit buttons are in the repainted list, so they are
+	// delegated; the field is outside it, so it gets On.
+	modal := root.Query("[data-modal]")
+	field := modal.Query("[data-edit-text]")
+	root.Delegate("click", "[data-edit]", func(e dom.Event) {
+		id, _ := strconv.Atoi(e.Target().Attr("data-edit"))
+		editing.Set(id)
+	})
+	root.Delegate("click", "[data-close]", func(dom.Event) { editing.Set(0) })
+	root.Delegate("click", "[data-save]", func(dom.Event) { saveEdit(field.Value()) })
+	field.On("keydown", func(e dom.Event) {
+		switch e.Key() {
+		case "Enter":
+			saveEdit(e.Value())
+		case "Escape":
+			editing.Set(0)
+		}
+	})
+	signal.Effect(func() {
+		id := editing.Get()
+		modal.Hide(id == 0)
+		if id == 0 {
+			return
+		}
+		// Peek: the field is filled when the modal opens, not on every
+		// change of the list underneath — reading it would re-fill mid-typing.
+		for _, it := range store.$PLURAL.Peek() {
+			if it.ID == id {
+				field.SetValue(it.$FIRSTFIELD)
+			}
+		}
+		field.Focus()
+	})
+
+`
+		funcs = `// saveEdit commits the edit and closes the modal in one Batch: one repaint.
+func saveEdit(text string) {
+	id := editing.Peek()
+	if id == 0 || text == "" {
+		return
+	}
+	signal.Batch(func() {
+		store.Commit$ITEM(store.$ITEMOp{Kind: "edit", ID: id, $FIRSTFIELD: text}, send)
+		editing.Set(0)
+	})
+}
+
+`
+	}
+
+	// The modal snippets are spliced in first, so the names are substituted
+	// inside them too.
+	modals := strings.NewReplacer("$MODALROW", row, "$MODALMARKUP", markup, "$MODALSTATE", state, "$MODALMOUNT", mount, "$MODALFUNCS", funcs)
 	return strings.NewReplacer(
 		"$PKG", pkg, "$LABEL", label, "$COMPONENT", component,
-		"$ITEMLIST", item+"List", "$ITEM", item, "$PLURAL", plural, "$IMPORT", storeImport,
+		"$ITEMLIST", item+"List", "$ITEM", item, "$PLURAL", plural, "$IMPORT", storeImport, "$LOWER", base,
 		"$FIRSTFIELD", storeFirstField(root, base, item),
-	).Replace(`package $PKG
+	).Replace(modals.Replace(`package $PKG
 
 import (
-	"context"
-	"strings"
+	"strconv"
 
 	"github.com/mirairoad/howl-go/core/dom"
 	"github.com/mirairoad/howl-go/core/signal"
@@ -643,81 +882,105 @@ templ $COMPONENT() {
 		<ul data-list>
 			@$ITEMLIST(store.$PLURALFrom(ctx))
 		</ul>
+		<!-- Shown when the server refuses an op the browser already applied.
+		     The store rolled it back; this only says why. -->
+		<p data-error hidden></p>
+		<!-- While the server is unreachable, ops stay applied and queued in
+		     order; one sender retries with backoff and this line says so. -->
+		<p data-offline hidden></p>
+$MODALMARKUP		<!-- The snapshot the server rendered from, serialised for the browser
+		     store. Mount restores it: no fetch, no empty-then-full flash. -->
+		@templ.JSONScript("$LOWER", store.$PLURALSnapshotFrom(ctx))
 	</section>
 }
 
 templ $ITEMLIST(items []store.$ITEM) {
 	for _, it := range items {
-		<li>{ it.$FIRSTFIELD }</li>
+$MODALROW
 	}
 }
 
-// release holds every registration Mount made — effects, watchers and DOM
-// listeners alike, since all three hand back a func().
-var release []func()
-
-// Mount hydrates the browser's store from the server, then renders from it.
+$MODALSTATE// Mount hydrates the browser's store from the server, then renders from it.
 // After this runs the server is out of the loop: a mutation repaints locally
 // and is reported afterwards, so nobody waits on a round trip.
+//
+// It runs inside a scope: every listener, effect and watcher registered here
+// is released when the page leaves, so there is no stop func to keep and no
+// Unmount to write.
 func Mount() {
-	// On hands back the func that removes the listener. Dropping it leaks the
-	// Go closure behind it for the life of the tab, once per visit.
-	release = append(release, dom.Root().Query("[data-add]").On("click", func() {
-		// Local first: apply, which publishes to the signal, which repaints.
-		store.$PLURALClient().Apply(store.$ITEMOp{Kind: "add", $FIRSTFIELD: "new"})
-	}))
+	root := dom.Root()
+
+	// Hydrate from the document. The server serialised the snapshot it
+	// rendered from into this page's markup, so the browser store starts with
+	// exactly what the user is looking at. Restore publishes to the signal; the
+	// effect below then renders from it on its first run.
+	var sn store.$ITEMSnapshot
+	if err := dom.Embedded("$LOWER", &sn); err != nil {
+		dom.Warn("[$PKG] no embedded snapshot:", err.Error())
+	} else {
+		store.Hydrate$PLURAL(sn) // visible state and confirmed state, in one
+	}
+
+	// One delegated listener on the page root covers every [data-add] there
+	// is now and every one a later repaint renders — nothing to rebind.
+	root.Delegate("click", "[data-add]", func(dom.Event) {
+		// Local first: Commit applies, which publishes, which repaints — then
+		// sends. A refusal rolls this op back and sets $ITEMRejected.
+		store.Commit$ITEM(store.$ITEMOp{Kind: "add", $FIRSTFIELD: "new"}, send)
+	})
 
 	// repaint reads the signal inside itself, so the dependency is discovered
 	// by running — there is no list to keep correct.
-	release = append(release, signal.Effect(repaint))
-	release = append(release, signal.Watch(store.$ITEMCount.Get, func(now, before int) {
+	signal.Effect(repaint)
+	signal.Watch(store.$ITEMCount.Get, func(now, before int) {
 		dom.Log("[$PKG] count", before, "->", now)
-	}))
+	})
 
-	// Hydrate from the server, then render from the local store. The generated
-	// client is typed against the same Go types the endpoint declares, so
-	// renaming a field breaks the build on both sides at once. Scaffold the
-	// endpoint (kind:"endpoint"), run fsapis, then uncomment:
-	//
-	//	go func() {
-	//		sn, err := apiclient.New("").$PLURAL(context.Background())
-	//		if err != nil {
-	//			dom.Warn("[$PKG] hydrate failed:", err.Error())
-	//			return
-	//		}
-	//		store.$PLURALClient().Restore(sn) // publishes to the signal, which repaints
-	//	}()
-	//
-	// The goroutine is not optional: blocking the JS callback deadlocks the Go
-	// scheduler, because the fetch can only resolve once control returns to the
-	// event loop.
+	// Offline: nothing was rolled back, the queue is waiting for the server.
+	signal.Effect(func() {
+		el := root.Query("[data-offline]")
+		off, n := store.$ITEMOffline.Get(), store.$ITEMQueued.Get()
+		el.Hide(!off)
+		if off {
+			el.SetText("server unreachable — " + strconv.Itoa(n) + " change(s) queued, retrying")
+		}
+	})
+
+$MODALMOUNT	// The rollback message: its own element, its own effect. The list's
+	// repaint does not depend on it and it does not depend on the list.
+	signal.Effect(func() {
+		r := store.$ITEMRejected.Get()
+		el := root.Query("[data-error]")
+		el.Hide(r.Empty())
+		if !r.Empty() {
+			el.SetText("server refused " + r.Op.Kind + ": " + r.Err + " — rolled back")
+		}
+	})
 }
 
-// Unmount releases every registration Mount made. An effect that outlives its
-// DOM keeps firing against nodes that were thrown away, and every visit adds
-// another one.
-func Unmount() {
-	dom.Off(release...)
-	release = nil
+$MODALFUNCS// send tells the server about one op. Commit runs it in a goroutine, so it
+// may block; a non-nil error rolls the op back. Until the endpoint exists it
+// accepts everything — scaffold it (kind:"endpoint"), run fsapis, add
+// "context" to the imports, and replace the body with:
+//
+//	_, err := apiclient.New("").Sync$PLURAL(context.Background(), []store.$ITEMOp{op})
+//	return err
+func send(op store.$ITEMOp) error {
+	_ = op
+	return nil
 }
 
+// repaint is the whole "update the screen": read through the signal — that is
+// what registers this effect as a dependent — and render the same component
+// the server used into the same element. An element the navigation has
+// already thrown away is a no-op, which is how an effect ends.
 func repaint() {
-	list := dom.Root().Query("[data-list]")
-	if !list.Valid() {
-		return // the page has already been swapped away
-	}
-	// Read through the signal, not the store: that is what registers this
-	// effect as a dependent.
 	items := store.$PLURAL.Get()
-
-	var sb strings.Builder
-	if err := $ITEMLIST(items).Render(context.Background(), &sb); err != nil {
+	if err := dom.Root().Query("[data-list]").Render($ITEMLIST(items)); err != nil {
 		dom.Warn("[$PKG] render failed:", err.Error())
-		return
 	}
-	list.SetHTML(sb.String())
 }
-`)
+`))
 }
 
 // storeFirstField finds the field the store's Add takes, so the generated page

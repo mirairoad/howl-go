@@ -9,3 +9,7 @@ examples/hello/howl-hello
 # `howl dev` builds the running binary here
 .howl/
 examples/toy_app/toy_desktop
+
+# browser test harness, Node for tests only
+test/browser/node_modules/
+test/browser/package-lock.json

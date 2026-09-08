@@ -144,10 +144,14 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 			"serverInfo":      map[string]any{"name": "howl-go", "version": "dev"},
 			"instructions": "Tools for working in a howl-go project. Call howl_conventions before writing " +
 				"routing, page or endpoint code — the file-naming rules cannot be guessed, because Go rejects " +
-				"the conventions every JS framework uses. Before writing anything that updates in the browser, " +
-				"call howl_conventions with section=\"Making a page interactive\": there are no hooks, no " +
-				"re-render and no dependency array here, so a page written from JS habits compiles and then " +
-				"silently never updates. Before editing a .client route, its layouts or shared components, call " +
+				"the conventions every JS framework uses. Before writing ANYTHING that runs in the browser, " +
+				"call howl_frontend with topic=\"checklist\", then the topic you are about to write (page, store, " +
+				"events, list, form, modal, filter, navigation, animation, islands). Each topic is When / Rules / " +
+				"a complete Example / what goes Wrong / the Check. There are no hooks, no re-render, no virtual " +
+				"DOM and no dependency array here, so a page written from JS habits compiles and then silently " +
+				"never updates — the modal and the store are where that happens most. A page with a store must " +
+				"embed the server's snapshot in its markup and restore it in Mount; a modal is one signal and one " +
+				"effect. Before editing a .client route, its layouts or shared components, call " +
 				"howl_conventions with section=\"Client render safety\": process globals describe the wasm " +
 				"build after local navigation, not the running server. Before packaging the app as a native " +
 				"window, call howl_conventions with section=\"Native window\": desktop is a separate module " +
@@ -214,7 +218,22 @@ func tools() []tool {
 		"The wasm renderer, Endpoints, " +
 		"The document store (db), Native window (desktop), " +
 		"Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
+	topics := "checklist, page, store, events, list, form, modal, filter, navigation, animation, islands"
 	return []tool{
+		{
+			Name:  "howl_frontend",
+			Title: "howl-go frontend recipes",
+			Description: "The browser half, as recipes with the same five parts each: When, Rules, a complete " +
+				"Example that compiles, what goes Wrong when written from JS-framework habits, and the Check that " +
+				"proves it works. Call with topic=\"checklist\" before any browser-side code, then the topic you " +
+				"are writing. The store topic is the mandatory shape for any page that edits data: the server " +
+				"serialises its snapshot into the page, Mount restores it, no fetch. The modal topic is the one " +
+				"signal + one effect pattern that replaces showModal and class toggling. Topics: " + topics,
+			InputSchema: object(map[string]any{
+				"topic":  str("one of: " + topics + ". Omit for the whole file."),
+				"format": str("\"json\" for {topic, when, rules, example, wrong, check} — one object, or an array when topic is omitted; default is the Markdown section"),
+			}),
+		},
 		{
 			Name:  "howl_conventions",
 			Title: "howl-go conventions",
@@ -236,8 +255,8 @@ func tools() []tool {
 			Description: "Run the framework's conventions against the project and return structured diagnostics: " +
 				"pages importing core/app, `templ Mount()`, a shell missing #outlet or the page-head markers, " +
 				"endpoints reading the raw query instead of their declared one, roles declared with no Authorize " +
-				"wired, hand-edited generated files — plus the browser-side rules that all fail silently: a Mount " +
-				"that subscribes with no Unmount, a discarded effect stop func, server code importing core/signal, " +
+				"wired, hand-edited generated files — plus the browser-side rules that all fail silently: a " +
+				"listener re-bound per row inside a repaint, server code importing core/signal, " +
 				"a store that cannot compile for wasm. Client render checks trace .client routes through their " +
 				"layouts and module-local UI imports, rejecting server-only packages and process-dependent calls " +
 				"such as os.Getenv, time.Now and runtime.Version. It also resolves every @pkg.Component() reference against " +
@@ -275,8 +294,8 @@ func tools() []tool {
 				"location and shape. The file name carries the behaviour in this framework, so a scaffold is the " +
 				"difference between a route that exists and a build error; for a collection it is the envelope " +
 				"embedding and the pointer receiver Defaults silently needs; for a store and a client page it is " +
-				"the whole reactive shape — which half compiles for wasm, which signals are package-level, and the " +
-				"Mount/Unmount pair whose absence leaks one live effect per visit. To make a page reactive: " +
+				"the whole reactive shape — which half compiles for wasm, which signals are package-level, and a " +
+				"Mount whose effect and delegated listener the page scope releases on its own. To make a page reactive: " +
 				"scaffold kind=\"store\" first, then kind=\"page\" with client=true and store=<that name>, and the " +
 				"page comes out wired to it. Refuses to overwrite.",
 			InputSchema: object(map[string]any{
@@ -289,7 +308,10 @@ func tools() []tool {
 				"method": map[string]any{"type": "string", "enum": []string{"GET", "POST", "PUT", "PATCH", "DELETE"},
 					"description": "endpoint only; defaults to GET"},
 				"client": map[string]any{"type": "boolean", "description": "page only: also render it in the browser (.client), " +
-					"with Mount, Unmount, an auto-tracked effect and its release"},
+					"with Mount, a delegated listener, an auto-tracked effect and a one-line repaint"},
+				"modal": map[string]any{"type": "boolean", "description": "page only, with a store: also generate an edit " +
+					"modal — one signal, one effect, every way in and out writing the signal. The recipe models get " +
+					"wrong most, written for them"},
 				"store": str("page only: the store this page renders, e.g. todos — wires the signal, the repaint and the " +
 					"hydrate call to client/store/<name>.go. Scaffold the store first."),
 				"roles": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "endpoint only: role strings your Authorize will interpret"},
@@ -304,12 +326,15 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 	var args struct {
 		Dir     string   `json:"dir"`
 		Section string   `json:"section"`
+		Topic   string   `json:"topic"`
+		Format  string   `json:"format"`
 		Build   bool     `json:"build"`
 		Kind    string   `json:"kind"`
 		Path    string   `json:"path"`
 		Name    string   `json:"name"`
 		Method  string   `json:"method"`
 		Client  bool     `json:"client"`
+		Modal   bool     `json:"modal"`
 		Roles   []string `json:"roles"`
 		Store   string   `json:"store"`
 		Fields  []string `json:"fields"`
@@ -331,6 +356,11 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 	switch name {
 	case "howl_conventions":
 		return conventions(args.Section), nil
+	case "howl_frontend":
+		if args.Format == "json" {
+			return frontendJSON(args.Topic)
+		}
+		return frontend(args.Topic), nil
 	case "howl_check":
 		return asJSON(runCheck(dir, args.Build))
 	case "howl_routes":
@@ -340,7 +370,7 @@ func callTool(root, name string, raw json.RawMessage) (string, error) {
 	case "howl_scaffold":
 		return scaffold(dir, request{
 			Kind: args.Kind, Path: args.Path, Name: args.Name, Method: args.Method,
-			Store: args.Store, Client: args.Client, Roles: args.Roles, Fields: args.Fields,
+			Store: args.Store, Client: args.Client, Modal: args.Modal, Roles: args.Roles, Fields: args.Fields,
 		})
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
@@ -355,11 +385,87 @@ func asJSON(v any) (string, error) {
 // downloaded module as from a checkout. Serving the file rather than a second
 // copy of the rules is the point: there is one place to update.
 func conventions(section string) string {
-	text := string(llmsTxt)
-	if section == "" {
+	return sectionOf(string(llmsTxt), section, "call this tool with no arguments for the whole file")
+}
+
+// frontend serves frontend.md by topic. The topics are the h2 headings, so an
+// unknown topic reports the ones that exist rather than the whole file.
+func frontend(topic string) string {
+	return sectionOf(string(frontendMd), topic,
+		"topics are: checklist, page, store, events, list, form, modal, filter, navigation, animation, islands")
+}
+
+// A recipe as fields, for a client that wants to render the five parts
+// separately or feed only "Wrong" and "Example" to a model. The Markdown is
+// the source; this is a view of it, cut at the bold markers every topic has.
+type recipe struct {
+	Topic   string `json:"topic"`
+	When    string `json:"when"`
+	Rules   string `json:"rules"`
+	Example string `json:"example"`
+	Wrong   string `json:"wrong"`
+	Check   string `json:"check"`
+}
+
+var frontendTopics = []string{"checklist", "page", "store", "events", "list", "form", "modal", "filter", "navigation", "animation", "islands"}
+
+var recipePartRe = regexp.MustCompile(`(?m)^\*\*(When|Rules|Example|Wrong|Check)\*\*[ —-]*`)
+
+func frontendJSON(topic string) (string, error) {
+	if topic == "" {
+		var all []recipe
+		for _, t := range frontendTopics {
+			all = append(all, parseRecipe(t, frontend(t)))
+		}
+		return asJSON(all)
+	}
+	text := frontend(topic)
+	if strings.HasPrefix(text, "no section matching") {
+		return "", fmt.Errorf("%s", text)
+	}
+	return asJSON(parseRecipe(topic, text))
+}
+
+func parseRecipe(topic, text string) recipe {
+	r := recipe{Topic: topic}
+	locs := recipePartRe.FindAllStringSubmatchIndex(text, -1)
+	for i, loc := range locs {
+		end := len(text)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		body := strings.TrimSpace(text[loc[1]:end])
+		switch text[loc[2]:loc[3]] {
+		case "When":
+			r.When = body
+		case "Rules":
+			r.Rules = body
+		case "Example":
+			r.Example = body
+		case "Wrong":
+			r.Wrong = body
+		case "Check":
+			r.Check = body
+		}
+	}
+	return r
+}
+
+// sectionOf returns the heading whose text contains name, with everything
+// under it up to the next heading of the same or a higher level.
+func sectionOf(text, name, hint string) string {
+	if name == "" {
 		return text
 	}
 	lines := strings.Split(text, "\n")
+	// An exact heading wins over a containing one: "list" is a topic of its
+	// own and also four letters of "checklist".
+	matches := func(heading string) bool { return strings.EqualFold(heading, name) }
+	if !anyHeading(lines, matches) {
+		matches = func(heading string) bool {
+			return strings.Contains(strings.ToLower(heading), strings.ToLower(name))
+		}
+	}
 	var out []string
 	depth := 0 // the level of the heading that matched; 0 while still looking
 	fenced := false
@@ -376,7 +482,7 @@ func conventions(section string) string {
 				if level <= depth {
 					break
 				}
-			} else if heading := strings.TrimSpace(strings.TrimLeft(line, "# ")); strings.Contains(strings.ToLower(heading), strings.ToLower(section)) {
+			} else if matches(strings.TrimSpace(strings.TrimLeft(line, "# "))) {
 				depth = level
 			}
 		}
@@ -385,9 +491,22 @@ func conventions(section string) string {
 		}
 	}
 	if len(out) == 0 {
-		return "no section matching " + section + " — call this tool with no arguments for the whole file"
+		return "no section matching " + name + " — " + hint
 	}
 	return strings.Join(out, "\n")
+}
+
+func anyHeading(lines []string, matches func(string) bool) bool {
+	fenced := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "```") {
+			fenced = !fenced
+		}
+		if headingLevel(line, fenced) > 0 && matches(strings.TrimSpace(strings.TrimLeft(line, "# "))) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -506,3 +625,6 @@ func readEndpoints(root string) any {
 
 //go:embed llms.txt
 var llmsTxt []byte
+
+//go:embed frontend.md
+var frontendMd []byte

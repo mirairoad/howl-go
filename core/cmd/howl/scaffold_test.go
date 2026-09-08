@@ -106,7 +106,7 @@ func TestScaffoldStore(t *testing.T) {
 		"client/store/todos.go": {
 			"type Todo struct {",
 			"Text string `json:\"text\"`",
-			"func WithTodos(ctx context.Context, items []Todo) context.Context",
+			"func WithTodos(ctx context.Context, sn TodoSnapshot) context.Context",
 			"func TodosFrom(ctx context.Context) []Todo",
 			"type TodoSnapshot struct {",
 			"func (s *TodoStore) Apply(op TodoOp)",
@@ -164,15 +164,21 @@ func TestScaffoldClientPageIsReactive(t *testing.T) {
 	}
 	source := string(body)
 	for _, want := range []string{
-		"package todos",                       // a directory is a package, and Todos is a type name
-		`"example.com/myapp/client/store"`,    // the real module path, or it compiles nowhere
-		"func Mount()",                        // a plain func — templ has no lifecycle
-		"func Unmount()",                      // ...and its pair, or every visit leaks
-		"release = append(release, signal.Effect(repaint))", // the stop func is kept, not discarded
-		"dom.Off(release...)",                              // ...and released
-		"release, dom.Root().Query(\"[data-add]\").On(",     // On's handle is kept too
-		"store.Todos.Get()",                   // read through the signal, not the store
-		"it.Text",                             // the field the store actually declares
+		"package todos",                    // a directory is a package, and Todos is a type name
+		`"example.com/myapp/client/store"`, // the real module path, or it compiles nowhere
+		"func Mount()",                     // a plain func — templ has no lifecycle
+		"signal.Effect(repaint)",           // registered bare: the scope releases it
+		`@templ.JSONScript("todos", store.TodosSnapshotFrom(ctx))`, // the server serialises what it rendered from
+		`dom.Embedded("todos", &sn)`,                               // ...and the browser store restores it without a request
+		"store.HydrateTodos(sn)",                                   // as the confirmed state, so a refusal can roll back to it
+		"store.CommitTodo(",                                        // apply now, send after, roll back on refusal
+		"store.TodoRejected.Get()",                                 // and the page shows why
+		"store.TodoOffline.Get()",                                  // ...and when the server cannot be reached
+		"data-key={ strconv.Itoa(it.ID) }",                         // keyed rows: the morph moves them instead of rebuilding
+		"root.Delegate(\"click\", \"[data-add]\"",                  // delegated, so a repaint never rebinds
+		".Render(TodoList(items))",                                 // the repaint is the component, rendered again
+		"store.Todos.Get()",                                        // read through the signal, not the store
+		"it.Text",                                                  // the field the store actually declares
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("the client page is missing %q\n%s", want, source)
@@ -185,8 +191,53 @@ func TestScaffoldClientPageIsReactive(t *testing.T) {
 	}
 }
 
+// The modal is generated whole when asked for: one signal, one effect, and an
+// "edit" op the store applies on both sides.
+func TestScaffoldClientPageWithModal(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/myapp\n\ngo 1.25\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scaffold(root, request{Kind: "store", Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scaffold(root, request{Kind: "page", Path: "/notes", Client: true, Store: "notes", Modal: true}); err != nil {
+		t.Fatal(err)
+	}
+	page, _ := os.ReadFile(filepath.Join(root, "client/pages/notes/index.client.templ"))
+	for _, want := range []string{
+		"var editing = signal.Of(0)",           // one signal
+		"modal.Hide(id == 0)",                  // one effect owns the DOM
+		`root.Delegate("click", "[data-edit]"`, // buttons in the list: delegated
+		`field.On("keydown"`,                   // the field outside it: On
+		"store.Notes.Peek()",                   // filled on open, not on every change
+		`Kind: "edit"`,                         // saved through the store
+		"data-modal hidden",                    // rendered closed by the server
+	} {
+		if !strings.Contains(string(page), want) {
+			t.Errorf("modal page is missing %q\n%s", want, page)
+		}
+	}
+	domain, _ := os.ReadFile(filepath.Join(root, "client/store/notes.go"))
+	if !strings.Contains(string(domain), `case "edit":`) {
+		t.Error("the store does not apply the edit op")
+	}
+	if result := runCheck(root, false); result.Errors > 0 {
+		t.Errorf("the modal scaffold does not pass howl check: %#v", result.Diagnostics)
+	}
+	// Without the flag, none of it.
+	plain := t.TempDir()
+	os.WriteFile(filepath.Join(plain, "go.mod"), []byte("module example.com/myapp\n\ngo 1.25\n"), 0o644) //nolint:errcheck
+	scaffold(plain, request{Kind: "store", Name: "notes"})                                               //nolint:errcheck
+	scaffold(plain, request{Kind: "page", Path: "/notes", Client: true, Store: "notes"})                 //nolint:errcheck
+	body, _ := os.ReadFile(filepath.Join(plain, "client/pages/notes/index.client.templ"))
+	if strings.Contains(string(body), "editing") || strings.Contains(string(body), "$MODAL") {
+		t.Error("a page scaffolded without modal:true carries modal code or an unreplaced placeholder")
+	}
+}
+
 // Without a store there is nothing real to wire, so the page owns its signal —
-// and still demonstrates the whole cycle, release included.
+// and still demonstrates the whole cycle.
 func TestScaffoldClientPageWithoutAStore(t *testing.T) {
 	root := t.TempDir()
 	if _, err := scaffold(root, request{Kind: "page", Path: "/counter", Client: true}); err != nil {
@@ -197,9 +248,9 @@ func TestScaffoldClientPageWithoutAStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"var count = signal.Of(0)", "func Mount()", "func Unmount()",
-		"release = append(release, signal.Effect(repaint))",
-		"dom.Off(release...)",
+		"var count = signal.Of(0)", "func Mount()",
+		"dom.Root().Delegate(\"click\", \"[data-inc]\"",
+		"signal.Effect(func() {",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("missing %q\n%s", want, body)

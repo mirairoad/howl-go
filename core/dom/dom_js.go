@@ -11,11 +11,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"syscall/js"
+
+	"github.com/mirairoad/howl-go/core/signal"
 )
 
-var root js.Value
+var (
+	root    js.Value
+	dispose func() // the current page's scope, nil between pages
+)
 
 // SetRoot is called by the wasm runtime before a page's Mount runs. It takes
 // `any` so the stub build can share the signature without naming js.Value.
@@ -25,8 +31,63 @@ func SetRoot(v any) {
 	}
 }
 
+// Mount runs a page's Mount hook inside a scope: every effect, watcher and
+// listener it registers is released by the next Unmount, with no bookkeeping
+// in the page. The wasm entrypoint calls this from howlMount.
+//
+// The scope is lexical. A goroutine started in Mount — the hydrate fetch —
+// runs after Mount has returned, so anything it registers is outside it;
+// a goroutine should write signals and let the effects registered in Mount
+// react, which is the shape hydration already has.
+func Mount(el any, fn func()) {
+	SetRoot(el)
+	Unmount(nil) // a page swapped in without its predecessor's Unmount running
+	if fn == nil {
+		return
+	}
+	dispose = signal.Scope(fn)
+}
+
+// Unmount runs the outgoing page's Unmount hook, if any, then disposes the
+// scope its Mount opened. The wasm entrypoint calls this from howlUnmount.
+func Unmount(fn func()) {
+	if fn != nil {
+		fn()
+	}
+	if dispose != nil {
+		dispose()
+		dispose = nil
+	}
+}
+
 // Root is the element the current page was rendered into.
 func Root() Element { return Element{root} }
+
+// Embedded decodes a JSON script the server rendered into this page. It is
+// the hydrate step without a request:
+//
+//	@templ.JSONScript("todos", store.SnapshotFrom(ctx))   // in the page markup
+//	dom.Embedded("todos", &sn); store.Client().Restore(sn) // in Mount
+//
+// The fragment carries the script, so it works on a cold load and after a
+// client-side navigation alike, and the browser store starts with exactly what
+// the user is looking at — no empty-then-full flash, no round trip, and the
+// server owns the serialisation. Looked up inside the page first, then the
+// document, so a shell-level script is reachable too.
+func Embedded(id string, out any) error {
+	sel := `script[type="application/json"][id="` + id + `"]`
+	el := js.Value{}
+	if root.Truthy() {
+		el = root.Call("querySelector", sel)
+	}
+	if !el.Truthy() {
+		el = js.Global().Get("document").Call("querySelector", sel)
+	}
+	if !el.Truthy() {
+		return fmt.Errorf("dom.Embedded: no <script type=\"application/json\" id=%q> in the page", id)
+	}
+	return json.Unmarshal([]byte(el.Get("textContent").String()), out)
+}
 
 type Element struct{ v js.Value }
 
@@ -53,6 +114,14 @@ func (e Element) Value() string     { return e.v.Get("value").String() }
 func (e Element) SetValue(s string) { e.v.Set("value", s) }
 func (e Element) Hide(hidden bool)  { e.v.Set("hidden", hidden) }
 
+// Focus moves keyboard focus to the element — the first field of a modal that
+// just opened, the box a shortcut targets. A no-op on a missing element.
+func (e Element) Focus() {
+	if e.v.Truthy() {
+		e.v.Call("focus")
+	}
+}
+
 func (e Element) Attr(name string) string {
 	v := e.v.Call("getAttribute", name)
 	if v.IsNull() || v.IsUndefined() {
@@ -63,34 +132,110 @@ func (e Element) Attr(name string) string {
 
 func (e Element) SetAttr(name, val string) { e.v.Call("setAttribute", name, val) }
 
-// On registers a DOM listener and returns the function that removes it again.
+// Component is anything that renders itself to a writer — a templ component,
+// without this package having to import templ.
+type Component interface {
+	Render(ctx context.Context, w io.Writer) error
+}
+
+// Render draws c into the element, replacing its content. This is the repaint:
+// the same component the server rendered, rendered again in the browser and
+// swapped in. An element that is no longer in the document — the page was
+// swapped away between the write and the effect — is a no-op, not an error,
+// because that is the ordinary end of an effect's life.
 //
-// The returned func is the only way to release the js.Func underneath. A
-// js.Func holds a Go closure alive on the JS side until Release is called, and
-// nothing else can reach it — so an On whose handle is dropped leaks one
-// closure per call, permanently. Pages mount on every client-side navigation
-// and repaint handlers are re-bound on every repaint, so "one per call" is one
-// per visit, for the life of the tab.
+// The swap is a morph: app.js reconciles the existing nodes to the new markup,
+// so an unchanged row is the same node afterwards, a row with a data-key or an
+// id is moved rather than rebuilt, and the field being typed into keeps its
+// value and its focus. Listeners bound with Delegate never noticed either way,
+// which is why that is the listener to use on anything inside a repainted
+// region. Without the runtime — a test harness, an old shell — it is innerHTML.
+func (e Element) Render(c Component) error {
+	if !e.v.Truthy() {
+		return nil
+	}
+	var sb strings.Builder
+	if err := c.Render(context.Background(), &sb); err != nil {
+		return err
+	}
+	if howl := js.Global().Get("howl"); howl.Truthy() && howl.Get("morph").Type() == js.TypeFunction {
+		howl.Call("morph", e.v, sb.String())
+		return nil
+	}
+	e.v.Set("innerHTML", sb.String())
+	return nil
+}
+
+// Event is what a listener receives: the element it fired on and the few
+// fields a page reads. Target is the delegated match when there is one, so a
+// handler on "[data-del]" gets the button, not the icon inside it.
+type Event struct {
+	v      js.Value
+	target js.Value
+}
+
+func (ev Event) Target() Element { return Element{ev.target} }
+func (ev Event) Value() string   { return Element{ev.target}.Value() }
+func (ev Event) Key() string     { return ev.v.Get("key").String() }
+func (ev Event) PreventDefault() { ev.v.Call("preventDefault") }
+
+// On registers a listener on this element and returns the func that removes
+// it. Inside a page's Mount the release is automatic — the scope calls it when
+// the page leaves — so the result can be ignored. Outside a scope it is the
+// only handle: a js.Func is held alive on the JS side until it is released,
+// and nothing else can reach it.
 //
-// Ignoring the result is still legal Go and still correct for a listener that
-// should live as long as the page process — an app-shell control outside the
-// outlet, say. Inside a page, keep it and call it from Unmount.
-func (e Element) On(event string, fn func()) func() {
+// A submit, and a click that lands on a link, are prevented before fn runs —
+// the browser would otherwise navigate away mid-handler. Nothing else is: a
+// click on a checkbox must still toggle it and a keydown must still type.
+func (e Element) On(event string, fn func(Event)) func() {
+	return e.listen(event, "", fn)
+}
+
+// Delegate registers one listener on this element for every descendant that
+// matches selector, now or later. Rows rendered by a repaint are covered
+// without rebinding, which is what makes a repaint one line:
+//
+//	root.Delegate("click", "[data-del]", func(e dom.Event) { del(e.Target().Attr("data-del")) })
+//
+// Only bubbling events reach it. Use focusin/focusout rather than focus/blur.
+func (e Element) Delegate(event, selector string, fn func(Event)) func() {
+	return e.listen(event, selector, fn)
+}
+
+func (e Element) listen(event, selector string, fn func(Event)) func() {
 	if !e.v.Truthy() {
 		return func() {}
 	}
 	cb := js.FuncOf(func(_ js.Value, args []js.Value) any {
-		// A submit or a link click would otherwise navigate away mid-handler.
-		if len(args) > 0 && args[0].Truthy() {
-			args[0].Call("preventDefault")
+		if len(args) == 0 || !args[0].Truthy() {
+			return nil
 		}
-		fn()
+		ev := args[0]
+		target := ev.Get("target")
+		if selector != "" {
+			// A text node has no closest(); its parent is the element that matters.
+			if target.Type() == js.TypeObject && target.Get("closest").IsUndefined() {
+				target = target.Get("parentElement")
+			}
+			if !target.Truthy() {
+				return nil
+			}
+			target = target.Call("closest", selector)
+			if !target.Truthy() || !e.v.Call("contains", target).Bool() {
+				return nil
+			}
+		}
+		if event == "submit" || (event == "click" && target.Truthy() && isElement(target) && target.Call("closest", "a[href]").Truthy()) {
+			ev.Call("preventDefault")
+		}
+		fn(Event{v: ev, target: target})
 		return nil
 	})
 	e.v.Call("addEventListener", event, cb)
 
 	var once bool
-	return func() {
+	release := func() {
 		// Releasing twice panics, and a release func is exactly the kind of
 		// thing a defensive Unmount calls again on a second pass.
 		if once {
@@ -100,14 +245,63 @@ func (e Element) On(event string, fn func()) func() {
 		e.v.Call("removeEventListener", event, cb)
 		cb.Release()
 	}
+	signal.OnCleanup(release)
+	return release
 }
 
-// Off releases several listeners at once — the shape an Unmount wants, since
-// it holds one handle per thing Mount registered.
+func isElement(v js.Value) bool {
+	return v.Type() == js.TypeObject && !v.Get("closest").IsUndefined()
+}
+
+// Frame runs fn once per animation frame until it returns false. t is the
+// frame timestamp in milliseconds, as requestAnimationFrame reports it. This
+// is the loop behind a progress bar, a countdown or a canvas: one callback per
+// paint, never a timer fighting the display's refresh. Inside a page's Mount
+// the loop is released with the scope; outside one, call the returned stop.
 //
-//	var stop []func()
-//	func Mount()   { stop = append(stop, el.On("click", add)) }
-//	func Unmount() { dom.Off(stop...); stop = nil }
+// Do not write signals from it every frame unless the effects they wake are
+// cheap — an effect is a repaint, and sixty repaints a second of a list is the
+// thing this framework has no virtual DOM to absorb. Set text, width and
+// transforms directly from the frame callback and leave signals for state.
+func Frame(fn func(t float64) bool) (stop func()) {
+	var cb js.Func
+	var pending js.Value // the frame the browser has queued, cancelled on stop
+	stopped := false
+	cb = js.FuncOf(func(_ js.Value, args []js.Value) any {
+		if stopped {
+			return nil
+		}
+		t := 0.0
+		if len(args) > 0 {
+			t = args[0].Float()
+		}
+		if fn(t) {
+			pending = js.Global().Call("requestAnimationFrame", cb)
+			return nil
+		}
+		stopped = true
+		cb.Release()
+		return nil
+	})
+	pending = js.Global().Call("requestAnimationFrame", cb)
+	stop = func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		// The browser already holds the next frame. Releasing the func with
+		// that frame still queued is a "call to released function" a few
+		// milliseconds later — measured, once per page leave — so cancel it
+		// first.
+		js.Global().Call("cancelAnimationFrame", pending)
+		cb.Release()
+	}
+	signal.OnCleanup(stop)
+	return stop
+}
+
+// Off releases several listeners at once, for code that keeps handles outside
+// a scope: an app shell's own controls, registered once at startup.
 func Off(release ...func()) {
 	for _, r := range release {
 		if r != nil {

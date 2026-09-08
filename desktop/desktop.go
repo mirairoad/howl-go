@@ -33,6 +33,20 @@ type Options struct {
 	Title  string
 	Width  int
 	Height int
+	// MinWidth and MinHeight are the floor a user can drag the window to. Worth
+	// setting: without one the window resizes to nothing, and a layout that
+	// reflows correctly at every width still has a width below which it stops
+	// reflowing and starts clipping.
+	MinWidth  int
+	MinHeight int
+	// MaxWidth and MaxHeight are the ceiling. Usually leave them zero — a
+	// desktop window that refuses to fill the screen it was dragged onto is a
+	// worse answer than a layout that centres its content.
+	MaxWidth  int
+	MaxHeight int
+	// Fixed forbids resizing altogether, ignoring the four bounds above. For a
+	// panel or a launcher, not for an application window.
+	Fixed bool
 	// Attach points the window at a server that is already running instead of
 	// starting one. This is the `howl dev` path: the dev server's front door
 	// stays up across rebuilds, so the window connects once, keeps its
@@ -91,8 +105,21 @@ func Run(a *app.App, h http.Handler, opt Options) error {
 	if opt.Title != "" {
 		w.SetTitle(opt.Title)
 	}
+	// Bounds before the size, so a Width below MinWidth lands clamped into a
+	// legal window rather than one the user cannot drag back out of.
+	if opt.MinWidth > 0 && opt.MinHeight > 0 {
+		w.SetSize(opt.MinWidth, opt.MinHeight, webview.HintMin)
+	}
+	if opt.MaxWidth > 0 && opt.MaxHeight > 0 {
+		w.SetSize(opt.MaxWidth, opt.MaxHeight, webview.HintMax)
+	}
 	if opt.Width > 0 && opt.Height > 0 {
-		w.SetSize(opt.Width, opt.Height, webview.HintNone)
+		// The constants are untyped ints, so the type has to be named here.
+		hint := webview.Hint(webview.HintNone)
+		if opt.Fixed {
+			hint = webview.HintFixed
+		}
+		w.SetSize(opt.Width, opt.Height, hint)
 	}
 	w.Navigate(url)
 	w.Run()

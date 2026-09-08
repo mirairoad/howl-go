@@ -12,17 +12,37 @@
 // both ways. Re-running an effect first detaches all of its old dependencies,
 // so a branch that stops reading a signal stops being woken by it.
 //
+// Release is automatic too, inside a Scope. The wasm runtime opens one around
+// a page's Mount and disposes it when the page leaves, so an effect created in
+// Mount needs no bookkeeping — there is no stop func to keep and no Unmount to
+// call it from. Outside a scope the stop func is still returned, for the
+// registrations that should live as long as the process.
+//
 // Concurrency: the browser is single-threaded, which is the environment this is
 // written for. The mutex keeps the structures safe if the same code is linked
-// into the server, but `current` is process-wide — an effect must not be run
-// from two goroutines at once. On the server nothing constructs signals.
+// into the server, but `current` and `scope` are process-wide — an effect must
+// not be run from two goroutines at once. On the server nothing constructs
+// signals.
 package signal
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 var (
 	mu      sync.Mutex
 	current *effect // the computation being tracked, nil when not tracking
+	owner   *scope  // the scope collecting cleanups, nil when none is open
+	nextID  uint64  // creation order, which is also the flush order
+
+	// Writes do not run effects directly; they queue them, and the queue is
+	// drained once the outermost write or Batch returns. That is what makes
+	// two Sets in one handler cost one repaint, and it is what keeps a
+	// diamond — an effect reading both a signal and a value derived from it —
+	// from running twice per change.
+	depth   int       // >0 while a Batch or a flush is running
+	pending []*effect // queued, unordered; sorted by id at flush
 )
 
 // dep is the signal side of the dependency edge, type-erased so an effect can
@@ -82,8 +102,9 @@ func (s *Signal[T]) Peek() T {
 	return s.v
 }
 
-// Set writes the value and wakes dependents. Subscribers are copied out and the
-// lock released before running them, since an effect will call Get again.
+// Set writes the value and wakes dependents. Inside a Batch, or inside another
+// effect's run, the dependents are queued and run when the outermost write
+// completes; a bare Set is a batch of one.
 func (s *Signal[T]) Set(v T) {
 	mu.Lock()
 	if s.eq != nil && s.eq(s.v, v) {
@@ -91,15 +112,14 @@ func (s *Signal[T]) Set(v T) {
 		return
 	}
 	s.v = v
-	woken := make([]*effect, 0, len(s.subs))
 	for e := range s.subs {
-		woken = append(woken, e)
+		if !e.queued && !e.stopped {
+			e.queued = true
+			pending = append(pending, e)
+		}
 	}
 	mu.Unlock()
-
-	for _, e := range woken {
-		e.run()
-	}
+	flush()
 }
 
 // Update applies fn to the current value. Convenience for read-modify-write.
@@ -108,13 +128,64 @@ func (s *Signal[T]) Update(fn func(T) T) { s.Set(fn(s.Peek())) }
 func (s *Signal[T]) removeSub(e *effect) { delete(s.subs, e) } // caller holds mu
 
 // ---------------------------------------------------------------------------
+// Batch
+// ---------------------------------------------------------------------------
+
+// Batch runs fn with effects deferred: however many signals fn writes, each
+// dependent runs once, after fn returns. A handler that sets three signals
+// without it repaints three times.
+func Batch(fn func()) {
+	mu.Lock()
+	depth++
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		depth--
+		mu.Unlock()
+		flush()
+	}()
+	fn()
+}
+
+// flush drains the queue, lowest id first. A computed value is necessarily
+// created before anything that reads it, so creation order is a topological
+// order: the computed recomputes, re-queues its readers (already queued, so a
+// no-op), and each reader runs once with every input current.
+//
+// Each run happens at depth 1, so a Set made inside an effect queues rather
+// than recursing — the loop picks it up on the next iteration.
+func flush() {
+	for {
+		mu.Lock()
+		if depth > 0 || len(pending) == 0 {
+			mu.Unlock()
+			return
+		}
+		sort.Slice(pending, func(i, j int) bool { return pending[i].id < pending[j].id })
+		e := pending[0]
+		pending = pending[1:]
+		e.queued = false
+		depth++
+		mu.Unlock()
+
+		e.run()
+
+		mu.Lock()
+		depth--
+		mu.Unlock()
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Effect
 // ---------------------------------------------------------------------------
 
 type effect struct {
+	id      uint64
 	fn      func()
 	deps    []dep
 	stopped bool
+	queued  bool
 }
 
 func (e *effect) run() {
@@ -141,16 +212,22 @@ func (e *effect) run() {
 }
 
 // Effect runs fn immediately, then again whenever any signal it read changes.
-// The returned function detaches it; calling it twice is safe.
+//
+// Inside a Scope — which is where a page's Mount runs — the effect is released
+// with the scope, and the returned stop func can be ignored. Outside one it is
+// the only way to detach; calling it twice is safe.
 //
 // Watching several values is just reading several signals inside one effect —
 // tracking is automatic, so there is no list of sources to declare.
 func Effect(fn func()) (stop func()) {
-	e := &effect{fn: fn}
+	mu.Lock()
+	nextID++
+	e := &effect{id: nextID, fn: fn}
+	mu.Unlock()
 	e.run()
 
 	var once sync.Once
-	return func() {
+	stop = func() {
 		once.Do(func() {
 			mu.Lock()
 			defer mu.Unlock()
@@ -161,6 +238,8 @@ func Effect(fn func()) (stop func()) {
 			e.deps = nil
 		})
 	}
+	OnCleanup(stop)
+	return stop
 }
 
 // Untrack runs fn without recording dependencies, so a callback can read
@@ -176,6 +255,64 @@ func Untrack(fn func()) {
 	mu.Lock()
 	current = prev
 	mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Scope
+// ---------------------------------------------------------------------------
+
+// scope collects everything registered while it is open, so one dispose
+// releases all of it. It is the reason a page has no release slice.
+type scope struct {
+	cleanups []func()
+	disposed bool
+}
+
+// Scope runs fn and returns the func that releases everything fn registered:
+// every Effect, Watch and Derive, and every dom listener, in reverse order.
+// Scopes nest; an inner one disposed by hand is simply not disposed again.
+//
+// The wasm runtime wraps a page's Mount in one and disposes it when the page
+// is swapped out — see dom.Mount. Application code only needs Scope for a
+// lifetime that is not a page's.
+func Scope(fn func()) (dispose func()) {
+	s := &scope{}
+	mu.Lock()
+	prev := owner
+	owner = s
+	mu.Unlock()
+
+	fn()
+
+	mu.Lock()
+	owner = prev
+	mu.Unlock()
+
+	return func() {
+		mu.Lock()
+		if s.disposed {
+			mu.Unlock()
+			return
+		}
+		s.disposed = true
+		cleanups := s.cleanups
+		s.cleanups = nil
+		mu.Unlock()
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+}
+
+// OnCleanup registers fn with the open scope, to run when it is disposed. With
+// no scope open it does nothing — the registration then lives as long as the
+// process, which is right for an app-shell control and wrong for a page.
+func OnCleanup(fn func()) {
+	mu.Lock()
+	defer mu.Unlock()
+	if owner != nil && !owner.disposed {
+		owner.cleanups = append(owner.cleanups, fn)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -220,13 +357,13 @@ func (c *Computed[T]) Dispose() { c.stop() }
 // and previous values. Unlike Effect it does not fire on the initial run —
 // matching Vue's `watch`, where the point is the transition, not the value.
 //
-//	stop := signal.Watch(
+//	signal.Watch(
 //	    func() string { return store.Article.Get().Title },
 //	    func(now, before string) { … },
 //	)
 //
 // cb runs untracked, so signals it reads do not silently become dependencies
-// of the watcher.
+// of the watcher. To watch several values, read them all in one Effect.
 func Watch[T comparable](src func() T, cb func(now, before T)) (stop func()) {
 	first := true
 	var prev T
@@ -243,85 +380,4 @@ func Watch[T comparable](src func() T, cb func(now, before T)) (stop func()) {
 		prev = v
 		Untrack(func() { cb(v, before) })
 	})
-}
-
-// WatchImmediate is Watch that also fires once on registration, with the
-// zero value as `before`.
-func WatchImmediate[T comparable](src func() T, cb func(now, before T)) (stop func()) {
-	first := true
-	var prev T
-	return Effect(func() {
-		v := src()
-		if !first && v == prev {
-			return
-		}
-		before := prev
-		first, prev = false, v
-		Untrack(func() { cb(v, before) })
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Multiple sources
-// ---------------------------------------------------------------------------
-
-// WatchAny watches several sources at once and calls cb when any of them
-// changes. Sources may be of different types.
-//
-//	signal.WatchAny(func() { … },
-//	    func() any { return store.Article.Get().Title },
-//	    func() any { return store.TodoCount.Get() },
-//	)
-//
-// Note this is NOT the same idea as React's useEffect(fn, [a, b, c]). React
-// requires that list because JavaScript cannot observe reads — it has no way to
-// know what the function looked at, so you declare it, and a wrong declaration
-// is the classic stale-closure bug. Here reads ARE observed, so the idiomatic
-// form needs no list at all:
-//
-//	signal.Effect(func() {
-//	    title := store.Article.Get().Title   // both become dependencies
-//	    n := store.TodoCount.Get()           // simply by being read
-//	    …
-//	})
-//
-// Prefer Effect. WatchAny exists for when you want the sources named
-// explicitly, or want cb to skip the initial run.
-func WatchAny(cb func(), srcs ...func() any) (stop func()) {
-	first := true
-	prev := make([]any, len(srcs))
-	return Effect(func() {
-		now := make([]any, len(srcs))
-		for i, src := range srcs {
-			now[i] = src()
-		}
-		if first {
-			first = false
-			copy(prev, now)
-			return
-		}
-		dirty := false
-		for i := range now {
-			if differs(prev[i], now[i]) {
-				dirty = true
-				break
-			}
-		}
-		copy(prev, now)
-		if dirty {
-			Untrack(cb)
-		}
-	})
-}
-
-// differs compares two dynamically-typed values. Comparing uncomparable types
-// (slices, maps, funcs) panics in Go, so those are treated as always-changed
-// rather than crashing a watcher.
-func differs(a, b any) (d bool) {
-	defer func() {
-		if recover() != nil {
-			d = true
-		}
-	}()
-	return a != b
 }

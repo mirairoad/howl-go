@@ -1,12 +1,23 @@
 # Reactivity
 
-`core/signal` is fine-grained reactivity in the shape Vue's `ref`/`computed`/`watch` and Preact's signals popularised.
+`core/signal` is fine-grained reactivity in the shape Vue's `ref`/`computed`/`watch` and Preact's signals popularised. Twelve names, and that is the whole package.
 
 ```go
 Todos     = signal.WithEq([]Todo(nil), sameTodos)   // signal
 TodoCount = signal.DeriveEq(func() int { … })       // computed
-stop      = signal.Effect(repaint)                  // auto-tracked effect
+signal.Effect(repaint)                              // auto-tracked effect
+signal.Watch(TodoCount.Get, func(now, before int) { … })
+signal.Batch(func() { a.Set(1); b.Set(2) })         // one repaint, not two
 ```
+
+| | |
+|---|---|
+| construct | `Of` (comparable), `New` (anything), `WithEq` (your equality) |
+| read and write | `Get`, `Peek`, `Set`, `Update` |
+| derive | `Derive`, `DeriveEq` |
+| react | `Effect`, `Watch` |
+| control | `Batch`, `Untrack` |
+| lifetime | `Scope`, `OnCleanup` |
 
 ## There is no dependency array
 
@@ -21,20 +32,28 @@ signal.Effect(func() {
 })
 ```
 
-That is also how you watch several values at once. `WatchAny(cb, srcs...)` exists if you want them named explicitly, but `Effect` is the idiomatic form.
+That is also how you watch several values at once. There is no `WatchAny`; one `Effect` reading several signals is the form.
 
 ## Watching a transition
 
 `Watch` fires only when the value changes, and gives you both sides:
 
 ```go
-stop := signal.Watch(
+signal.Watch(
 	func() string { return store.Article.Get().Title },
 	func(now, before string) { … },
 )
 ```
 
 The callback runs untracked, so signals it reads do not silently become dependencies of the watcher.
+
+## Writes are batched
+
+A `Set` does not run its dependents on the spot. It queues them, and the queue drains when the outermost write returns. Three consequences, each of which used to be a bug:
+
+- Two writes in one handler cost one repaint. `Batch` widens that window over any number of writes.
+- A `Set` made inside an effect does not recurse into the effect that is running; it queues, and runs after.
+- The diamond — an effect reading both a signal and a value derived from it — runs once per change, with the derived value already recomputed. Creation order is flush order, and a derived value is necessarily created before anything that reads it.
 
 ## Equality is what makes it fine-grained
 
@@ -46,11 +65,11 @@ The callback runs untracked, so signals it reads do not silently become dependen
 
 A store holding a slice needs `WithEq`, or re-hydrating identical data wakes every dependent for nothing.
 
-## Detaching
+## Release
 
 Re-running an effect detaches all of its previous dependencies first. Without that, a conditional branch that stops reading a signal keeps a permanent subscription to it.
 
-Always pair `Effect`/`Watch` in `Mount` with their `stop` in `Unmount` — and `dom.On` with its release func, which is the same `func()` shape, so one slice and one `dom.Off(release...)` handles both. See [Lifecycle](/docs/lifecycle).
+Releasing the effect itself is the scope's job. A page's `Mount` runs inside one, and every `Effect`, `Watch` and `Derive` created there — and every `dom` listener — is released when the page leaves. The stop func is still returned for code outside a scope, where it is the only handle. `signal.Scope(fn)` opens one for a lifetime that is not a page's, and `signal.OnCleanup(fn)` attaches teardown to whichever scope is open. See [Lifecycle](/docs/lifecycle).
 
 ## Server safety
 
@@ -92,12 +111,12 @@ The domain half holds the types, the mutation methods, `Snapshot` (the wire form
 Then three wires, in the order they run:
 
 1. **SSR** — `Config.Data` puts the data on the context, the page renders from `store.TodosFrom(ctx)`. This is the first paint, and it needs no JavaScript.
-2. **Hydrate** — `Mount` fetches a `Snapshot` through the generated typed client and calls `Restore`, which publishes to the signal.
-3. **Local** — a mutation calls `Apply(op)`, which publishes, which wakes the effect, which re-renders the same templ component the server used.
+2. **Hydrate** — the page serialises the snapshot it rendered from with `@templ.JSONScript("todos", store.SnapshotFrom(ctx))`; `Mount` reads it back with `dom.Embedded` and calls `Restore`, which publishes to the signal. No request, and the browser store starts with exactly what is on screen.
+3. **Local** — a mutation calls `store.Commit(op, send)`: `Apply` runs now, publishes, wakes the effect, which re-renders the same templ component the server used; `send` tells the server from a goroutine. One sender goroutine sends in commit order. If the server refuses (a 4xx), that one op is rolled back — the confirmed snapshot plus the ops still waiting — and `store.Rejected` carries the reason for the page to show. If the server is unreachable nothing is dropped: `store.Offline` goes true, `store.Queued` counts the wait, and the sender retries with backoff until the op lands.
 
 The one rule that fails silently: **read through the signal, not the store**. `store.Todos.Get()` registers the effect as a dependent; `store.TodosClient().List()` returns the same data, subscribes to nothing, and the page simply stops updating.
 
-Both files, and a page already wired to them, come out of `howl_scaffold` — `kind: "store"`, then `kind: "page"` with `client: true, store: "todos"`. See [Lifecycle](/docs/lifecycle) for the `Mount`/`Unmount` pair it writes.
+Both files, and a page already wired to them, come out of `howl_scaffold` — `kind: "store"`, then `kind: "page"` with `client: true, store: "todos"`. See [Lifecycle](/docs/lifecycle) for the `Mount` it writes.
 
 ## Hidden markup still costs
 

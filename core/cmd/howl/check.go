@@ -415,17 +415,69 @@ func lintShell(root string, files []sourceFile) []Diagnostic {
 // ---------------------------------------------------------------------------
 
 var (
-	funcMountRe   = regexp.MustCompile(`(?m)^func\s+Mount\s*\(\s*\)`)
-	funcUnmountRe = regexp.MustCompile(`(?m)^func\s+Unmount\s*\(\s*\)`)
-	registersRe   = regexp.MustCompile(`signal\.(Effect|Watch|WatchAny)\(|\.On\("`)
-	bareEffectRe  = regexp.MustCompile(`(?m)^\s*signal\.(Effect|Watch|WatchAny)\(`)
-	// A statement that is only a .On( call: the release func it returns went
-	// nowhere, so the js.Func behind it can never be released.
-	bareListenerRe = regexp.MustCompile(`(?m)^\s*[\w.()\[\]"' -]*\.On\("`)
+	funcMountRe = regexp.MustCompile(`(?m)^func\s+Mount\s*\(\s*\)`)
+	// A .On( bound inside a repaint — after SetHTML or Render has replaced the
+	// nodes — is the pre-scope habit: one js.Func per row per repaint, rebound
+	// by hand. Delegate on the root covers rows that do not exist yet.
+	rebindRe       = regexp.MustCompile(`(?m)^\s*for\b[^\n]*\bQueryAll\([^\n]*\{\s*\n(?:[^\n]*\n){0,3}?[^\n]*\.On\("`)
 	importSignalRe = regexp.MustCompile(`"[^"]*howl-go/core/signal"`)
-	importJSRe     = regexp.MustCompile(`"syscall/js"`)
-	notPortableRe  = regexp.MustCompile(`"(database/sql|os|os/exec|net/http/httptest)"`)
+	// A page that restores its store but never reads the embedded snapshot is
+	// hydrating over the network what the server already rendered from.
+	restoreRe  = regexp.MustCompile(`\.Restore\(|\bHydrate\w*\(`)
+	embeddedRe = regexp.MustCompile(`dom\.Embedded\(`)
+	// Registrations, for the goroutine rule: anything the scope would release
+	// had it been made in Mount proper.
+	registerRe    = regexp.MustCompile(`signal\.(Effect|Watch|Derive|DeriveEq)\(|\.(On|Delegate)\("|dom\.Frame\(`)
+	goFuncRe      = regexp.MustCompile(`\bgo\s+func\s*\(`)
+	funcUnmountRe = regexp.MustCompile(`(?m)^func\s+Unmount\s*\(\s*\)`)
+	closeRe       = regexp.MustCompile(`\bclose\(`)
+	nilGuardRe    = regexp.MustCompile(`!=\s*nil`)
+	importJSRe    = regexp.MustCompile(`"syscall/js"`)
+	notPortableRe = regexp.MustCompile(`"(database/sql|os|os/exec|net/http/httptest)"`)
 )
+
+// funcBody returns the body of the first function whose signature matches re,
+// and the offset of that body in src. Brace-matched, so nested closures and
+// goroutines stay inside it.
+func funcBody(src []byte, re *regexp.Regexp) (body []byte, at int, ok bool) {
+	m := re.FindIndex(src)
+	if m == nil {
+		return nil, 0, false
+	}
+	return blockAt(src, m[1])
+}
+
+// blockAt returns the {…} block that opens at or after pos, without its
+// braces, and the offset of its first byte. Strings and comments are not
+// parsed: a brace inside a string literal in a page is rare enough that a
+// wrong answer here is a missed warning, not a false one.
+func blockAt(src []byte, pos int) (body []byte, at int, ok bool) {
+	open := bytes.IndexByte(src[pos:], '{')
+	if open < 0 {
+		return nil, 0, false
+	}
+	start := pos + open + 1
+	depth := 1
+	for i := start; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[start:i], start, true
+			}
+		}
+	}
+	return nil, 0, false
+}
+
+func lineAt(src []byte, offset int) int {
+	if offset > len(src) {
+		offset = len(src)
+	}
+	return bytes.Count(src[:offset], []byte("\n")) + 1
+}
 
 func lintReactivity(root string, files []sourceFile) []Diagnostic {
 	var out []Diagnostic
@@ -442,31 +494,53 @@ func lintReactivity(root string, files []sourceFile) []Diagnostic {
 			strings.HasSuffix(f.Rel, ".api.go")
 
 		if inPages && funcMountRe.Match(f.Body) {
-			// Mount that registers nothing needs no Unmount — the metrics page
-			// in the toy app logs and fetches, and pairing it would be
-			// ceremony. Mount that subscribes is the leak: one more live
-			// listener or effect per visit, all of them firing at a DOM that
-			// no longer exists.
-			if registersRe.Match(f.Body) && !funcUnmountRe.Match(f.Body) {
-				line, _ := findLine(f.Body, funcMountRe)
+			// Mount runs in a scope, so what it registers is released when the
+			// page leaves: there is no leak to catch here any more. What is left
+			// is the older habit that the scope makes redundant and the
+			// repaint makes expensive — re-binding a listener per row.
+			// The scope is lexical: it closes when Mount returns. A goroutine
+			// started in Mount finishes later, so an effect or a listener it
+			// registers is outside the scope and lives for the tab — one more
+			// per visit, exactly the leak the scope removed.
+			if body, at, ok := funcBody(f.Body, funcMountRe); ok {
+				for _, m := range goFuncRe.FindAllIndex(body, -1) {
+					block, blockAt0, found := blockAt(body, m[1]-1)
+					if !found {
+						continue
+					}
+					if loc := registerRe.FindIndex(block); loc != nil {
+						out = append(out, Diagnostic{
+							File: f.Rel, Line: lineAt(f.Body, at+blockAt0+loc[0]), Rule: "register-in-goroutine", Level: "error",
+							Message: "an effect, watcher, listener or frame loop is registered inside a goroutine started by Mount; the scope closed when Mount returned, so this lives for the tab and repeats every visit",
+							Fix:     "register it in Mount itself; let the goroutine write a signal and the effect react",
+						})
+					}
+				}
+			}
+			// Unmount runs for the outgoing route whether or not its Mount ran —
+			// the user can leave before the wasm has loaded — and close(nil)
+			// takes the whole wasm runtime down.
+			if body, at, ok := funcBody(f.Body, funcUnmountRe); ok && closeRe.Match(body) && !nilGuardRe.Match(body) {
+				loc := closeRe.FindIndex(body)
 				out = append(out, Diagnostic{
-					File: f.Rel, Line: line, Rule: "mount-without-unmount", Level: "error",
-					Message: "Mount registers an effect, a watcher or a DOM listener and there is no Unmount; every visit to this route adds another one",
-					Fix:     "keep the stop funcs in package-level vars and call them in func Unmount()",
+					File: f.Rel, Line: lineAt(f.Body, at+loc[0]), Rule: "unmount-close-unguarded", Level: "warning",
+					Message: "Unmount closes a channel with no nil check; it runs even when Mount never did, and close(nil) panics the wasm runtime",
+					Fix:     "if stop != nil { close(stop); stop = nil }",
 				})
 			}
-			if line, ok := findLine(f.Body, bareEffectRe); ok {
+			if restoreRe.Match(f.Body) && !embeddedRe.Match(f.Body) {
+				line, _ := findLine(f.Body, restoreRe)
 				out = append(out, Diagnostic{
-					File: f.Rel, Line: line, Rule: "effect-not-released", Level: "error",
-					Message: "the stop func from signal.Effect/Watch is discarded, so this subscription can never be released",
-					Fix:     "stopEffect = signal.Effect(repaint), then call stopEffect() in Unmount",
+					File: f.Rel, Line: line, Rule: "store-not-embedded", Level: "warning",
+					Message: "the browser store is restored from a fetch; the server already rendered this page from that snapshot",
+					Fix:     "@templ.JSONScript(\"todos\", store.SnapshotFrom(ctx)) in the markup, then dom.Embedded(\"todos\", &sn) and Restore(sn) in Mount — no request, no empty-then-full flash",
 				})
 			}
-			if line, ok := findLine(f.Body, bareListenerRe); ok {
+			if line, ok := findLine(f.Body, rebindRe); ok {
 				out = append(out, Diagnostic{
-					File: f.Rel, Line: line, Rule: "listener-not-released", Level: "warning",
-					Message: "the release func from dom.On is discarded; a js.Func is held alive from the JS side until it is released, so this leaks one Go closure per visit",
-					Fix:     "release = append(release, el.On(\"click\", fn)), then dom.Off(release...) in Unmount",
+					File: f.Rel, Line: line, Rule: "listener-rebound-per-row", Level: "warning",
+					Message: "a listener is bound per row inside a loop over QueryAll; every repaint binds them again",
+					Fix:     "one dom.Root().Delegate(\"click\", \"[data-del]\", fn) in Mount covers rows rendered later too",
 				})
 			}
 			if line, ok := findLine(f.Body, importJSRe); ok {

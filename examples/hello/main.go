@@ -5,8 +5,8 @@ import (
 	"io/fs"
 	"log"
 
-	"github.com/mirairoad/howl-go/core/app"
 	"example.com/howl-hello/client/pages"
+	"github.com/mirairoad/howl-go/core/app"
 )
 
 //go:generate go run github.com/mirairoad/howl-go/core/cmd/fsroutes -module example.com/howl-hello/client/pages

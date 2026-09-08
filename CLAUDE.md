@@ -36,6 +36,7 @@ make run-toy    # example app         -> :9000
 make dev-toy    # watched: rebuild + restart + reload on save
 go test ./core/...
 go run ./core/cmd/howl check     # the conventions, enforced
+make test-browser                # app.js in jsdom: the morph, the router, build drift. Needs Node; opt-in
 ```
 
 In an application, the dev loop is `go run github.com/mirairoad/howl-go/core/cmd/howl dev`

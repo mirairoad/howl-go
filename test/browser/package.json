@@ -1,0 +1,12 @@
+{
+  "name": "howl-browser-tests",
+  "private": true,
+  "type": "module",
+  "description": "jsdom tests for core/runtime/app.js. Node is a test-time dependency of this directory only, never of the framework.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1"
+  }
+}

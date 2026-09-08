@@ -362,6 +362,10 @@ type Client struct {
 	// build does, so the browser never has to ask whether it is still current.
 	Binary string `json:"binary,omitempty"`
 	Exec   string `json:"exec,omitempty"`
+	// Build identifies the build that rendered this document. Every response
+	// repeats it in X-Howl-Build; when the two disagree the client has outlived
+	// its build, and its next navigation is a full load instead of a swap.
+	Build string `json:"build,omitempty"`
 }
 
 // RenderPayload is the one value handed from app.js to the wasm renderer.

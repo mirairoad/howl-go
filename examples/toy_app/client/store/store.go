@@ -65,13 +65,18 @@ func MetricsFrom(ctx context.Context) Metrics {
 	return m
 }
 
-func WithTodos(ctx context.Context, t []Todo) context.Context {
-	return context.WithValue(ctx, todosKey, t)
+// WithTodos installs the server's whole snapshot, not just the list: the page
+// renders the items and serialises the snapshot into its own markup, which is
+// what the browser store restores from. One value, both uses.
+func WithTodos(ctx context.Context, sn Snapshot) context.Context {
+	return context.WithValue(ctx, todosKey, sn)
 }
 
-func TodosFrom(ctx context.Context) []Todo {
-	t, _ := ctx.Value(todosKey).([]Todo)
-	return t
+func TodosFrom(ctx context.Context) []Todo { return SnapshotFrom(ctx).Items }
+
+func SnapshotFrom(ctx context.Context) Snapshot {
+	sn, _ := ctx.Value(todosKey).(Snapshot)
+	return sn
 }
 
 func WithMeta(ctx context.Context, m Meta) context.Context {
