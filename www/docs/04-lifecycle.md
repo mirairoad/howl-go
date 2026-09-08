@@ -60,7 +60,7 @@ func repaint() {
 
 `Render` takes any templ component and draws it into the element — the same component the server rendered, rendered again in the browser. On an element the navigation has already thrown away it is a no-op, which is the ordinary end of an effect's life.
 
-The swap is `innerHTML`. It does not preserve focus, selection or scroll inside the region it replaces, so keep an input the user is typing into outside the element a repaint renders — the todos form is a sibling of the list, not a child.
+The swap is a morph, done by `app.js`: the element's existing nodes are reconciled to the new markup. A row with a `data-key` (or an `id`) is moved rather than rebuilt when it changes position, an unchanged node stays the same node, a checkbox mid-toggle keeps its state, and the field being typed into keeps its value and focus. Give rows a key. Measured on `/lab`: after a toggle, a reverse, a delete and a filter, the untouched `<li>` elements are the same objects they were before. There is still no state above the DOM — a listener bound with `On` to a node the morph replaced is gone — so `Delegate` remains the listener for anything inside a repainted region.
 
 ## Hydrating
 

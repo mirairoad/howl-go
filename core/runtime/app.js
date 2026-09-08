@@ -868,6 +868,105 @@ addEventListener("popstate", (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Morph. Element.Render on the Go side used to be innerHTML: correct, and it
+// threw away every node in the region — focus, selection, scroll, a checkbox
+// mid-toggle. This reconciles the existing DOM to the new markup instead. A
+// node of the same kind at the same position is updated in place; an element
+// with a data-key or an id is found wherever it moved to and moved, not
+// rebuilt; the element the user is typing into keeps its value. What is left
+// over is removed.
+//
+// Not a virtual DOM: there is no component tree and no state above the DOM,
+// only the markup the server would have produced, applied as a diff. Living
+// here rather than in Go because a diff is thousands of small DOM calls, and
+// each one across the wasm boundary costs more than the work it does.
+// ---------------------------------------------------------------------------
+const keyOf = (n) => (n.nodeType === 1 ? n.getAttribute("data-key") || n.id || null : null);
+const sameKind = (a, b) => a.nodeType === b.nodeType && (a.nodeType !== 1 || a.tagName === b.tagName);
+
+function morph(target, html) {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  morphChildren(target, tpl.content);
+}
+
+function morphChildren(oldParent, newParent) {
+  const keyed = new Map();
+  for (const c of oldParent.childNodes) {
+    const k = keyOf(c);
+    if (k && !keyed.has(k)) keyed.set(k, c);
+  }
+  // cursor is the old node at the position being filled. A match that is the
+  // cursor advances it; a match found elsewhere is moved in front of it; a new
+  // node is inserted in front of it. Whatever is still at or after the cursor
+  // when the incoming list is exhausted was not wanted.
+  let cursor = oldParent.firstChild;
+  for (const incoming of [...newParent.childNodes]) {
+    const k = keyOf(incoming);
+    let match = null;
+    if (k) {
+      if (keyed.has(k)) {
+        match = keyed.get(k);
+        keyed.delete(k);
+      }
+    } else if (cursor && !keyOf(cursor) && sameKind(cursor, incoming)) {
+      match = cursor;
+    }
+    if (!match) {
+      oldParent.insertBefore(incoming, cursor); // adopts the template's node
+      continue;
+    }
+    if (match === cursor) cursor = cursor.nextSibling;
+    else oldParent.insertBefore(match, cursor);
+    morphNode(match, incoming);
+  }
+  while (cursor) {
+    const next = cursor.nextSibling;
+    oldParent.removeChild(cursor);
+    cursor = next;
+  }
+}
+
+function morphNode(old, incoming) {
+  if (old.nodeType !== 1) {
+    if (old.nodeValue !== incoming.nodeValue) old.nodeValue = incoming.nodeValue;
+    return;
+  }
+  for (const a of [...old.attributes]) {
+    if (!incoming.hasAttribute(a.name)) old.removeAttribute(a.name);
+  }
+  for (const a of incoming.attributes) {
+    if (old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
+  }
+  syncProps(old, incoming);
+  morphChildren(old, incoming);
+}
+
+// Attributes are the markup; these properties are the live state the markup
+// describes, and a changed attribute does not move them once the user has.
+// The value of the element being typed into is left alone — that is the one
+// piece of state the DOM owns and the markup does not.
+function syncProps(old, incoming) {
+  const typing = old === document.activeElement;
+  switch (old.tagName) {
+    case "INPUT":
+      if (old.type === "checkbox" || old.type === "radio") {
+        if (old.checked !== incoming.checked) old.checked = incoming.checked;
+      } else if (!typing && old.value !== incoming.value) old.value = incoming.value;
+      break;
+    case "TEXTAREA":
+      if (!typing && old.value !== incoming.value) old.value = incoming.value;
+      break;
+    case "SELECT":
+      if (!typing && old.value !== incoming.value) old.value = incoming.value;
+      break;
+    case "OPTION":
+      if (old.selected !== incoming.selected) old.selected = incoming.selected;
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API. Everything an application — or Go running in wasm, through
 // core/dom — is allowed to call. Anything above this line is internal.
 //
@@ -893,6 +992,9 @@ globalThis.howl = {
   },
   island: register,
   hydrate,
+  // morph(el, html): reconcile el's children to html. What Element.Render in
+  // Go calls; usable from an island for the same reason.
+  morph,
   config: CONFIG,
 };
 

@@ -2,7 +2,7 @@
 
 The browser half of howl-go, as recipes. Every topic has the same five parts: **When** to use it, the **Rules**, a complete **Example** that compiles, what goes **Wrong** when it is written from JS-framework habits, and the **Check** that proves it works. Read the checklist first; then the topic you are about to write. The examples are lifted from `examples/toy_app` — `/todos` and `/lab` — where they run.
 
-Three facts everything below follows from. There is no component tree: a templ component renders once to a writer and is finished, so "update the screen" is *render it again into the same element*. There is no virtual DOM: `Render` is `innerHTML`, so the element it replaces loses focus, and anything you bind to a node inside it is gone after the next repaint. There is one browser, one user and one tab: state is package-level signals, and any handler can reach them.
+Three facts everything below follows from. There is no component tree: a templ component renders once to a writer and is finished, so "update the screen" is *render it again into the same element*. There is no virtual DOM: `Render` morphs the element's existing nodes to the new markup — a row with a `data-key` (or an `id`) is moved, not rebuilt; an unchanged node stays the same node; the field being typed into keeps its value and focus — but there is no state above the DOM, so a listener bound with `On` to a node the morph replaced is gone, and a node without a key that changes position is rebuilt. There is one browser, one user and one tab: state is package-level signals, and any handler can reach them.
 
 ## checklist
 
@@ -13,7 +13,7 @@ Three facts everything below follows from. There is no component tree: a templ c
 1. State is a signal. Not a DOM attribute, not a class name, not a Go variable read by a handler. If two things need to agree, they read the same signal.
 2. The DOM is written only by effects. A handler writes a signal; an effect reads it and touches the DOM. Never both in one place.
 3. Everything a repaint replaces is listened to with `Delegate` on the root. `On` only on elements outside the repainted region.
-4. Inputs the user types into live outside the element a repaint renders.
+4. Rows carry `data-key`. The morph moves a keyed row and rebuilds an unkeyed one; the difference is whether a checkbox mid-toggle or a focused field survives the repaint. Inputs still prefer to live outside the repainted element: simpler, and nothing to get right.
 5. A page that has a store embeds the server's snapshot in its markup and restores it in `Mount`. No fetch to get the state the server just rendered.
 6. `Mount` registers; the scope releases. `Unmount` only for a goroutine or a timer.
 7. Two writes in one handler go in `signal.Batch`.
@@ -101,9 +101,9 @@ func Mount() {
 - Two files: `client/store/<name>.go` (domain: types, `Snapshot`, `Op`, `Apply`, the context pair; compiles for wasm) and `client/store/<name>_client.go` (the package-level signals and `publish`).
 - The server renders from the context: `Config.Data` calls `store.WithTodos(ctx, srv.Snapshot())`, the page reads `store.TodosFrom(ctx)`.
 - **The page serialises the snapshot it rendered from**: `@templ.JSONScript("todos", store.SnapshotFrom(ctx))` in the markup. **`Mount` restores it**: `dom.Embedded("todos", &sn)` then `store.Client().Restore(sn)`. This is mandatory for a store page: the browser store must start with what is on screen, and no request is made to get there.
-- A mutation is `store.Commit(op, send)` — local first, instant repaint — and `send` tells the server from a goroutine. The server runs the same `Apply`. If `send` returns an error the store rolls that one op back, rebuilding the visible state from the last confirmed snapshot plus the ops still in flight, and sets `store.Rejected`.
+- A mutation is `store.Commit(op, send)` — local first, instant repaint — and one sender goroutine calls `send` for each op in commit order. The server runs the same `Apply`. A refusal (`api.Refused`: a 4xx) rolls that one op back, rebuilding the visible state from the last confirmed snapshot plus the ops still waiting, and sets `store.Rejected`. Anything else — the server unreachable, a 5xx — drops nothing: `store.Offline` goes true, `store.Queued` counts the ops waiting, and the sender retries the same op with backoff until it goes through.
 - `Mount` hydrates with `store.Hydrate(sn)`, not `Restore`: it is the confirmed state a rollback returns to.
-- The page shows `store.Rejected` in its own element with its own effect. The next confirmed commit clears it.
+- The page shows `store.Rejected` and `store.Offline`/`store.Queued`, each in its own element with its own effect. The next confirmed commit clears them.
 - The server never writes a signal. `publish` guards on `s == client`.
 
 **Example** — the whole handoff, in order:
@@ -134,6 +134,14 @@ signal.Effect(func() {                       // the rollback message, its own el
 		el.SetText("server refused " + r.Op.Kind + ": " + r.Err + " — rolled back")
 	}
 })
+signal.Effect(func() {                       // the outage message: nothing rolled back, queue waiting
+	el := dom.Root().Query("[data-offline]")
+	off, n := store.Offline.Get(), store.Queued.Get()
+	el.Hide(!off)
+	if off {
+		el.SetText("server unreachable — " + strconv.Itoa(n) + " change(s) queued, retrying")
+	}
+})
 
 // a mutation: applied now, sent after, rolled back if refused
 func mutate(op store.Op) {
@@ -146,7 +154,7 @@ func mutate(op store.Op) {
 
 **Wrong** — fetching the snapshot in `Mount` from an endpoint (a request, an empty-then-full flash, and `howl check` warns `store-not-embedded`); `Apply` plus a goroutine that only logs the error (the page keeps showing an op that never happened — use `Commit`); rendering the page from `store.Client().List()` on the server (the server's store is per-process, the page must read ctx); `Todos.Set(...)` in a server handler (a data race across requests); a store that imports `net/http` or `database/sql` (pages import it, pages compile to wasm).
 
-**Check** — `howl_scaffold kind:"store"` then `kind:"page"` with `client: true, store: "<name>"` writes both files and the page already wired. Network tab on load: no request for the store's data. Make the server refuse one (the toy app refuses a ninth todo): the row vanishes, the message appears, and the next accepted op clears it.
+**Check** — `howl_scaffold kind:"store"` then `kind:"page"` with `client: true, store: "<name>"` writes both files and the page already wired. Network tab on load: no request for the store's data. Make the server refuse one (the toy app refuses a ninth todo): the row vanishes, the message appears, and the next accepted op clears it. Stop the server and add two: both stay, the page says two are queued, and when the server is back they land in order.
 
 ## events
 
@@ -191,7 +199,7 @@ root.Delegate("change", "[data-toggle]", func(e dom.Event) {      // inside the 
 
 **Rules**
 
-- One templ component for the rows, called by the server for the first paint and by the effect for every one after.
+- One templ component for the rows, called by the server for the first paint and by the effect for every one after. Each row carries `data-key={ id }`, so the morph moves it instead of rebuilding it.
 - The effect calls `Render(component)` on the container. That is the entire repaint.
 - Per-row actions carry their id in a `data-` attribute and are delegated on the root.
 - Equality on the slice signal (`signal.WithEq`) so a restore that changed nothing does not repaint.
@@ -202,7 +210,7 @@ root.Delegate("change", "[data-toggle]", func(e dom.Event) {      // inside the 
 ```go
 templ Items(items []Item) {
 	for _, it := range items {
-		<li>
+		<li data-key={ strconv.Itoa(it.ID) }>
 			<span>{ it.Text }</span>
 			<button data-del={ strconv.Itoa(it.ID) }>×</button>
 		</li>
@@ -219,7 +227,7 @@ func Mount() {
 
 **Wrong** — building the rows with string concatenation in Go (the server's markup and the browser's drift); `SetHTML` from the click handler (overwritten by the next effect run); one effect that renders the list *and* fills a form field (every keystroke in the list re-fills the field).
 
-**Check** — delete the last row: count and list agree. Restore the same snapshot: zero repaints.
+**Check** — delete the last row: count and list agree. Restore the same snapshot: zero repaints. Toggle a checkbox in a row: the same `<li>` node is still in the document afterwards.
 
 ## form
 

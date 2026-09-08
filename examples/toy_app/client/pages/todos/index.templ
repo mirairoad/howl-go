@@ -34,6 +34,9 @@ templ Page() {
 		<!-- The server can refuse an op the browser already applied. The store
 		     rolls it back and says so here; the next confirmed op clears it. -->
 		<p class="hint" data-error hidden></p>
+		<!-- While the server is unreachable, ops stay applied and queued in
+		     order; one sender retries with backoff and this line says so. -->
+		<p class="hint" data-offline hidden></p>
 		<!-- The snapshot this page was rendered from, serialised for the
 		     browser store. Mount restores it: the store starts with exactly
 		     what is on screen, and no request is made to get there. -->
@@ -105,6 +108,16 @@ func Mount() {
 	// values — and not on the initial run.
 	signal.Watch(store.TodoCount.Get, func(now, before int) {
 		dom.Log("[todos] count changed", before, "->", now)
+	})
+
+	// Offline: nothing was rolled back, the queue is waiting for the server.
+	signal.Effect(func() {
+		el := root.Query("[data-offline]")
+		off, n := store.Offline.Get(), store.Queued.Get()
+		el.Hide(!off)
+		if off {
+			el.SetText("server unreachable — " + itoa(n) + " change(s) queued in order, retrying")
+		}
 	})
 
 	// The rollback message. The store rolled the state back already — this

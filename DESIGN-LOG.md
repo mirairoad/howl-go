@@ -1258,6 +1258,52 @@ fetch already happens on hover and is shared by every route naming the same
 endpoint. Embedding would have saved one request on a cold load whose first
 paint the server had already done.
 
+## The morph, and what it did not change
+
+`Render` was `innerHTML` from the first commit, with a comment that said so
+and a rule in the recipes that inputs live outside the repainted region.
+Honest, and the rule was doing real work: a checkbox mid-toggle, a focused
+field, a scrolled list, all thrown away on every repaint. Item 11 on the
+first table, deferred because it was the large one.
+
+It is about 90 lines of JavaScript, and JavaScript on purpose. A diff is
+thousands of small DOM calls, and each one across the wasm boundary costs
+more than the work it does — the Go side hands `app.js` the markup and
+`howl.morph` reconciles. A node of the same kind at the same position is
+updated in place; an element with a `data-key` or an `id` is found wherever
+it moved to and moved; the element being typed into keeps its value; what is
+left over is removed. `checked` and `selected` are synced from the incoming
+markup, because they are what the markup describes; `value` is not synced on
+the active element, because that is the one piece of state the DOM owns.
+
+What it did not change is the model. There is still no component tree and
+no state above the DOM, so a listener bound with `On` to a node the morph
+replaced is still gone, and `Delegate` is still the listener for a repainted
+region. The rule about inputs outside the region survives as advice rather
+than as a requirement. Measured on `/lab`: after a toggle, a reverse, a
+delete and a filter, the untouched `<li>` elements are the same objects, and
+a checkbox focused inside the list is still focused after its repaint.
+
+## Outage is not refusal
+
+Rollback treated every error the same, and a network failure is not the
+server saying no. Two adds during an outage were two rows the user watched
+disappear, with a message blaming the server for something it never heard.
+
+The store now tells them apart with `api.Refused` — a `*api.Error` with a
+4xx — and only that rolls back. Anything else keeps the op: `Offline` goes
+true, `Queued` counts the wait, and one sender goroutine retries the head of
+the queue with backoff, one to five seconds. One sender rather than one
+goroutine per op is the part that matters: the ops have to arrive in the
+order they were applied, or a delete can land before the add it deletes.
+`Hydrate` replays the queue on top of the snapshot it installs, so leaving
+the page and coming back while offline does not make queued rows vanish
+from the screen while they are still queued to be sent.
+
+Watched in a browser with the server killed: two adds stayed on screen, the
+page said two were queued, and within the first retry after the server came
+back both were on it, in order, with the ids the browser had already shown.
+
 ## 17. Open questions
 
 - **TinyGo** — would it bring 1.71 MB gzipped down to the 200–800 KB range, and

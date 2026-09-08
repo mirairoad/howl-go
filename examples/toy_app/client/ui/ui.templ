@@ -59,7 +59,7 @@ templ TodoList(items []store.Todo) {
 }
 
 templ TodoItem(t store.Todo) {
-	<li data-id={ fmt.Sprint(t.ID) }>
+	<li data-key={ fmt.Sprint(t.ID) }>
 		<span>{ t.Text }</span>
 		<button class="del" data-del={ fmt.Sprint(t.ID) } aria-label="delete">×</button>
 	</li>

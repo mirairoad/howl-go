@@ -173,6 +173,8 @@ func TestScaffoldClientPageIsReactive(t *testing.T) {
 		"store.HydrateTodos(sn)",                                   // as the confirmed state, so a refusal can roll back to it
 		"store.CommitTodo(",                                        // apply now, send after, roll back on refusal
 		"store.TodoRejected.Get()",                                 // and the page shows why
+		"store.TodoOffline.Get()",                                  // ...and when the server cannot be reached
+		"data-key={ strconv.Itoa(it.ID) }",                         // keyed rows: the morph moves them instead of rebuilding
 		"root.Delegate(\"click\", \"[data-add]\"",                  // delegated, so a repaint never rebinds
 		".Render(TodoList(items))",                                 // the repaint is the component, rendered again
 		"store.Todos.Get()",                                        // read through the signal, not the store

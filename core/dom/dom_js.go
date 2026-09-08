@@ -144,8 +144,12 @@ type Component interface {
 // swapped away between the write and the effect — is a no-op, not an error,
 // because that is the ordinary end of an effect's life.
 //
-// The swap is innerHTML today. Listeners bound with Delegate survive it, which
-// is why that is the listener to use on anything inside a repainted region.
+// The swap is a morph: app.js reconciles the existing nodes to the new markup,
+// so an unchanged row is the same node afterwards, a row with a data-key or an
+// id is moved rather than rebuilt, and the field being typed into keeps its
+// value and its focus. Listeners bound with Delegate never noticed either way,
+// which is why that is the listener to use on anything inside a repainted
+// region. Without the runtime — a test harness, an old shell — it is innerHTML.
 func (e Element) Render(c Component) error {
 	if !e.v.Truthy() {
 		return nil
@@ -153,6 +157,10 @@ func (e Element) Render(c Component) error {
 	var sb strings.Builder
 	if err := c.Render(context.Background(), &sb); err != nil {
 		return err
+	}
+	if howl := js.Global().Get("howl"); howl.Truthy() && howl.Get("morph").Type() == js.TypeFunction {
+		howl.Call("morph", e.v, sb.String())
+		return nil
 	}
 	e.v.Set("innerHTML", sb.String())
 	return nil

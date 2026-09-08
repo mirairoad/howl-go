@@ -56,6 +56,15 @@ func Unavailable(message string) *Error {
 	return &Error{Code: statusServiceUnavailable, Message: message}
 }
 
+// Refused reports whether err is the server declining the request — a 4xx the
+// caller has to act on, such as rolling back an optimistic write — as opposed
+// to a transport failure or a 5xx, which are the server being unreachable or
+// broken and are worth retrying.
+func Refused(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Code >= 400 && e.Code < 500
+}
+
 // badRequest keeps a deliberate *Error as it is and promotes anything else to
 // a 400.
 func badRequest(err error) error {

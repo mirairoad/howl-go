@@ -71,7 +71,7 @@ func Page() templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "</p><!-- The server can refuse an op the browser already applied. The store\n\t\t     rolls it back and says so here; the next confirmed op clears it. --><p class=\"hint\" data-error hidden></p><!-- The snapshot this page was rendered from, serialised for the\n\t\t     browser store. Mount restores it: the store starts with exactly\n\t\t     what is on screen, and no request is made to get there. -->")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "</p><!-- The server can refuse an op the browser already applied. The store\n\t\t     rolls it back and says so here; the next confirmed op clears it. --><p class=\"hint\" data-error hidden></p><!-- While the server is unreachable, ops stay applied and queued in\n\t\t     order; one sender retries with backoff and this line says so. --><p class=\"hint\" data-offline hidden></p><!-- The snapshot this page was rendered from, serialised for the\n\t\t     browser store. Mount restores it: the store starts with exactly\n\t\t     what is on screen, and no request is made to get there. -->")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -151,6 +151,16 @@ func Mount() {
 	// values — and not on the initial run.
 	signal.Watch(store.TodoCount.Get, func(now, before int) {
 		dom.Log("[todos] count changed", before, "->", now)
+	})
+
+	// Offline: nothing was rolled back, the queue is waiting for the server.
+	signal.Effect(func() {
+		el := root.Query("[data-offline]")
+		off, n := store.Offline.Get(), store.Queued.Get()
+		el.Hide(!off)
+		if off {
+			el.SetText("server unreachable — " + itoa(n) + " change(s) queued in order, retrying")
+		}
 	})
 
 	// The rollback message. The store rolled the state back already — this

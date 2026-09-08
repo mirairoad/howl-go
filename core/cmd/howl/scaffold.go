@@ -409,7 +409,13 @@ func (s *$ITEMStore) Apply(op $ITEMOp) {
 // is package-level and therefore browser-only.
 const storeClientTemplate = `package store
 
-import "github.com/mirairoad/howl-go/core/signal"
+import (
+	"sync"
+	"time"
+
+	"github.com/mirairoad/howl-go/core/api"
+	"github.com/mirairoad/howl-go/core/signal"
+)
 
 // The browser's store, exposed reactively.
 //
@@ -457,16 +463,24 @@ func (s *$ITEMStore) publish() {
 }
 
 // ---------------------------------------------------------------------------
-// Optimistic commits, and taking them back. A mutation is applied locally
-// first and the server told afterwards; when the server refuses, the op is
-// dropped and the visible state rebuilt from the last snapshot the server
-// agreed to plus the ops still in flight. Ops are deterministic, so a later
-// op that succeeded keeps the id the server gave it.
+// Optimistic commits, the queue behind them, and taking one back. A mutation
+// is applied locally first and the server told afterwards, in order, by one
+// sender. Confirmed: the op folds into the confirmed snapshot. Refused (4xx):
+// the op is dropped and the visible state rebuilt from the confirmed snapshot
+// plus the ops still waiting. Unreachable (network, 5xx): nothing is dropped;
+// $ITEMOffline goes true and the sender backs off and retries the same op.
 // ---------------------------------------------------------------------------
 
 // $ITEMRejected is the last op the server refused, and why. Zero when none;
 // the next confirmed commit clears it. A page shows it in its own element.
 var $ITEMRejected = signal.Of($ITEMRejection{})
+
+// $ITEMOffline is true while the server cannot be reached; $ITEMQueued is how
+// many ops are applied locally and not yet confirmed.
+var (
+	$ITEMOffline = signal.Of(false)
+	$ITEMQueued  = signal.Of(0)
+)
 
 type $ITEMRejection struct {
 	Op  $ITEMOp
@@ -477,38 +491,68 @@ func (r $ITEMRejection) Empty() bool { return r.Err == "" }
 
 var (
 	$LOWERConfirmed $ITEMSnapshot
-	$LOWERPending   []$LOWERInflight
+	$LOWERPending   []$LOWERInflight // oldest first; [0] is being sent
 	$LOWERSeq       int
+	$LOWERKick      = make(chan struct{}, 1)
+	$LOWERSender    sync.Once
 )
 
 type $LOWERInflight struct {
-	seq int
-	op  $ITEMOp
+	seq  int
+	op   $ITEMOp
+	send func($ITEMOp) error
 }
 
-// Hydrate$PLURAL installs the server's snapshot as both the visible state and
-// the confirmed one. Mount calls it with what dom.Embedded read from the page.
+// Hydrate$PLURAL installs the server's snapshot as the confirmed state, with
+// any ops still waiting to be sent replayed on top. Mount calls it with what
+// dom.Embedded read from the page.
 func Hydrate$PLURAL(sn $ITEMSnapshot) {
 	$LOWERConfirmed = sn
-	$LOWERPending = nil
-	$LOWERClient.Restore(sn)
+	view := sn
+	for _, p := range $LOWERPending {
+		view = $LOWERReplay(view, p.op)
+	}
+	$LOWERClient.Restore(view)
 }
 
-// Commit$ITEM applies op now, then sends it from a goroutine. On an error the
-// op is rolled back and $ITEMRejected is set. The page passes the network call
+// Commit$ITEM applies op now and queues it. send is called from the sender
+// goroutine, in commit order; a refusal rolls the op back and sets
+// $ITEMRejected, anything else is retried. The page passes the network call
 // in: the store cannot import the generated client without a cycle.
 func Commit$ITEM(op $ITEMOp, send func($ITEMOp) error) {
 	$LOWERSeq++
-	entry := $LOWERInflight{seq: $LOWERSeq, op: op}
-	$LOWERPending = append($LOWERPending, entry)
+	$LOWERPending = append($LOWERPending, $LOWERInflight{seq: $LOWERSeq, op: op, send: send})
 	$LOWERClient.Apply(op)
-	go func() {
-		if err := send(op); err != nil {
-			$LOWERReject(entry, err)
-			return
+	$ITEMQueued.Set(len($LOWERPending))
+	$LOWERSender.Do(func() { go $LOWERDrain() })
+	select {
+	case $LOWERKick <- struct{}{}:
+	default:
+	}
+}
+
+func $LOWERDrain() {
+	backoff := time.Second
+	for range $LOWERKick {
+		for len($LOWERPending) > 0 {
+			e := $LOWERPending[0]
+			err := e.send(e.op)
+			switch {
+			case err == nil:
+				$LOWERConfirm(e)
+				backoff = time.Second
+			case api.Refused(err):
+				$LOWERReject(e, err)
+				backoff = time.Second
+			default:
+				$ITEMOffline.Set(true)
+				time.Sleep(backoff)
+				if backoff < 5*time.Second {
+					backoff *= 2
+				}
+			}
 		}
-		$LOWERConfirm(entry)
-	}()
+	}
 }
 
 func $LOWERConfirm(e $LOWERInflight) {
@@ -516,9 +560,13 @@ func $LOWERConfirm(e $LOWERInflight) {
 		return
 	}
 	$LOWERConfirmed = $LOWERReplay($LOWERConfirmed, e.op)
-	if !$ITEMRejected.Peek().Empty() {
-		$ITEMRejected.Set($ITEMRejection{})
-	}
+	signal.Batch(func() {
+		$ITEMQueued.Set(len($LOWERPending))
+		$ITEMOffline.Set(false)
+		if !$ITEMRejected.Peek().Empty() {
+			$ITEMRejected.Set($ITEMRejection{})
+		}
+	})
 }
 
 func $LOWERReject(e $LOWERInflight, err error) {
@@ -531,6 +579,8 @@ func $LOWERReject(e $LOWERInflight, err error) {
 	}
 	signal.Batch(func() { // one repaint for the rollback and the message
 		$LOWERClient.Restore(sn)
+		$ITEMQueued.Set(len($LOWERPending))
+		$ITEMOffline.Set(false)
 		$ITEMRejected.Set($ITEMRejection{Op: e.op, Err: err.Error()})
 	})
 }
@@ -713,6 +763,8 @@ func Mount() {
 	).Replace(`package $PKG
 
 import (
+	"strconv"
+
 	"github.com/mirairoad/howl-go/core/dom"
 	"github.com/mirairoad/howl-go/core/signal"
 
@@ -737,6 +789,9 @@ templ $COMPONENT() {
 		<!-- Shown when the server refuses an op the browser already applied.
 		     The store rolled it back; this only says why. -->
 		<p data-error hidden></p>
+		<!-- While the server is unreachable, ops stay applied and queued in
+		     order; one sender retries with backoff and this line says so. -->
+		<p data-offline hidden></p>
 		<!-- The snapshot the server rendered from, serialised for the browser
 		     store. Mount restores it: no fetch, no empty-then-full flash. -->
 		@templ.JSONScript("$LOWER", store.$PLURALSnapshotFrom(ctx))
@@ -745,7 +800,7 @@ templ $COMPONENT() {
 
 templ $ITEMLIST(items []store.$ITEM) {
 	for _, it := range items {
-		<li>{ it.$FIRSTFIELD }</li>
+		<li data-key={ strconv.Itoa(it.ID) }>{ it.$FIRSTFIELD }</li>
 	}
 }
 
@@ -783,6 +838,16 @@ func Mount() {
 	signal.Effect(repaint)
 	signal.Watch(store.$ITEMCount.Get, func(now, before int) {
 		dom.Log("[$PKG] count", before, "->", now)
+	})
+
+	// Offline: nothing was rolled back, the queue is waiting for the server.
+	signal.Effect(func() {
+		el := root.Query("[data-offline]")
+		off, n := store.$ITEMOffline.Get(), store.$ITEMQueued.Get()
+		el.Hide(!off)
+		if off {
+			el.SetText("server unreachable — " + strconv.Itoa(n) + " change(s) queued, retrying")
+		}
 	})
 
 	// The rollback message: its own element, its own effect. The list's

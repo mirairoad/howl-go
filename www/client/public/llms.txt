@@ -482,7 +482,7 @@ root := dom.Root()                                          // the element this 
 root.Delegate("click", "[data-del]", func(e dom.Event) { … }) // one listener, every match, now or after a repaint
 root.Query("[data-form]").On("submit", func(e dom.Event) { … }) // submit and link clicks are prevented for you
 e.Target() / e.Value() / e.Key() / e.PreventDefault()       // what a handler reads
-root.Query("[data-list]").Render(ui.TodoList(items))        // the repaint: any templ.Component, into the element
+root.Query("[data-list]").Render(ui.TodoList(items))        // the repaint: a morph — keyed rows move, unchanged nodes stay, focus survives
 dom.Embedded("todos", &sn)                                  // the snapshot the server serialised into this page
 el.Focus()                                                  // keyboard focus — a modal's field on open
 dom.Frame(func(t float64) bool { …; return true })          // once per paint; released with the scope
@@ -618,10 +618,13 @@ Scaffold both files with `howl_scaffold` (`kind: "store"`, `name: "todos"`).
 3. **Local.** A mutation calls `store.Commit(op, send)`: `Apply` runs now, which
    publishes, which wakes the effect, which re-renders **the same templ component
    the server used** and swaps it in. `send` tells the server from a goroutine and
-   never blocks the user. If the server refuses, the store rolls that one op back —
-   the confirmed snapshot plus the ops still in flight — and sets `store.Rejected`,
-   which the page shows in its own element. `Mount` hydrates with `Hydrate(sn)` so
-   there is a confirmed state to return to.
+   never blocks the user; one sender goroutine sends in commit order. If the server
+   refuses (`api.Refused`, a 4xx) the store rolls that one op back — the confirmed
+   snapshot plus the ops still waiting — and sets `store.Rejected`. If the server is
+   unreachable nothing is dropped: `store.Offline` goes true, `store.Queued` counts
+   the wait, and the sender retries with backoff until the op lands. The page shows
+   both in their own elements. `Mount` hydrates with `Hydrate(sn)` so there is a
+   confirmed state to return to, with queued ops replayed on top.
 
 ### The lifecycle contract
 
@@ -739,9 +742,12 @@ explain.
 No hooks, no re-render, no virtual DOM, no dependency array, no `useState`. A
 component renders once to a writer and is finished; "update the screen" means
 render it again and swap the result in — which is why `repaint` is two lines
-and why the markup is identical to the server's. The swap is `innerHTML`: it
-does not preserve focus or selection inside the region it replaces, so keep an
-input the user is typing into outside the element a repaint renders.
+and why the markup is identical to the server's. The swap is a morph, done by
+`app.js`: an element with a `data-key` or an `id` is moved rather than rebuilt,
+an unchanged node stays the same node, and the field being typed into keeps its
+value and focus. Give rows a `data-key`. There is still no state above the DOM:
+a listener bound with `On` to a node the morph replaced is gone, which is what
+`Delegate` is for.
 
 ---
 
@@ -1228,7 +1234,10 @@ snapshot serialised by the server into the page, restored in `Mount` without a f
 `howl_frontend` MCP tool (`format: "json"` for the five parts as fields) and
 `www/docs/11-frontend.md` (the browser recipes), the store's `Hydrate`/`Commit`/
 `Rejected` (optimistic commits rolled back when the server refuses; scaffolded), the
-`register-in-goroutine` and `unmount-close-unguarded` check rules.
+`register-in-goroutine` and `unmount-close-unguarded` check rules, the morph behind
+`Element.Render` (`howl.morph(el, html)` in `app.js`; keyed by `data-key` or `id`), the
+store's `Offline`/`Queued` and its ordered sender with backoff (an outage queues ops,
+never drops them), `api.Refused`.
 
 Removed: `signal.WatchAny` and `signal.WatchImmediate` (one `Effect` reading several
 signals is the idiomatic form), and `dom.On`'s handler is now `func(dom.Event)`.

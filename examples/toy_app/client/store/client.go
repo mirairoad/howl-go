@@ -1,6 +1,12 @@
 package store
 
-import "github.com/mirairoad/howl-go/core/signal"
+import (
+	"sync"
+	"time"
+
+	"github.com/mirairoad/howl-go/core/api"
+	"github.com/mirairoad/howl-go/core/signal"
+)
 
 // The browser's store, exposed reactively.
 //
@@ -28,6 +34,12 @@ var (
 	// Rejected is the last op the server refused, and why. Zero when there is
 	// none. A page shows it; the next confirmed commit clears it.
 	Rejected = signal.Of(Rejection{})
+
+	// Offline is true while the server cannot be reached. Queued is how many
+	// ops are applied locally and not yet confirmed — the number that will be
+	// sent, in order, when it can be reached again.
+	Offline = signal.Of(false)
+	Queued  = signal.Of(0)
 )
 
 type Rejection struct {
@@ -59,54 +71,90 @@ func (s *Store) publish() {
 }
 
 // ---------------------------------------------------------------------------
-// Optimistic commits, and taking them back.
+// Optimistic commits, the queue behind them, and taking one back.
 //
 // A mutation is applied locally first — the user never waits — and the server
-// is told afterwards. Most of the time it agrees. When it does not, the page
-// is showing something that never happened, and "log a warning" is not an
-// answer. So the store keeps two things: the last snapshot the server agreed
-// to, and the ops applied since, in order. A refusal drops that one op and
-// rebuilds the visible state from the confirmed snapshot plus the ops still in
-// flight — so an op that succeeded after the failed one is kept, and because
-// ops are deterministic, an "add" that came after a rejected "add" ends up
-// with the id the server gave it.
+// is told afterwards, in order, by one sender. The store keeps the last
+// snapshot the server agreed to and every op applied since. Three outcomes:
+//
+//   - confirmed: the op folds into the confirmed snapshot.
+//   - refused (a 4xx): the op is dropped and the visible state rebuilt from
+//     the confirmed snapshot plus the ops still waiting, so a later op that
+//     the server will still see is kept, and — ops being deterministic — an
+//     "add" after a refused "add" ends up with the id the server gives it.
+//   - unreachable (a network failure, a 5xx): nothing is dropped. Offline goes
+//     true, the sender backs off and retries the same op, and everything
+//     committed meanwhile waits its turn behind it. Order is the whole point
+//     of one sender: two goroutines racing would let a later op land first.
 // ---------------------------------------------------------------------------
 
 var (
 	confirmed Snapshot   // what the server last agreed to
-	pending   []inflight // applied locally since, oldest first
+	pending   []inflight // applied locally since, oldest first; pending[0] is being sent
 	seq       int
+
+	kick   = make(chan struct{}, 1)
+	sender sync.Once
 )
 
 type inflight struct {
-	seq int
-	op  Op
+	seq  int
+	op   Op
+	send func(Op) error
 }
 
-// Hydrate installs the server's snapshot as both the visible state and the
-// confirmed one. Mount calls it with what dom.Embedded read from the page.
+// Hydrate installs the server's snapshot as the confirmed state. Ops still
+// waiting to be sent are replayed on top, so navigating away and back while
+// offline does not make queued changes vanish from the screen.
 func Hydrate(sn Snapshot) {
 	confirmed = sn
-	pending = nil
-	client.Restore(sn)
+	view := sn
+	for _, p := range pending {
+		view = replay(view, p.op)
+	}
+	client.Restore(view)
 }
 
-// Commit applies op now, then sends it. send runs in a goroutine and returns
-// the server's verdict; on an error the op is rolled back and Rejected is set.
-// The page passes the network call in, because the store cannot import the
-// generated client without a cycle — the client imports the store's types.
+// Commit applies op now and queues it. send is called from the sender
+// goroutine, in commit order, and returns the server's verdict; a refusal
+// rolls the op back and sets Rejected, anything else is retried. The page
+// passes the network call in, because the store cannot import the generated
+// client without a cycle — the client imports the store's types.
 func Commit(op Op, send func(Op) error) {
 	seq++
-	entry := inflight{seq: seq, op: op}
-	pending = append(pending, entry)
+	pending = append(pending, inflight{seq: seq, op: op, send: send})
 	client.Apply(op)
-	go func() {
-		if err := send(op); err != nil {
-			reject(entry, err)
-			return
+	Queued.Set(len(pending))
+	sender.Do(func() { go drain() })
+	select {
+	case kick <- struct{}{}:
+	default: // the sender is already awake
+	}
+}
+
+func drain() {
+	backoff := time.Second
+	for range kick {
+		for len(pending) > 0 {
+			e := pending[0]
+			err := e.send(e.op)
+			switch {
+			case err == nil:
+				confirm(e)
+				backoff = time.Second
+			case api.Refused(err):
+				reject(e, err)
+				backoff = time.Second
+			default:
+				Offline.Set(true)
+				time.Sleep(backoff)
+				if backoff < 5*time.Second {
+					backoff *= 2
+				}
+				// pending[0] is still e: try it again.
+			}
 		}
-		confirm(entry)
-	}()
+	}
 }
 
 func confirm(e inflight) {
@@ -114,9 +162,13 @@ func confirm(e inflight) {
 		return
 	}
 	confirmed = replay(confirmed, e.op)
-	if !Rejected.Peek().Empty() {
-		Rejected.Set(Rejection{})
-	}
+	signal.Batch(func() {
+		Queued.Set(len(pending))
+		Offline.Set(false)
+		if !Rejected.Peek().Empty() {
+			Rejected.Set(Rejection{})
+		}
+	})
 }
 
 func reject(e inflight, err error) {
@@ -130,6 +182,8 @@ func reject(e inflight, err error) {
 	// One repaint for the rollback and the message together.
 	signal.Batch(func() {
 		client.Restore(sn)
+		Queued.Set(len(pending))
+		Offline.Set(false)
 		Rejected.Set(Rejection{Op: e.op, Err: err.Error()})
 	})
 }
