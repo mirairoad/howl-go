@@ -1,10 +1,10 @@
 package db
 
 import (
-	"container/list"
 	"context"
-	"sync"
 	"time"
+
+	"github.com/mirairoad/howl-go/core/cache"
 )
 
 // Cache configures query-result caching. The zero value disables it: a TTL of
@@ -27,14 +27,11 @@ type Cache struct {
 	SkipFind bool
 }
 
-// CacheAdapter is the storage a cache uses. Get returns false on a miss; Set
-// is best-effort and never reports failure, because a cache that fails a
-// write has cost the caller nothing but a slower next read.
-type CacheAdapter interface {
-	Get(ctx context.Context, key string) ([]byte, bool)
-	Set(ctx context.Context, key string, value []byte, ttl time.Duration)
-	Del(ctx context.Context, keys ...string)
-}
+// CacheAdapter is the storage a cache uses — core/cache's Store, so one
+// adapter serves documents, endpoint responses and pages alike. Get returns
+// false on a miss; Set is best-effort and never reports failure, because a
+// cache that fails a write has cost the caller nothing but a slower next read.
+type CacheAdapter = cache.Store
 
 // Versioner is the optional capability that makes invalidation work across
 // processes. Every cache key embeds a collection version; a write bumps it,
@@ -56,72 +53,4 @@ type Prefixed interface{ Prefix() string }
 
 // NewLRU returns an in-process cache holding at most max entries, evicting
 // least-recently-used. It is what [Cache] uses when no adapter is set.
-func NewLRU(max int) CacheAdapter {
-	if max <= 0 {
-		max = 1000
-	}
-	return &lru{max: max, index: make(map[string]*list.Element, max), order: list.New()}
-}
-
-type lru struct {
-	mu    sync.Mutex
-	max   int
-	index map[string]*list.Element
-	order *list.List
-}
-
-type entry struct {
-	key     string
-	value   []byte
-	expires time.Time
-}
-
-func (c *lru) Get(_ context.Context, key string) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	el, ok := c.index[key]
-	if !ok {
-		return nil, false
-	}
-	e := el.Value.(*entry)
-	if time.Now().After(e.expires) {
-		c.drop(el)
-		return nil, false
-	}
-	c.order.MoveToFront(el)
-	return e.value, true
-}
-
-func (c *lru) Set(_ context.Context, key string, value []byte, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	expires := time.Now().Add(ttl)
-	if el, ok := c.index[key]; ok {
-		e := el.Value.(*entry)
-		e.value, e.expires = value, expires
-		c.order.MoveToFront(el)
-		return
-	}
-	c.index[key] = c.order.PushFront(&entry{key: key, value: value, expires: expires})
-	for c.order.Len() > c.max {
-		c.drop(c.order.Back())
-	}
-}
-
-func (c *lru) Del(_ context.Context, keys ...string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, k := range keys {
-		if el, ok := c.index[k]; ok {
-			c.drop(el)
-		}
-	}
-}
-
-func (c *lru) drop(el *list.Element) {
-	if el == nil {
-		return
-	}
-	c.order.Remove(el)
-	delete(c.index, el.Value.(*entry).key)
-}
+func NewLRU(max int) CacheAdapter { return cache.NewLRU(max) }

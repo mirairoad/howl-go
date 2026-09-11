@@ -11,6 +11,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/a-h/templ"
 )
@@ -52,6 +53,12 @@ type Route struct {
 	// renderer. Empty means fall back to Config.ClientData — which is what
 	// every route did before per-route data existed.
 	Data string
+	// Cache is how long the server may reuse this page's rendered response,
+	// from `//howl:cache`. Zero renders every request. core/app only ever
+	// shares a response between visitors who send no cookie and no
+	// Authorization, so a page that greets the signed-in user is never
+	// handed to someone else — see app.Config.Cache.
+	Cache time.Duration
 }
 
 var titleTag = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)

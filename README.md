@@ -250,8 +250,16 @@ Use: []mw.Middleware{mw.RequestID, mw.Logger(nil), mw.Recover(nil), mw.Compress{
 ```
 
 `mw` ships `RequestID`, `Logger` (slog, level follows status), `Recover`,
-`Compress`, `CORS`, `CSRF`, `CSP` and `Coalesce`. Everything composes with
-anything written for chi or the standard library, in either direction.
+`Compress`, `CORS`, `CSRF`, `CSP`, `Coalesce`, `Cache`, `SecureHeaders`,
+`Proxy`, and `Only`/`Except` to scope any of them to a path.
+Everything composes with anything written for chi or the standard library, in
+either direction.
+
+A typed endpoint can set headers and cookies (`r.Header()`, `r.SetCookie`),
+declare `Description`, `Errors` and a per-route `Cache`, and type its path
+parameters with `path:"id"`. A page can ask for `//howl:cache 30s`, served to
+anonymous visitors only. `app.Redirect` turns a guard's redirect into a
+document load even when the request was an in-page navigation.
 
 Three details that are the whole reason these exist rather than being left to
 the application:

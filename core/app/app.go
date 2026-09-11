@@ -25,6 +25,7 @@ import (
 
 	"github.com/a-h/templ"
 
+	"github.com/mirairoad/howl-go/core/cache"
 	"github.com/mirairoad/howl-go/core/mw"
 	"github.com/mirairoad/howl-go/core/router"
 	"github.com/mirairoad/howl-go/core/runtime"
@@ -73,6 +74,39 @@ type Config struct {
 	// Log is the runtime's own logger — the startup line, render failures.
 	// Defaults to slog.Default(); see core/console for the tinted one.
 	Log *slog.Logger
+	// RedirectTrailingSlash answers /about/ with a 301 to /about for every
+	// page route — howl (TS)'s trailingSlashes('never'). One URL per page, so
+	// a crawler does not index two copies and analytics do not split one
+	// page's traffic. Off, both spellings render.
+	//
+	// A setting on the page routes rather than a middleware in front of the
+	// mux: ServeMux itself redirects /files to /files/ for any subtree pattern
+	// (`mux.Handle("/files/", …)`), and a middleware stripping the slash again
+	// sends that request round in a loop until the browser gives up. Only the
+	// routes this App registered, which it knows have no subtree, redirect.
+	RedirectTrailingSlash bool
+
+	// Logger logs one line per request through Log — howl (TS)'s
+	// `logger: true`. It is mw.RequestID and mw.LogWith with Callers and
+	// SkipNoise, placed outside Use so the line times everything Use does.
+	// Leave it off when Use already lists a logger: every request would be
+	// logged twice.
+	Logger bool
+
+	// Cache stores the rendered responses of pages that declare
+	// `//howl:cache 30s`. Nil is an in-process LRU of 1000 entries, created
+	// only when some route asks for it. The same core/cache Store can back
+	// api.Config.Cache and db's document cache.
+	//
+	// A page response is stored and served only for a request with no Cookie
+	// and no Authorization, and only when the response sets no cookie. A
+	// rendered page is somebody's — it may greet the signed-in user or carry
+	// their CSRF token — and a visitor who sends no cookie is the one visitor
+	// it provably is not. The rule has a consequence worth knowing: an
+	// application whose middleware hands every new visitor a cookie (mw.CSRF
+	// does) never stores a page, because every cookie-less response sets one.
+	// That is the rule working, not failing; cache those pages' data instead.
+	Cache cache.Store
 
 	// ClientData is a JSON endpoint the browser fetches once before its first
 	// local render, and hands to the wasm renderer as its data argument. Leave
@@ -91,6 +125,7 @@ type App struct {
 	cfg    Config
 	mounts []mount
 	static *Static
+	cache  cache.Store // pages' //howl:cache store; nil when no route declares one
 	// client is everything the shell publishes that cannot change between
 	// requests. Derived from the route table, which is generated at build time
 	// and never mutated afterwards.
@@ -128,9 +163,16 @@ func New(cfg Config) *App {
 		public = os.DirFS(cfg.PublicDir)
 	}
 	params := map[string][]string{}
+	var pages cache.Store
 	for _, rt := range cfg.Routes {
 		if names := paramNames(rt.Pattern); len(names) > 0 {
 			params[rt.Pattern] = names
+		}
+		if rt.Cache > 0 && pages == nil {
+			pages = cfg.Cache
+			if pages == nil {
+				pages = cache.NewLRU(1000)
+			}
 		}
 	}
 
@@ -150,6 +192,7 @@ func New(cfg Config) *App {
 			Live:  liveEndpoint(),
 		},
 		params: params,
+		cache:  pages,
 	}
 }
 
@@ -311,7 +354,7 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, rt router.Route, c 
 	// SPA navigation: the page plus its layouts, without the document shell.
 	// A fragment has no <head>, so the page's head travels with it in an inert
 	// <template> for the client to merge.
-	if r.Header.Get("X-Partial") == "1" {
+	if IsPartial(r) {
 		// The title travels in the body, not the header. A header is bytes, and
 		// fetch() decodes response headers as ISO-8859-1, so a UTF-8 em dash
 		// would surface as "â€”"; the body is decoded as UTF-8 per Content-Type.
@@ -376,15 +419,24 @@ func (a *App) Mux() *http.ServeMux {
 	}
 
 	for _, rt := range a.cfg.Routes {
-		h := func(w http.ResponseWriter, r *http.Request) { a.Render(w, r, rt, rt.Component()) }
+		var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			a.Render(w, r, rt, rt.Component())
+		})
+		if rt.Cache > 0 {
+			h = mw.Cache{Store: a.cache, TTL: rt.Cache, Key: a.pageKey, Vary: []string{"X-Partial"}}.Handler(h)
+		}
 		if rt.Pattern == "/" {
 			// "GET /" is ServeMux's catch-all; "{$}" matches only the root so
 			// the 404 handler below still owns everything else.
-			mux.HandleFunc("GET /{$}", h)
+			mux.Handle("GET /{$}", h)
 			continue
 		}
-		mux.HandleFunc("GET "+rt.Pattern, h)
-		mux.HandleFunc("GET "+rt.Pattern+"/{$}", h) // trailing slash, no redirect
+		mux.Handle("GET "+rt.Pattern, h)
+		if a.cfg.RedirectTrailingSlash {
+			mux.HandleFunc("GET "+rt.Pattern+"/{$}", trimSlash)
+		} else {
+			mux.Handle("GET "+rt.Pattern+"/{$}", h) // trailing slash, served as-is
+		}
 	}
 
 	// Not "GET /": a method-specific catch-all conflicts with any method-less
@@ -402,6 +454,22 @@ func (a *App) Mux() *http.ServeMux {
 	return mux
 }
 
+// trimSlash redirects a page's slashed spelling to its canonical one. A
+// fragment request is redirected too: fetch() follows it, and the client
+// runtime shows the page under the URL it landed on.
+func trimSlash(w http.ResponseWriter, r *http.Request) {
+	target := strings.TrimRight(r.URL.EscapedPath(), "/")
+	// ServeMux has already cleaned "//evil.example/" by the time a pattern
+	// matches, but a Location starting with two slashes is a protocol-relative
+	// URL to another site, and this line is cheaper than relying on that.
+	target = "/" + strings.TrimLeft(target, `/\`)
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	w.Header().Set("Location", target)
+	w.WriteHeader(http.StatusMovedPermanently)
+}
+
 // strip removes the mount prefix, mapping the bare prefix to "/" instead of
 // the empty path http.StripPrefix would hand the sub-handler — a mux given ""
 // matches nothing and answers 404 at its own root.
@@ -417,13 +485,33 @@ func strip(prefix string, h http.Handler) http.Handler {
 	})
 }
 
+// pageKey is the //howl:cache key: nothing for a request with credentials (see
+// Config.Cache), otherwise the canonical path and query under this build. The
+// build is in the key because a shared store outlives a deploy, and a stored
+// document names the previous build's wasm and asset hashes.
+func (a *App) pageKey(r *http.Request) string {
+	if r.Header.Get("Cookie") != "" || r.Header.Get("Authorization") != "" {
+		return ""
+	}
+	return "page\x00" + a.build() + "\x00" + Canonical(r.URL.Path) + "?" + r.URL.Query().Encode()
+}
+
 // Handler is Mux wrapped in the configured middleware. Use it when you want the
 // full chain but not Listen — tests, a custom http.Server, a cloud runtime.
 func (a *App) Handler() http.Handler { return a.withBuild(a.Wrap(a.Mux())) }
 
 // Wrap applies the middleware chain to any handler, so an application that
 // builds its own mux still gets the same treatment.
-func (a *App) Wrap(h http.Handler) http.Handler { return mw.Chain(h, a.cfg.Use...) }
+func (a *App) Wrap(h http.Handler) http.Handler {
+	if !a.cfg.Logger {
+		return mw.Chain(h, a.cfg.Use...)
+	}
+	logged := []mw.Middleware{
+		mw.RequestID,
+		mw.LogWith(mw.LogOptions{Logger: a.Log(), Callers: true, Skip: mw.SkipNoise}),
+	}
+	return mw.Chain(h, append(logged, a.cfg.Use...)...)
+}
 
 // asset is the content-hashed URL for a static file. See Static.Name.
 func (a *App) asset(name string) string { return "/static/" + a.static.Name(name) }

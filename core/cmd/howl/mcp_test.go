@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -125,5 +128,40 @@ func TestHeadingLevelIgnoresFences(t *testing.T) {
 	}
 	if got := headingLevel("#not-a-heading", false); got != 0 {
 		t.Errorf("got level %d, want 0", got)
+	}
+}
+
+// Every generated line must come back, whatever fields it carries. The reader
+// was one regexp that could not cross the } of a Layouts slice, so routes with
+// a layout — a third of the toy app — were missing from howl_routes.
+func TestRoutesReadsEveryGeneratedLine(t *testing.T) {
+	root := t.TempDir()
+	gen := `package pages
+
+func FsClientRoutes() []router.Route {
+	return []router.Route{
+		{Pattern: "/", Label: "Home", Page: Page, Head: nil, Mount: nil, Unmount: nil, Layouts: nil, Client: false, Raw: false},
+		{Pattern: "/dashboard/metrics", Label: "Metrics", Page: p3.Page, Head: p3.Head, Mount: p3.Mount, Unmount: nil, Layouts: []router.Wrapper{p2.Layout}, Client: true, Raw: false, Data: "/api/metrics"},
+		{Pattern: "/pricing", Label: "Pricing", Page: p4.Page, Head: nil, Mount: nil, Unmount: nil, Layouts: []router.Wrapper{Layout, p4.Layout}, Client: false, Raw: false, Cache: 30000000000 /* 30s */},
+	}
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "fsroutes_gen.go"), []byte(gen), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(readPageRoutes(root))
+	var got struct{ Routes []pageRoute }
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Routes) != 3 {
+		t.Fatalf("read %d routes, want 3: %s", len(got.Routes), raw)
+	}
+	metrics, pricing := got.Routes[1], got.Routes[2]
+	if !metrics.Client || !metrics.Mount || metrics.Data != "/api/metrics" {
+		t.Errorf("metrics = %+v", metrics)
+	}
+	if pricing.Cache != "30s" || pricing.Mount {
+		t.Errorf("pricing = %+v, want cache 30s and no mount", pricing)
 	}
 }

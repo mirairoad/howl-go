@@ -25,6 +25,12 @@
 // fight. Same for logging and correlation ids: they arrive through core/mw if
 // you want them.
 //
+// It does not write the response body for you to break: a handler returns a
+// value and the framework encodes it. What a handler may add is headers and
+// cookies — r.Header() and r.SetCookie() — because signing someone in is a
+// cookie, and an endpoint that cannot set one sends the application off to
+// write a second, untyped handler for the one call that needed it.
+//
 // It is also JSON-only. An endpoint speaking protobuf, serving a file, or
 // streaming is an ordinary http.Handler on the mux; wrapping those in a typed
 // envelope would buy nothing.
@@ -52,7 +58,9 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"time"
 
+	"github.com/mirairoad/howl-go/core/cache"
 	"github.com/mirairoad/howl-go/core/mw"
 )
 
@@ -67,10 +75,46 @@ type Spec[Q, B, R any] struct {
 	Path string
 	// Roles is passed verbatim to Config.Authorize. Empty means public.
 	Roles []string
+	// Description is for the reader of the OpenAPI document: what the endpoint
+	// does, in a sentence. Name is the label; this is the explanation.
+	Description string
+	// Errors lists the statuses this endpoint answers with on purpose, beyond
+	// the ones the document already derives — 400 for input, 401 and 403 for
+	// roles. A 404 or a 409 the handler returns belongs here, so a client
+	// generated from the document knows to expect it.
+	Errors []int
+	// Cache reuses successful responses for Cache.TTL. GET only; the zero
+	// value caches nothing. See Cache for who shares an entry.
+	Cache Cache
 	// Handler receives decoded, validated input and returns a value to encode.
 	// Return an *api.Error to choose the status; anything else is a 500 with
 	// its details kept server-side.
 	Handler func(*Request[Q, B]) (R, error)
+}
+
+// Cache is an endpoint's response cache — howl (TS)'s `caching: { ttl }`.
+//
+//	Cache: api.Cache{TTL: 5 * time.Second},
+//
+// An entry is keyed by path, query and caller, so it is never served to
+// somebody else (howl (TS): `{method}:{url}:{userId}`). The caller is
+// Config.Identity; without one, a request carrying Cookie or Authorization is
+// its own caller, keyed by a hash of those headers. Config.Authorize still runs
+// on every request, hit or miss: a cached answer is not a way past the roles.
+//
+// Never stored: anything but a 200, and a response that sets a cookie. The
+// response carries X-Howl-Cache: hit or miss, and Age on a hit.
+//
+// It is TTL-based and nothing else — there is no purge. Cache what may be that
+// stale: a paid upstream's suggestions, an aggregate over a day. A read that
+// must show the write that just happened belongs uncached, or in db's
+// document cache, which is invalidated by the write itself.
+type Cache struct {
+	// TTL is how long a response is reused. Zero disables the cache.
+	TTL time.Duration
+	// Vary lists request headers the response depends on — Accept-Language,
+	// say — so each value gets its own entry.
+	Vary []string
 }
 
 // Request is what a handler is given: the decoded query and body, plus the
@@ -79,10 +123,42 @@ type Request[Q, B any] struct {
 	HTTP  *http.Request
 	Query Q
 	Body  B
+
+	// w is the response the framework will write. Unexported on purpose: the
+	// handler adds headers through Header and SetCookie, and the framework
+	// still owns the status line and the body, so a handler cannot write half
+	// a response and then return an error that has nowhere to go.
+	w      http.ResponseWriter
+	header http.Header // only for a Request built by hand, in a test
 }
 
 // Param returns a {placeholder} from the path.
 func (r *Request[Q, B]) Param(name string) string { return r.HTTP.PathValue(name) }
+
+// Header is the response's header map — howl (TS)'s ctx.headers. Whatever is
+// set here goes out with the response, including when the handler returns an
+// error: clearing a session cookie on a 401 is a real case. Content-Type is the
+// framework's, and is overwritten.
+func (r *Request[Q, B]) Header() http.Header {
+	if r.w == nil {
+		if r.header == nil {
+			r.header = http.Header{}
+		}
+		return r.header
+	}
+	return r.w.Header()
+}
+
+// SetCookie adds a Set-Cookie to the response — howl (TS)'s ctx.cookies.set,
+// and http.SetCookie without the writer. A cookie with an invalid name is
+// dropped silently, as net/http drops it.
+//
+// A response that sets a cookie is never stored by Spec.Cache.
+func (r *Request[Q, B]) SetCookie(c *http.Cookie) {
+	if v := c.String(); v != "" {
+		r.Header().Add("Set-Cookie", v)
+	}
+}
 
 // Context is the request context — where core/state values and the request id
 // live.
@@ -91,10 +167,13 @@ func (r *Request[Q, B]) Context() context.Context { return r.HTTP.Context() }
 // Route is a Spec with its type parameters erased, so a slice of them can hold
 // endpoints of different shapes — the same trick router.Route uses for pages.
 type Route struct {
-	Name   string
-	Method string
-	Path   string
-	Roles  []string
+	Name        string
+	Method      string
+	Path        string
+	Roles       []string
+	Description string
+	Errors      []int
+	Cache       Cache
 	// Types records the query, body and response type names for the generated
 	// client and the OpenAPI document. Filled by Define.
 	Types TypeNames
@@ -102,7 +181,7 @@ type Route struct {
 	// accurate OpenAPI document possible without a schema library: generics
 	// erase at run time, but reflect still knows what Q, B and R were.
 	schema shapes
-	handle func(Config) http.HandlerFunc
+	handle func(Config) http.Handler
 }
 
 type shapes struct{ query, body, response reflect.Type }
@@ -128,6 +207,21 @@ type Config struct {
 	Log *slog.Logger
 	// Prefix is prepended to every derived path. Default "/api".
 	Prefix string
+	// Cache stores the responses of endpoints that declare Spec.Cache. Nil is
+	// an in-process LRU of 1000 entries shared by every endpoint registered
+	// together — per process, so replicas each keep their own. Hand in a shared
+	// store (core/cache, a Redis adapter) for anything replicated; the same
+	// value serves db's document cache.
+	Cache cache.Store
+	// Identity names the caller for Spec.Cache: two requests share an entry
+	// only when it returns the same string. Return "" for an anonymous caller,
+	// and every anonymous caller shares one entry per URL.
+	//
+	// Nil keys a request carrying Cookie or Authorization by those headers
+	// themselves — never wrong, but every browser with any cookie at all, a
+	// CSRF token included, gets its own entry. An application with sessions
+	// does better returning the user id.
+	Identity func(r *http.Request) string
 }
 
 // Define erases the type parameters and produces the registerable Route.
@@ -138,20 +232,22 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 	if s.Handler == nil {
 		panic("api: " + s.Name + " has no Handler")
 	}
+	if s.Cache.TTL < 0 {
+		panic("api: " + s.Name + " has a negative Cache.TTL")
+	}
 	return Route{
-		Name:   s.Name,
-		Method: strings.ToUpper(s.Method),
-		Path:   s.Path,
-		Roles:  s.Roles,
-		Types:  TypeNames{Query: typeName[Q](), Body: typeName[B](), Response: typeName[R]()},
-		schema: shapes{query: reflectType[Q](), body: reflectType[B](), response: reflectType[R]()},
-		handle: func(cfg Config) http.HandlerFunc {
-			return func(w http.ResponseWriter, r *http.Request) {
-				if err := authorize(cfg, r, s.Roles); err != nil {
-					fail(cfg, w, r, err)
-					return
-				}
-				req := &Request[Q, B]{HTTP: r}
+		Name:        s.Name,
+		Method:      strings.ToUpper(s.Method),
+		Path:        s.Path,
+		Roles:       s.Roles,
+		Description: s.Description,
+		Errors:      s.Errors,
+		Cache:       s.Cache,
+		Types:       TypeNames{Query: typeName[Q](), Body: typeName[B](), Response: typeName[R]()},
+		schema:      shapes{query: reflectType[Q](), body: reflectType[B](), response: reflectType[R]()},
+		handle: func(cfg Config) http.Handler {
+			var run http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				req := &Request[Q, B]{HTTP: r, w: w}
 				if err := decodeQuery(r, &req.Query); err != nil {
 					fail(cfg, w, r, err)
 					return
@@ -178,7 +274,19 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 					return
 				}
 				write(w, out)
+			})
+			if s.Cache.TTL > 0 {
+				run = mw.Cache{Store: cfg.Cache, TTL: s.Cache.TTL, Vary: s.Cache.Vary, Key: cfg.cacheKey}.Handler(run)
 			}
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Before the cache, always: an entry filled by an admin must
+				// not become the way a caller without the role reads it.
+				if err := authorize(cfg, r, s.Roles); err != nil {
+					fail(cfg, w, r, err)
+					return
+				}
+				run.ServeHTTP(w, r)
+			})
 		},
 	}
 }
@@ -211,14 +319,41 @@ func Register(mux *http.ServeMux, cfg Config, routes ...Route) {
 		cfg.Prefix = "/api"
 	}
 	for _, rt := range routes {
+		if rt.Cache.TTL > 0 && cfg.Cache == nil {
+			cfg.Cache = cache.NewLRU(1000) // one store for the table, not one per endpoint
+			break
+		}
+	}
+	for _, rt := range routes {
 		if len(rt.Roles) > 0 && cfg.Authorize == nil {
 			panic(fmt.Sprintf("api: %q declares roles %v but Config.Authorize is nil — every caller would be let through", rt.Name, rt.Roles))
 		}
 		if rt.Path == "" {
 			panic("api: " + rt.Name + " has no path (generated tables call api.At)")
 		}
-		mux.HandleFunc(rt.Method+" "+rt.Path, rt.handle(cfg))
+		// A cached POST would answer the second submission of a form with the
+		// first one's result, and never run it.
+		if rt.Cache.TTL > 0 && rt.Method != http.MethodGet {
+			panic(fmt.Sprintf("api: %q caches a %s — only GET responses can be reused", rt.Name, rt.Method))
+		}
+		if err := checkPathFields(rt); err != nil {
+			panic("api: " + rt.Name + ": " + err.Error())
+		}
+		mux.Handle(rt.Method+" "+rt.Path, rt.handle(cfg))
 	}
+}
+
+// cacheKey is Spec.Cache's key: the path, the query re-encoded so the order of
+// its parameters does not matter, and the caller. mw.Cache hashes the result,
+// so the cookie that may be in it never reaches a store in the clear.
+func (cfg Config) cacheKey(r *http.Request) string {
+	var who string
+	if cfg.Identity != nil {
+		who = cfg.Identity(r)
+	} else if auth, cookie := r.Header.Get("Authorization"), r.Header.Get("Cookie"); auth != "" || cookie != "" {
+		who = "credentials\x00" + auth + "\x00" + cookie
+	}
+	return "api\x00" + r.URL.Path + "?" + r.URL.Query().Encode() + "\x00" + who
 }
 
 // Routes is sugar for building a table by hand, in tests or a small app.

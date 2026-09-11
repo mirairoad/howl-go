@@ -38,6 +38,7 @@ Components never branch on which one is happening. One switch in `core/app` does
 | `core/app` | server runtime: `app.New(Config)`, mux, SSR/SPA switch, static, SSE, export |
 | `core/router` | route model, context accessors, response status, client config. **Leaf — pages import this** |
 | `core/mw` | middleware: `Middleware = func(http.Handler) http.Handler` |
+| `core/cache` | the cache store every cache shares: `cache.Store` (Get/Set/Del), `cache.NewLRU`, `cache.Try` |
 | `core/console` | `log/slog` handler: tinted columns on a terminal, JSON in a pipe |
 | `core/state` | typed request state on `context.Context`, via generics |
 | `core/signal` | fine-grained reactivity for the browser: signal, computed, effect, watch |
@@ -175,7 +176,15 @@ loses a capability.
 ```go
 //howl:route /custom/path      // override the derived pattern outright
 //howl:data  /api/metrics      // this route's own client-data endpoint (.client routes)
+//howl:cache 30s               // reuse the rendered response for anonymous visitors
 ```
+
+`//howl:cache` is a `time.ParseDuration` string; anything else fails `fsroutes`. The server
+stores and serves the page's response only for a request with **no Cookie and no
+Authorization**, and never stores a response that sets a cookie — a rendered page is
+somebody's, and a visitor with no cookie is the one visitor it provably is not. So an app
+whose middleware gives every visitor a cookie (`mw.CSRF` does) never fills it: that is the
+rule working. A fragment and a document are separate entries, and the build id is in the key.
 
 `//howl:data` is what a `.client` route uses to fetch its own payload instead of sharing
 `Config.ClientData` with every other client route. The browser fetches it before rendering
@@ -325,7 +334,7 @@ Status works because pages render into a buffer before anything is sent. This is
 a component that fails halfway produces an error page rather than a truncated document.
 
 `router.Route` fields: `Pattern`, `Label`, `Page`, `Head`, `Mount`, `Unmount`, `Layouts`,
-`Client`, `Raw`, `Data`. All produced by `fsroutes` — never construct one by hand outside tests.
+`Client`, `Raw`, `Data`, `Cache`. All produced by `fsroutes` — never construct one by hand outside tests.
 
 ---
 
@@ -343,6 +352,9 @@ a := app.New(app.Config{
 	Use:     []mw.Middleware{…},        // outermost first
 	OnError: func(w, r, err) {…},       // owns the response; nothing written yet
 	Log:     nil,                       // defaults to slog.Default()
+	Logger:  true,                      // one line per request (howl TS `logger: true`); not with a logger in Use
+	RedirectTrailingSlash: true,        // /about/ → 301 /about on page routes (howl TS trailingSlashes('never'))
+	Cache:   nil,                       // cache.Store for //howl:cache pages; nil = in-process LRU
 
 	StaticMaxAge:    0,                 // 0 = revalidate with ETag
 	StaticImmutable: app.Hashed,        // app.9f8c2a1b.css → cache a year
@@ -364,7 +376,19 @@ a.Handler()                             // Mux wrapped in Use — for tests/cust
 a.Wrap(h)                               // apply Use to any handler
 a.Export("./dist")                      // static export of every non-dynamic route
 app.SSE(w, r)                           // (*Stream, error); Send(event, data), Done()
+
+app.IsPartial(r)                        // the client runtime asking for a fragment (X-Partial: 1)
+app.Redirect(w, r, "/sign-in", 303)     // a document load, even when r is a fragment request
+app.StaticFiles(root)                   // mw.Middleware: /robots.txt, /favicon.ico, /.well-known/… from an fs.FS
 ```
+
+**Redirects and in-page navigation.** A fragment request that gets a plain `http.Redirect`
+is followed by `fetch()`; `app.js` shows the page it landed on *under that page's URL* and
+does not cache it. `app.Redirect` answers a fragment request with `204` +
+`X-Howl-Location` instead, and the client loads that URL as a whole document — use it when
+the redirect changes more than `#outlet` (sign-in, sign-out, a guard) or leaves the origin.
+A redirect to another origin, to a non-HTML response or to a `.raw` route is always a
+document load.
 
 There is **no `ctx` wrapper and no framework handler type**. Use `r.Cookie`,
 `r.URL.Query()`, `r.PathValue`, `json.NewEncoder(w)`. Do not invent `ctx.json` helpers.
@@ -378,11 +402,13 @@ Use: []mw.Middleware{
 	mw.RequestID,                                              // id on ctx + X-Request-Id
 	mw.LogWith(mw.LogOptions{Callers: true, Skip: mw.SkipNoise}),
 	mw.Recover(nil),                                           // panic → 500
+	mw.SecureHeaders{}.Handler,                                // nosniff, Referrer-Policy, X-Frame-Options (howl TS defaultHeaders)
+	mw.Proxy{Target: "http://127.0.0.1:8000", Paths: []string{"/legacy"}}.Handler, // howl TS createProxy
 	mw.Compress{}.Handler,                                     // gzip dynamic responses
 	(&mw.Coalesce{}).Handler,                                  // share one render across identical concurrent GETs
 	mw.CORS{Origins: []string{"https://app.example.com"}}.Handler,
-	mw.CSRF{Secure: true}.Handler,                             // origin check + double-submit token
-	mw.CSP{Policy: "default-src 'self' 'nonce-{nonce}'"}.Handler,
+	mw.Except("/api", mw.CSRF{Secure: true}.Handler),          // origin check + double-submit token, not for the API
+	mw.Only("/embed", mw.CSP{Policy: "default-src 'self' 'nonce-{nonce}'"}.Handler),
 }
 ```
 
@@ -390,7 +416,23 @@ Use: []mw.Middleware{
   standard library drops in, in either direction.
 - Config-struct middleware are used as `Type{…}.Handler`. `Coalesce` needs a pointer
   (`(&mw.Coalesce{}).Handler`) because it holds state.
-- Read helpers: `mw.ID(ctx)`, `mw.CSRFToken(ctx)`, `mw.Nonce(ctx)`.
+- Read helpers: `mw.ID(ctx)`, `mw.CSRFToken(ctx)`, `mw.Nonce(ctx)`, `mw.ClientIP(r, trustProxy)`
+  (the peer address, or the first `X-Forwarded-For` entry when trusted — and only if it parses as an IP).
+- `mw.Only(prefix, ms...)` / `mw.Except(prefix, ms...)` scope middleware to a path prefix, matched
+  a whole segment at a time (`/admin` never covers `/administrator`); `mw.Under(path, prefix)` is the test.
+- `mw.Cache{Store, TTL, Key, Vary}` is the response cache behind `api.Spec.Cache` and
+  `//howl:cache`, usable on any handler: GET only, 200 only, never a response that sets a
+  cookie or flushes; `X-Howl-Cache: hit|miss` and `Age` on the way out. The default `Key`
+  skips requests carrying `Cookie`/`Authorization`.
+- `mw.Proxy` is `httputil.ReverseProxy`: `Paths` match by segment with `{name}` wildcards,
+  `StripPrefix` removes the match, `X-Forwarded-*` are rewritten (never passed through from the
+  client), a target's cookie `Domain` is dropped, and a dead or slow target is 502/504 without
+  naming its address.
+- `mw.SecureHeaders` deliberately sends no `X-XSS-Protection` (removed from browsers; `mode=block`
+  was itself exploitable) and no blanket `Cache-Control: no-store` (it would defeat static caching).
+- There is no trailing-slash middleware on purpose: ServeMux redirects `/files` to `/files/` for a
+  subtree pattern, and a middleware trimming the slash loops with it. `app.Config.RedirectTrailingSlash`
+  does it on the page routes only.
 - `Coalesce` refuses to share: non-GET, requests with `Cookie`/`Authorization`, responses
   that set a cookie, bodies over `MaxBody`.
 - `LogOptions.Callers` adds `ip`/`ua` **only** for requests that did not come from a page
@@ -496,6 +538,11 @@ dom.Log(…) / dom.Warn(…)
 
 `net/http` under `GOOS=js` **is** the browser's `fetch()` — no JS glue needed. It must run
 in a goroutine: blocking the JS callback deadlocks the Go scheduler.
+
+A fragment request that is redirected is handled, not swallowed: a same-origin redirect to a
+page is swapped in under the URL it landed on and never cached; `X-Howl-Location` (from
+`app.Redirect`), a cross-origin redirect, a non-HTML target or a `.raw` target become a full
+document load.
 
 JS side — `window.howl` is the entire public API:
 
@@ -877,6 +924,20 @@ Rules:
 - **One `api.Define` per file.** The file name is the URL; it can only describe one.
 - `api.None` for no query, no body, or no response (a `None` response answers 204).
 - Query decoding uses `query:"name"` tags. Body is JSON, and unknown fields are rejected.
+- A query field tagged `path:"id"` is filled from the `{id}` placeholder and typed like a query
+  field — `` ID int64 `path:"id"` `` answers 400 naming `id` for `/orders/abc`. A tag naming no
+  placeholder in the path panics at `Register`. The generated client still takes `{id}` as its
+  own argument; `EncodeQuery` leaves path fields out.
+- Headers and cookies: `r.Header().Set(…)` and `r.SetCookie(&http.Cookie{…})` inside the handler
+  (howl TS `ctx.headers` / `ctx.cookies.set`). They go out with the response, error responses
+  included. The framework still writes the status and the body.
+- `Description: "…"` and `Errors: []int{404, 409}` feed the OpenAPI document only.
+- `Cache: api.Cache{TTL: 5 * time.Second}` reuses a GET's 200 responses (howl TS `caching: { ttl }`).
+  The key is path + query + caller: `api.Config.Identity(r)` names the caller ("" = anonymous,
+  shared); without it a request with `Cookie`/`Authorization` is keyed by those headers.
+  `Authorize` runs before the cache on every request. A response that sets a cookie is never
+  stored; a cached POST panics at `Register`. TTL only — there is no purge.
+  `api.Config.Cache` is the `cache.Store` (nil = one in-process LRU for the table).
 - Validation is a `Validate() error` method on the query or body type. It runs before the
   handler; a plain error becomes a 400.
 - Return `*api.Error` (`api.NotFound`, `api.Invalid`, `api.Forbidden`, …) to choose a status.
@@ -898,8 +959,10 @@ mux.HandleFunc("GET /api/openapi.json", api.OpenAPI(api.Info{Title: "Guard"}, ro
 mux.HandleFunc("GET /api/docs", api.Docs("/api/openapi.json"))
 ```
 
-Query tags become parameters, `{placeholders}` become path parameters, named
-structs become components, `Roles` becomes a security requirement. `Validate()`
+Query tags become parameters, `{placeholders}` become path parameters (typed by a
+`path:"…"` field when there is one), named structs become components, `Roles` becomes a
+security requirement plus 401/403, `Description` the operation's description, and `Errors`
+extra documented responses. `Validate()`
 is deliberately NOT expressed — it is arbitrary Go, and a `maximum: 100` the
 handler does not enforce would be worse than silence.
 
@@ -1074,6 +1137,58 @@ rules carry a window better than breakpoints do, because a window is dragged thr
 width in between: the toy app's card grid is `repeat(auto-fit, minmax(210px, 1fr))` and
 reflows on its own, with no `@media` anywhere in its 176 lines.
 
+### Packaging: `howl package`
+
+A bare binary runs. What it does not have is the metadata that makes the OS treat it as an
+application — so it shows a blank sheet of paper in the Dock, and on Linux it is not in the
+launcher at all. `howl package` writes that, and only that:
+
+```bash
+go build -o myapp_desktop ./desktop           # this is still what builds
+howl package -bin ./myapp_desktop -name "My App" -id com.example.myapp -version 1.2.0
+```
+
+```
+dist/My App.app/          darwin  Info.plist, PkgInfo, MacOS/<binary>, Resources/AppIcon.icns
+dist/my-app/              linux   binary, my-app.desktop, icons/hicolor/**, install.sh
+```
+
+It does not build, and it does not cross-compile: the desktop binary needs cgo and the
+platform's webview, so build and package the Linux one on Linux. Passing a Mach-O binary
+with `-os linux` is refused rather than wrapped — the mistake otherwise produces a tree that
+installs, appears in the launcher with the right icon, and does nothing when clicked.
+
+**The only required asset is `desktop/packaging/icon.png`** — one square PNG, 1024×1024.
+Every size in both bundles is derived from it, in pure Go: no `iconutil` and no `sips`, so a
+`.app` can be assembled anywhere. Flags carry what changes per release, because that already
+lives in the caller's Makefile; the folder carries what does not, because a file location is
+how the rest of this framework holds configuration.
+
+The escape hatch is a file, not a flag. Drop an `Info.plist` or an `app.desktop` into
+`desktop/packaging/` and it is copied verbatim — that is the answer to
+`LSMinimumSystemVersion`, URL schemes, document types and MIME associations, none of which
+have flags and none of which should.
+
+Four things about the output are worth knowing before changing it:
+
+- `-id` is what Launch Services keys its icon and permission caches on. Changing it after a
+  build has been installed anywhere leaves a ghost that still claims the old icon. It
+  defaults to a reverse-DNS form of the module path and is printed on every run for that
+  reason.
+- The `.icns`'s 16px and 32px entries are `ic04`/`ic05` carrying raw **ARGB**, not PNG. The
+  `icp4`/`icp5` slots that look like the obvious home for a small PNG are read as JPEG 2000,
+  and a PNG written there produces a file that `iconutil` itself decodes into noise. This is
+  checked against `iconutil`'s own output, not inferred.
+- The `.desktop` entry's `StartupWMClass` must be the **executable's** base name, not the
+  slug: GTK sets `WM_CLASS` from the program name, and without a match the taskbar shows a
+  second, iconless item beside the pinned one.
+- `install.sh` rewrites `Exec=` to the absolute installed path. A `.desktop` launched from
+  the app grid does not inherit the login shell's `PATH`, so a bare name works from a
+  terminal and fails from the launcher.
+
+Unsigned bundles are what this produces. On macOS the first launch needs right-click ▸ Open;
+signing and notarisation are Apple's tooling and are not wrapped here.
+
 ### What it costs, and what it does not have
 
 The toy app's window binary is **17 MB** — one file, including the 7 MB wasm renderer.
@@ -1085,18 +1200,25 @@ loads on every navigation, which is exactly the signal state `.client` routes ex
 - Linux: `libwebkit2gtk-4.1` is a runtime dependency. The binary is not fully static.
 - Windows: not wired up here.
 
-The binding creates **no menu bar** (zero `NSMenu`), so macOS key equivalents that come
-from one — ⌘Q, ⌘W, and the Edit menu's ⌘C/⌘V — are not there. Fine for an internal tool or
-a dev loop; a shipped product needs a menu, which is either ~80 lines of Objective-C in
-`desktop/` or a move to wails.
+The binding creates no menu bar, so `desktop` installs one: an app menu, Edit and Window,
+with the standard key equivalents. It is not decoration. On macOS ⌘Q, ⌘W, ⌘M and — the one
+that gets reported as "the text fields are broken" — ⌘C, ⌘V, ⌘X and ⌘A are *menu item*
+behaviour, not window behaviour, so with zero `NSMenu` none of them do anything anywhere in
+the page. `Options.NoMenu` turns it off, for an application installing its own.
+
+There is deliberately no "leave an existing menu alone" guard: a **bundled** app is handed a
+one-item `mainMenu` by AppKit before any of our code runs, so such a guard fires every time
+and the menu reverts to that stub. The symptom is a menu that is correct when the binary is
+run bare and gone once it is inside a `.app`.
 
 Off by default and not worth re-deriving: the inspector (only when `Debug`), the webview's
 own right-click menu (Reload/Back/Forward — browser affordances in something that is not a
 browser), and dropped-file navigation, which would otherwise turn the app into a `file://`
 viewer with no address bar to get back from.
 
-Do not invent: `howl desktop` (there is no build verb — `go build` builds), a `.app` or
-AppImage packager, a tray icon, auto-update, or a frameless window. None of it exists.
+Do not invent: `howl desktop` (there is still no build verb — `go build` builds), an
+AppImage or `.dmg` builder, code signing or notarisation, a tray icon, auto-update, or a
+frameless window. None of it exists. Bundling a `.app` *does* — see below.
 
 ---
 
@@ -1153,6 +1275,14 @@ actually serves.
 | add a parameter | `client/pages/blog/article_id.dyn.templ`, read `router.Param(ctx, "article_id")` |
 | 404 from a page | `{{ router.NotFound(ctx) }}` inside the branch that has nothing to show |
 | add an API endpoint | a `*.api.go` file under `server/apis/`; run `fsapis`; register the generated table |
+| set a cookie from an endpoint | `r.SetCookie(&http.Cookie{…})` in the handler |
+| cache an endpoint | `Cache: api.Cache{TTL: 5 * time.Second}` on the Spec (GET only) |
+| cache a public page | `//howl:cache 30s` in the page file (anonymous visitors only) |
+| redirect from a guard | `app.Redirect(w, r, "/sign-in", http.StatusSeeOther)` |
+| one URL per page | `app.Config{RedirectTrailingSlash: true}` |
+| forward a path to another server | `mw.Proxy{Target: …, Paths: […]}.Handler` in `Use` |
+| serve /robots.txt, /favicon.ico | `app.StaticFiles(rootFS)` in `Use` |
+| middleware for one prefix | `mw.Only("/admin", …)`, `mw.Except("/api", …)` |
 | add a raw/protobuf/streaming endpoint | `mux.HandleFunc("POST /v1/x", …)` on the mux from `a.Mux()` |
 | return HTML from an API | render a component to the writer: `ui.TodoItem(t).Render(r.Context(), w)` |
 | share data with every page | `Config.Data`, or `state.With` in middleware |
@@ -1203,7 +1333,9 @@ actually serves.
 
 howl-go deliberately does not have, and proposals should not assume:
 
-- a `ctx` wrapper (`ctx.json`, `ctx.cookies`, `ctx.query`) — the standard library has these
+- a `ctx` wrapper (`ctx.json`, `ctx.cookies`, `ctx.query`) — the standard library has these.
+  The one exception is inside a typed endpoint, where the handler returns a value and has no
+  writer: `api.Request` has `Header()` and `SetCookie()` for exactly that, and nothing more
 - pluggable render engines — `templ.Component` is already the seam
 - full client-side hydration of every page — islands + wasm is the opposite bet
 - a bundler, CSS pipeline, or any Node dependency
@@ -1231,14 +1363,21 @@ generated table, generated client), `howl check` and `howl mcp`, `db` +
 `signal.Batch`, `dom.Delegate`, `dom.Event`, `Element.Render`, `router.Client.Build` +
 `X-Howl-Build` (an open tab reloads itself after a deploy), `dom.Embedded` (the store
 snapshot serialised by the server into the page, restored in `Mount` without a fetch),
-`Element.Focus`, `dom.Frame` (per-paint animation, released with the scope), the
+`Element.Focus`, `dom.Frame` (per-paint animation, released with the scope), `howl package`
+(the `.app` bundle and the Linux install tree, from one 1024px PNG) and the macOS menu bar
+`desktop` now installs (`Options.NoMenu` to decline), the
 `howl_frontend` MCP tool (`format: "json"` for the five parts as fields) and
 `www/docs/11-frontend.md` (the browser recipes), the store's `Hydrate`/`Commit`/
 `Rejected` (optimistic commits rolled back when the server refuses; scaffolded), the
 `register-in-goroutine` and `unmount-close-unguarded` check rules, the morph behind
 `Element.Render` (`howl.morph(el, html)` in `app.js`; keyed by `data-key` or `id`), the
 store's `Offline`/`Queued` and its ordered sender with backoff (an outage queues ops,
-never drops them), `api.Refused`.
+never drops them), `api.Refused`, `core/cache` (`db.CacheAdapter` is now an alias of
+`cache.Store`), `api.Request.Header`/`SetCookie`, `api.Spec.Description`/`Errors`/`Cache`,
+`api.Config.Cache`/`Identity`, `path:"…"` query fields, `app.Redirect`/`IsPartial`/
+`StaticFiles`/`HeaderLocation`, `app.Config.Logger`/`Cache`/`RedirectTrailingSlash`, `//howl:cache` + `Route.Cache`,
+`mw.Cache`/`SecureHeaders`/`Proxy`/`Only`/`Except`/`Under`/`ClientIP`, and
+`app.js` following redirected fragment requests.
 
 Removed: `signal.WatchAny` and `signal.WatchImmediate` (one `Effect` reading several
 signals is the idiomatic form), and `dom.On`'s handler is now `func(dom.Event)`.

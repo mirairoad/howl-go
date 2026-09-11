@@ -32,8 +32,16 @@ const (
 // RequestID puts an id on the request context and echoes it in the response.
 // An inbound id is trusted only if it is short and printable — it ends up in
 // logs and headers, so a caller must not be able to inject newlines into them.
+//
+// A second RequestID in the same chain keeps the first one's id — app.Config's
+// Logger adds one, and an application that also lists it in Use would
+// otherwise log one id and answer with another.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ID(r.Context()) != "" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		id := r.Header.Get(HeaderRequestID)
 		if !safeID(id) {
 			id = newID()
@@ -130,7 +138,7 @@ func LogWith(o LogOptions) Middleware {
 				attrs = append(attrs, slog.Bool("partial", true))
 			}
 			if o.Callers && !fromThisSite(r) {
-				attrs = append(attrs, slog.String("ip", clientIP(r, o.TrustProxy)))
+				attrs = append(attrs, slog.String("ip", ClientIP(r, o.TrustProxy)))
 				if ua := r.Header.Get("User-Agent"); ua != "" {
 					attrs = append(attrs, slog.String("ua", truncate(ua, 48)))
 				}
@@ -183,12 +191,20 @@ func sameHost(rawURL, host string) bool {
 	return err == nil && strings.EqualFold(u.Host, host)
 }
 
-func clientIP(r *http.Request, trustProxy bool) string {
+// ClientIP is the address the request came from: the connection's peer, or
+// with trustProxy the first address in X-Forwarded-For.
+//
+// Only pass trustProxy behind a proxy that overwrites that header — anyone can
+// send it, and a proxy that appends to it leaves the client's own claim in
+// first place. A forwarded value that is not an IP address is ignored rather
+// than returned: this ends up in logs and in audit columns like last_ip, and a
+// header is free text.
+func ClientIP(r *http.Request, trustProxy bool) string {
 	if trustProxy {
 		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 			first, _, _ := strings.Cut(fwd, ",")
-			if first = strings.TrimSpace(first); first != "" {
-				return first
+			if ip := net.ParseIP(strings.TrimSpace(first)); ip != nil {
+				return ip.String()
 			}
 		}
 	}

@@ -329,10 +329,10 @@ func TestClientIPIgnoresForwardedHeaderUnlessTrusted(t *testing.T) {
 	r.RemoteAddr = "10.0.0.5:4000"
 	r.Header.Set("X-Forwarded-For", "1.2.3.4, 10.0.0.1")
 
-	if got := clientIP(r, false); got != "10.0.0.5" {
+	if got := ClientIP(r, false); got != "10.0.0.5" {
 		t.Fatalf("untrusted = %q — anyone can send X-Forwarded-For", got)
 	}
-	if got := clientIP(r, true); got != "1.2.3.4" {
+	if got := ClientIP(r, true); got != "1.2.3.4" {
 		t.Fatalf("trusted = %q", got)
 	}
 }

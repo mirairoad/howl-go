@@ -1,6 +1,6 @@
 # The HTTP layer
 
-Everything between the socket and a component: middleware, static files, status codes, errors, sub-applications, request state.
+Everything between the socket and a component: middleware, redirects, caching, static files, status codes, errors, sub-applications, request state.
 
 There is no framework handler type and no context wrapper. A middleware is `func(http.Handler) http.Handler` and a handler is `http.Handler` — so anything written for chi, gorilla or the standard library drops in unchanged, and anything you write here works outside howl-go.
 
@@ -33,6 +33,50 @@ The chain wraps everything — pages, static files, and any handler the applicat
 | `mw.CSRF{…}` | origin check plus double-submit token |
 | `mw.CSP{…}` | Content-Security-Policy, with a per-request nonce |
 | `mw.Coalesce{}` | identical concurrent requests share one render |
+| `mw.Cache{…}` | keeps a GET's 200 response for a TTL — the store behind endpoint and page caching |
+| `mw.SecureHeaders{}` | `nosniff`, `Referrer-Policy`, `X-Frame-Options`, and HSTS when asked |
+| `mw.Proxy{…}` | forwards some paths to another server |
+| `mw.Only(prefix, …)`, `mw.Except(prefix, …)` | middleware for one part of the site |
+
+howl (TypeScript) users will recognise most of these: `SecureHeaders` is `defaultHeaders`, `Proxy` is `createProxy`, and `Only`/`Except` are what the per-path `app.use('/admin', …)` did. `trailingSlashes('never')` is a setting rather than a middleware — see below.
+
+### Trailing slashes
+
+Every page answers on both `/about` and `/about/` by default. `app.Config{RedirectTrailingSlash: true}` makes one of them the address: the slashed spelling gets a `301` to the other, query kept, and the root is left alone.
+
+It is a setting on the page routes and not a middleware for a reason that shows up as "too many redirects": `ServeMux` itself redirects `/files` to `/files/` whenever something is mounted as a subtree (`mux.Handle("/files/", …)`), and a middleware stripping the slash sends that request straight back. The page routes are the ones the app registered, with no subtree under them, so only they redirect.
+
+### Only and Except
+
+```go
+Use: []mw.Middleware{
+	mw.RequestID,
+	mw.Except("/api", mw.CSRF{Secure: true}.Handler), // forms need it; a bearer-token API does not
+	mw.Only("/admin", requireAdmin),
+}
+```
+
+A prefix is matched a whole segment at a time: `/admin` covers `/admin` and `/admin/users`, never `/administrator`. A guard written with `strings.HasPrefix` protects a page it was never meant to — or, used to exempt a path, exempts one. `mw.Under(path, prefix)` is the same test, for middleware of your own.
+
+### SecureHeaders
+
+The zero value sends `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` and `X-Frame-Options: DENY`, before the handler runs, so a handler that needs something else sets its own. `"-"` turns one off; `HSTS` adds `Strict-Transport-Security` — set it only once the site is https for good, because a browser that has seen it refuses plain http for that long.
+
+Two headers howl (TS) sent are left out on purpose. `X-XSS-Protection: 1; mode=block` drove a filter every browser has since removed, and `mode=block` could be used to delete chosen scripts from a page; CSP replaced it. And `Cache-Control: no-store` on every response would switch off the year-long immutable assets below — each response here already says how it may be cached.
+
+### Proxy
+
+```go
+mw.Proxy{
+	Target:      "http://127.0.0.1:8000",
+	Paths:       []string{"/api/v1/admin/{table}/restore"},
+	StripPrefix: false,
+}.Handler
+```
+
+It is `httputil.ReverseProxy`, so streaming, WebSocket upgrades and hop-by-hop headers are already right. `Paths` match by segment, with `{name}` matching any one — howl (TS) matched with `startsWith`, so a pattern with `:table` in it could never match a request. Requests that match nothing pass on to the next handler.
+
+What it decides for you: `X-Forwarded-For`, `-Host` and `-Proto` are written from what this server saw, never passed through from the client; a target's `Set-Cookie` loses its `Domain` (a cookie scoped to a domain the browser never talked to is refused outright — `KeepCookieDomain` to keep it); the target's own host is sent (`KeepHost` to forward the incoming one); and a target that is down or slower than `Timeout` to answer (30 s, headers only, so a download is not cut off) is a `502` or `504` whose body does not name its address.
 
 ### Compress
 
@@ -107,6 +151,14 @@ So the same binary is pleasant to run and parseable to ship, with nothing to con
 
 `a.Listen` logs it through the same logger rather than printing to stdout, so it obeys whatever the process decided about format. It is the one line you always want: a server that is up and a server that is up *on the port you meant* look identical otherwise. At debug level it is preceded by one line per route.
 
+### One switch
+
+```go
+app.Config{Logger: true}
+```
+
+howl (TS)'s `logger: true`: `mw.RequestID` and `mw.LogWith` with `Callers` and `SkipNoise`, through `Config.Log`, placed outside `Use` so the line times everything the chain does. Leave it off when `Use` already lists a logger, or each request is logged twice. A `mw.RequestID` in both places keeps the first id, so the log and the response agree.
+
 ### Who is hitting your API
 
 ```go
@@ -117,7 +169,7 @@ mw.LogWith(mw.LogOptions{Callers: true, Skip: mw.SkipNoise})
 
 Three signals decide, cheapest first: `Sec-Fetch-Site`, then `Origin`, then `Referer`. A request with none of them is not a browser on your site. `Sec-Fetch-Site: cross-site` is believed over a forged `Referer`, since the browser sets it and script cannot.
 
-`TrustProxy: true` reads the client address from `X-Forwarded-For` — only set it behind a proxy that *overwrites* that header, because anyone can send it.
+`TrustProxy: true` reads the client address from `X-Forwarded-For` — only set it behind a proxy that *overwrites* that header, because anyone can send it. The same rule is exported as `mw.ClientIP(r, trustProxy)`, for an audit column like `last_ip`; a forwarded value that does not parse as an IP address is ignored, since a header is free text.
 
 `Skip: mw.SkipNoise` drops `/static/`, `/healthz`, `/favicon.ico` and friends. They are the majority of requests and the least informative line in any log.
 
@@ -157,6 +209,86 @@ A hashed URL from an older deploy still serves the current bytes — but with `n
 Everything is compressed **once**, in the background at `Listen`, so no request pays for it — not even the first. `Dev` compares modification time and size before rebuilding, so a watched directory stays fresh without redoing the work: on a 6.94 MB wasm binary that distinction is **530 ms per request against 2.4 ms**, and the original version paid it on the `304`s too, where nothing is transferred at all.
 
 The application's own files are layered over the framework's, so `app.js` is served without ever being copied into your project — and a file of the same name in your `static/` wins.
+
+### Files at the root
+
+`/static/` is for your assets. Browsers, crawlers and other tools ask for a few names at the root and will not look anywhere else — `/favicon.ico`, `/robots.txt`, `/.well-known/security.txt`:
+
+```go
+Use: []mw.Middleware{app.StaticFiles(rootFS)}
+```
+
+howl (TS)'s `staticFiles()`. Same handler as `/static/` — ETag, `Cache-Control`, compressed once — for `GET` and `HEAD` of a file the FS has; everything else passes on. The FS is listed once, so a page request costs a map lookup rather than an open. A file shadows a page at the same path, so give it a directory of its own rather than pointing it at `Public`.
+
+## Redirects
+
+A plain `http.Redirect` works for every request, including the client runtime's fragment requests: `fetch()` follows it, and `app.js` shows the page it landed on **under that page's URL**, without caching it under the one that redirected. Before, the target was swapped in silently under the old address, and a reload then disagreed with the screen.
+
+When the redirect should be a fresh document — a sign-in or sign-out, a guard sending someone to a page with a different shell, anything on another origin — use `app.Redirect`:
+
+```go
+if viewer.ID == "" {
+	app.Redirect(w, r, "/sign-in", http.StatusSeeOther)
+	return
+}
+```
+
+A document request gets the redirect as usual. A fragment request gets `204` with `X-Howl-Location`, and the client loads that URL as a whole page, so chrome outside `#outlet` — the name in the header — is rendered again. `app.IsPartial(r)` tells the two apart for middleware of your own. A followed redirect to another origin, a non-HTML response or a `.raw` route is a document load either way.
+
+## Endpoints: headers, cookies, caching
+
+An endpoint returns a value and the framework writes it, so a handler has no writer to break. What it can add is headers and cookies:
+
+```go
+Handler: func(r *api.Request[api.None, SignIn]) (Session, error) {
+	token, err := sessions.Start(r.Context(), r.Body.Email)
+	if err != nil {
+		return Session{}, err
+	}
+	r.SetCookie(&http.Cookie{Name: "session", Value: token, HttpOnly: true, SameSite: http.SameSiteLaxMode, Path: "/"})
+	return Session{Email: r.Body.Email}, nil
+},
+```
+
+`r.Header()` is the response's header map and `r.SetCookie` adds to it — howl (TS)'s `ctx.headers` and `ctx.cookies.set`. Both go out with error responses too, because clearing a session cookie on a `401` is a real case. `Content-Type` stays the framework's.
+
+A query field tagged `path:"id"` is the typed form of `r.Param("id")`, like howl (TS)'s `params` schema: `/orders/abc` answers `400` naming `id` before the handler runs, and a tag that names no placeholder in the path panics at `Register` instead of staying zero forever.
+
+### Caching an endpoint
+
+```go
+var Suggest = api.Define(api.Spec[SuggestQuery, api.None, []Place]{
+	Name:        "Suggest",
+	Description: "Address suggestions from the maps provider, which bills per call.",
+	Cache:       api.Cache{TTL: 5 * time.Second},
+	Handler:     …,
+})
+```
+
+howl (TS)'s `caching: { ttl }`, with its key: path, query, caller. `api.Config.Identity(r)` names the caller — return the user id, or `""` for anonymous visitors, who then share. Without it, a request carrying `Cookie` or `Authorization` is keyed by those headers themselves: never wrong, but every browser holding any cookie gets its own entry.
+
+| rule | why |
+|---|---|
+| `Authorize` runs first, on hits too | an entry filled by an admin is not a way past the roles |
+| GET only; a cached POST panics at `Register` | a stored POST answers the second submission with the first one's result |
+| 200 only | a cached 500 is an outage that outlives its cause |
+| never a response that sets a cookie | a stored `Set-Cookie` hands every later caller the same session |
+| request `Cache-Control` is ignored | the cache usually protects something from exactly that traffic |
+
+Responses say `X-Howl-Cache: hit` or `miss`, and a hit carries `Age`. There is no purge: a TTL is the whole contract, so cache what may be that stale. A read that must show the write that just happened belongs uncached, or in `db`'s document cache, which the write itself invalidates.
+
+`api.Config.Cache` is the store — `nil` is one in-process LRU for the table. It is a `cache.Store` (`core/cache`), the same interface as `db.Cache.Adapter` and `app.Config.Cache`, so one Redis adapter serves all three, and `cache.Try(redis, cache.NewLRU(1000), 150*time.Millisecond)` falls back to memory when Redis is slow or gone.
+
+### Caching a page
+
+```go
+//howl:cache 30s
+templ Pricing() { … }
+```
+
+The rendered response is reused — but only between visitors who send **no cookie and no `Authorization`**, and never from a response that sets a cookie. A rendered page is somebody's: it may greet the signed-in user or carry their CSRF token, and a visitor with no cookie is the one visitor it provably is not.
+
+That has a consequence worth knowing before reaching for it: an application whose middleware hands every new visitor a cookie — `mw.CSRF` does — never stores a page, because every cookie-less response sets one. That is the rule working. Cache such a page's data instead, in `Config.Data` or the document store. A fragment and a whole document are separate entries, and the build id is part of the key, so a shared store never serves a document naming the previous deploy's assets.
 
 ## Status codes
 

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mirairoad/howl-go/core/mw"
 )
 
 // Static serves an fs.FS with the three things net/http's FileServer leaves to
@@ -45,6 +47,12 @@ type Static struct {
 
 	mu    sync.RWMutex
 	cache map[string]*entry
+
+	// names is every file in FS, listed once, so Middleware can pass a request
+	// for a page on without touching the FS. Unused under Reload, where a file
+	// may appear at any moment.
+	namesOnce sync.Once
+	names     map[string]bool
 }
 
 type entry struct {
@@ -149,6 +157,66 @@ func (s *Static) Handler() http.Handler {
 		// is the validator, and an embed.FS has no meaningful mtime anyway.
 		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(body))
 	})
+}
+
+// StaticFiles serves the files in fsys at the site root — /favicon.ico,
+// /robots.txt, /.well-known/security.txt — and passes every other request on:
+// howl (TS)'s staticFiles().
+//
+//	Use: []mw.Middleware{app.StaticFiles(client.Root())}
+//
+// /static/ already serves the application's Public files; this is for the
+// names that browsers, crawlers and other tools ask for at the root and will
+// not look for anywhere else. A file shadows a page of the same path, which
+// is the point for /robots.txt and a surprise for anything else, so give it
+// its own directory rather than pointing it at Public.
+//
+// The same handler as /static/: an ETag, a Cache-Control, compressed once.
+func StaticFiles(fsys fs.FS) mw.Middleware {
+	return (&Static{FS: fsys}).Middleware
+}
+
+// Middleware serves a GET or HEAD for a file s has, and hands everything else
+// to next: other methods, directories, and names it does not have.
+func (s *Static) Middleware(next http.Handler) http.Handler {
+	files := s.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			next.ServeHTTP(w, r)
+			return
+		}
+		name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if name == "" || !fs.ValidPath(name) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if base, _ := unhash(name); !s.has(base) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		files.ServeHTTP(w, r)
+	})
+}
+
+// has reports whether name is a file in the FS. Every page request passes
+// through Middleware, so the answer for a name that is not there must not cost
+// an open: the FS is listed once. Not remembered per miss, which a stream of
+// made-up URLs would grow without bound.
+func (s *Static) has(name string) bool {
+	if s.Reload {
+		_, err := s.load(name)
+		return err == nil
+	}
+	s.namesOnce.Do(func() {
+		s.names = map[string]bool{}
+		fs.WalkDir(s.FS, ".", func(p string, d fs.DirEntry, err error) error { //nolint:errcheck
+			if err == nil && !d.IsDir() {
+				s.names[p] = true
+			}
+			return nil
+		})
+	})
+	return s.names[name]
 }
 
 func (s *Static) cacheControl(name string) string {

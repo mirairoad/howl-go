@@ -468,6 +468,10 @@ wrapping the whole mux — pages, static files and application handlers alike.
 `core/mw` ships `RequestID`, `Logger`, `Recover`, `Compress`, `CORS`, `CSRF`,
 `CSP` and `Coalesce`, and none of them import anything of ours.
 
+(Revisited in §The rest of howl's HTTP surface: a typed endpoint has no writer
+to call `http.SetCookie` on, so `api.Request` gained `Header` and `SetCookie` —
+two methods, not a wrapper.)
+
 The one thing worth porting from `ctx.state` was the *typing*, and generics do
 it in twenty lines — the key is the type itself:
 
@@ -1355,6 +1359,162 @@ behind them, the fragment swap and head merge, the build-drift reload and
 the `.raw` escape. `core/dom` is still exercised by hand — it needs Go's
 wasm test runner, which needs Node and a DOM under it, and that is a second
 harness for a package whose logic is thin over `app.js`.
+
+## The rest of howl's HTTP surface
+
+The first application built on the framework with real authentication —
+factory, a port of hushkey's sign-in — found the gaps by needing them. Measured
+against how hushkey uses howl (TS) rather than against its source, which is not
+on hand: 82 `defineApi` files, its middleware list, its client rules.
+
+### An endpoint that could not sign anyone in
+
+§13 refused the `ctx` wrapper because the standard library already has cookies.
+It does — on the `http.ResponseWriter`, which an `api.Define` handler never
+sees: it returns a value, and the framework writes it. So the one call that
+must set a cookie, signing in, could not be an endpoint. factory grew eighteen
+routes in a second tree of plain handlers, untyped and outside the generated
+client, among them JSON calls that were endpoints in every way but that one.
+
+The fix is two methods, not a wrapper. `r.Header()` is the response's header
+map and `r.SetCookie` adds to it; the writer stays unexported, so a handler
+still cannot write half a body and then return an error with nowhere to go.
+Headers set before an error still go out, because clearing a session cookie on
+a 401 is the case that motivated it. A `Request` built by hand in a unit test
+has no writer, and gets a map of its own instead of a nil dereference.
+
+### The redirect fetch() swallowed
+
+A guard that answers a fragment request with a 302 was followed by `fetch()`
+without a word. `app.js` took the sign-in page's markup and swapped it in under
+`/dashboard`'s URL, cached under `/dashboard` for fifteen seconds; a reload then
+disagreed with the screen. factory worked around it by answering with a fake
+build id, which turned the navigation into a document load by pretending a
+deploy had happened.
+
+`res.redirected` was always there. A same-origin redirect to a page is now
+shown under `res.url` and never cached — a redirect depends on who is asking,
+which is what changes between a hover and a click. A redirect off the origin,
+to something that is not HTML, or to a `.raw` route is a document load. And
+for the redirect that should be a fresh document regardless, `app.Redirect`
+answers a fragment request with 204 and `X-Howl-Location`: a status the browser
+would follow itself would hand back the target's fragment, and the signed-in
+name in the header outside `#outlet` would stay as it was. The jsdom tests for
+all three fail against the previous `app.js`.
+
+### One cache, three callers
+
+howl (TS) had `caching: { ttl }` per endpoint and a store config
+(`tryCache(redisCache, memoryCache)`); howl-go had a cache interface in `db`,
+for documents only. The interface moved to `core/cache` — standard library
+only, so `db`, which imports nothing else from `core`, can depend on it — and
+`db.CacheAdapter` became an alias, so no adapter anyone wrote changes. One Redis
+adapter now backs documents, endpoints and pages. `cache.Try` is `tryCache`,
+with a timeout on the primary: without one, a Redis the network has swallowed
+holds each request until the caller's own context gives up.
+
+The response cache itself is one middleware, `mw.Cache`, used by both endpoints
+and pages. The rules are the ones `Coalesce` already had to learn, plus the ones
+a cache adds by outliving the request:
+
+- GET only, and a cached POST panics at `Register` — a stored POST answers the
+  second submission with the first one's result and never runs it;
+- 200 only: a cached 500 is an outage that outlives its cause;
+- never a response carrying `Set-Cookie`, whether the handler set it or
+  middleware inside the cache did;
+- what is stored is what the *handler* added to the headers, diffed against the
+  map middleware left: replaying the whole map would hand every hit the
+  `X-Request-Id` of the request that filled the entry. The test for that fails
+  when the diff is replaced with an empty map;
+- request `Cache-Control` is ignored, because the store usually exists to
+  protect a paid upstream from exactly the traffic a client could generate by
+  sending `no-cache`;
+- the key is hashed, so a cookie in it never reaches a shared store in the
+  clear.
+
+For endpoints the key is path, query and caller — howl (TS)'s
+`{method}:{url}:{userId}`. howl-go has no idea what a user id is, so
+`api.Config.Identity` names the caller, and without it a request carrying
+`Cookie` or `Authorization` is keyed by those headers themselves: never wrong,
+and wasteful, since every browser with a CSRF cookie is then its own caller.
+`Authorize` runs before the lookup on every request. Removing that ordering
+fails `TestCacheNeverSkipsAuthorize`: an admin's entry served to a caller
+without the role.
+
+### Pages cache only for strangers
+
+A page cannot use the endpoint rule, because a page is not keyed by caller — it
+*renders* the caller. factory's top bar shows who is signed in, and every form
+carries that visitor's CSRF token. Keying by cookie would be correct and
+useless. So `//howl:cache` stores and serves only for a request with no cookie
+and no `Authorization`, from a response that sets none — Varnish's default
+policy, arrived at from the same two facts.
+
+The consequence is stated in the docs rather than worked around: an application
+whose middleware hands every new visitor a cookie never fills the page cache,
+because every cookie-less response sets one. That is the rule doing its job.
+A documentation site has no cookies and gets the whole benefit; an application
+with sessions caches its data instead. The build id is in the key, so a shared
+store never serves a document naming the previous deploy's hashed assets.
+
+### What was ported from hushkey's middleware, and what was not
+
+- `defaultHeaders` became `mw.SecureHeaders` without two of its lines.
+  `X-XSS-Protection: 1; mode=block` drove a filter every browser has removed,
+  and `mode=block` was itself usable to delete chosen scripts from a page.
+  `Cache-Control: no-store` on everything would have disabled the year-long
+  immutable assets of §13.
+- `createProxy` matched prefixes with `startsWith`, and hushkey's one use of it
+  is `/api/v1/admin/:table/restore` — a pattern no real request path starts
+  with, so it matches nothing. `mw.Proxy` compares segments, with
+  `{name}` matching one. It also rewrites `X-Forwarded-*` from what the server
+  saw instead of passing the client's through, and a dead target is a 502 whose
+  body does not name the internal address the error message contains.
+- `trailingSlashes('never')` was written first as `mw.TrailingSlash`, a
+  middleware, and removed before it shipped. ServeMux redirects `/files` to
+  `/files/` for any subtree pattern, and a middleware in front of it trimming
+  the slash answers that redirect with its opposite — a loop, on the ordinary
+  `mux.Handle("/files/", http.FileServer(…))`. It is
+  `Config.RedirectTrailingSlash` now, applied to the page routes the App
+  registered itself, which have no subtree under them; the test mounts a file
+  server beside them. It keeps the guard the middleware needed: a Location
+  beginning `//` is a protocol-relative URL to another site, so leading slashes
+  are collapsed even though ServeMux has cleaned the path first.
+- `staticFiles()` and `logger: true` already existed as `app.Static` and
+  `mw.LogWith`; what was missing was the one-line form. `app.StaticFiles` serves
+  root names — `/robots.txt`, `/.well-known/…` — from an FS listed once, so a
+  page request costs a map lookup, not an open; misses are not remembered one by
+  one, which a stream of made-up URLs would grow without bound.
+  `Config.Logger` adds the logger outside `Use`, and `mw.RequestID` became
+  idempotent so listing it twice logs and answers with one id.
+- `app.use('/admin', …)` became `mw.Only` and `mw.Except` rather than a
+  `Config.UseFor` map: a function keeps its place in the chain's order, nests,
+  and works outside howl-go. Both match whole segments, since a guard written
+  with `HasPrefix` covers `/administrator` too.
+- `params: z.object({…})` became `path:"id"` on a query field, decoded and
+  validated like the rest of the query, with a tag that names no placeholder
+  refused at `Register` — otherwise it stays zero on every request, and "load
+  order 42" quietly loads order 0.
+- Not ported: `redirectOnFailure`. A JSON endpoint that answers 401 with a
+  redirect is a page pretending to be an endpoint.
+
+### The route list that lost a third of the routes
+
+`howl_routes` read the generated table with one regexp per line, and its
+`[^}]*?` could not cross the `}` of `Layouts: []router.Wrapper{…}`. Every route
+with a layout was missing: 6 of the toy app's 9. Nothing failed — an MCP tool
+that returns a plausible, shorter list looks like a correct answer. It surfaced
+because `Cache:` was about to be appended to the same lines. The reader now
+takes each field with its own expression, and the test's table has a layout, a
+`Data` and a `Cache` on it.
+
+### llms.txt had forked
+
+`make` copies the root `llms.txt` over the one `howl mcp` embeds. The desktop
+packaging commit edited only the embedded copy, so the next `make` would have
+deleted `howl package` and the menu bar from what agents are told. The embedded
+copy was the newer one and became the root again before anything else was
+written to it.
 
 ## 17. Open questions
 

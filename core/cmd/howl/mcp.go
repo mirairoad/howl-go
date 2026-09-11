@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // headingLevel counts the leading '#' of a Markdown ATX heading, and returns 0
@@ -525,9 +527,25 @@ type pageRoute struct {
 	Client  bool   `json:"client"`
 	Raw     bool   `json:"raw"`
 	Mount   bool   `json:"mount"`
+	Data    string `json:"data,omitempty"`
+	Cache   string `json:"cache,omitempty"`
 }
 
-var routeLineRe = regexp.MustCompile(`\{Pattern: "([^"]*)", Label: "([^"]*)"[^}]*?Mount: (\w+[\w.]*)[^}]*?Client: (true|false), Raw: (true|false)\}`)
+// One regexp per field, applied to one generated line at a time. A single
+// expression for the whole line was brittle in the way that hides: its
+// [^}]*? could not cross the } of `Layouts: []router.Wrapper{…}`, so every
+// route with a layout silently vanished from howl_routes — 3 of the toy app's 9
+// — and any field added after Raw would have dropped the rest.
+var (
+	routeLineRe    = regexp.MustCompile(`(?m)^\s*\{Pattern: .*$`)
+	routePatternRe = regexp.MustCompile(`Pattern: "([^"]*)"`)
+	routeLabelRe   = regexp.MustCompile(`Label: "([^"]*)"`)
+	routeMountRe   = regexp.MustCompile(`\bMount: ([\w.]+)`)
+	routeClientRe  = regexp.MustCompile(`Client: (true|false)`)
+	routeRawRe     = regexp.MustCompile(`Raw: (true|false)`)
+	routeDataRe    = regexp.MustCompile(`Data: "([^"]*)"`)
+	routeCacheRe   = regexp.MustCompile(`Cache: (\d+)`)
+)
 
 func readPageRoutes(root string) any {
 	var routes []pageRoute
@@ -535,13 +553,25 @@ func readPageRoutes(root string) any {
 		if filepath.Base(f.Rel) != "fsroutes_gen.go" {
 			continue
 		}
-		for _, m := range routeLineRe.FindAllStringSubmatch(string(f.Body), -1) {
-			routes = append(routes, pageRoute{
-				Pattern: m[1], Label: m[2],
-				Mount:  m[3] != "nil",
-				Client: m[4] == "true",
-				Raw:    m[5] == "true",
-			})
+		for _, line := range routeLineRe.FindAllString(string(f.Body), -1) {
+			field := func(re *regexp.Regexp) string {
+				if m := re.FindStringSubmatch(line); m != nil {
+					return m[1]
+				}
+				return ""
+			}
+			rt := pageRoute{
+				Pattern: field(routePatternRe),
+				Label:   field(routeLabelRe),
+				Mount:   field(routeMountRe) != "nil" && field(routeMountRe) != "",
+				Client:  field(routeClientRe) == "true",
+				Raw:     field(routeRawRe) == "true",
+				Data:    field(routeDataRe),
+			}
+			if ns, err := strconv.ParseInt(field(routeCacheRe), 10, 64); err == nil && ns > 0 {
+				rt.Cache = time.Duration(ns).String()
+			}
+			routes = append(routes, rt)
 		}
 	}
 	if routes == nil {
@@ -554,20 +584,24 @@ func readPageRoutes(root string) any {
 }
 
 type endpointInfo struct {
-	Method   string   `json:"method"`
-	Path     string   `json:"path"`
-	Name     string   `json:"name,omitempty"`
-	File     string   `json:"file,omitempty"`
-	Roles    []string `json:"roles,omitempty"`
-	Query    string   `json:"query,omitempty"`
-	Body     string   `json:"body,omitempty"`
-	Response string   `json:"response,omitempty"`
+	Method      string   `json:"method"`
+	Path        string   `json:"path"`
+	Name        string   `json:"name,omitempty"`
+	Description string   `json:"description,omitempty"`
+	File        string   `json:"file,omitempty"`
+	Roles       []string `json:"roles,omitempty"`
+	Cache       string   `json:"cache,omitempty"`
+	Query       string   `json:"query,omitempty"`
+	Body        string   `json:"body,omitempty"`
+	Response    string   `json:"response,omitempty"`
 }
 
 var (
 	atRe        = regexp.MustCompile(`api\.At\("([A-Z]+)",\s*"([^"]*)",\s*([\w.]+)\)`)
 	specRe      = regexp.MustCompile(`(?m)^var\s+([A-Z]\w*)\s*=\s*api\.Define\(\s*api\.Spec\[(.+)\]\s*\{`)
 	specNameRe  = regexp.MustCompile(`Name:\s*"([^"]*)"`)
+	specDescRe  = regexp.MustCompile(`Description:\s*"([^"]*)"`)
+	specCacheRe = regexp.MustCompile(`Cache:\s*api\.Cache\{TTL:\s*([^,}\n]+)`)
 	roleValueRe = regexp.MustCompile(`"([^"]*)"`)
 )
 
@@ -596,6 +630,12 @@ func readEndpoints(root string) any {
 		}
 		if n := specNameRe.FindSubmatch(f.Body); n != nil {
 			info.Name = string(n[1])
+		}
+		if d := specDescRe.FindSubmatch(f.Body); d != nil {
+			info.Description = string(d[1])
+		}
+		if c := specCacheRe.FindSubmatch(f.Body); c != nil {
+			info.Cache = strings.TrimSpace(string(c[1]))
 		}
 		if r := rolesRe.Find(f.Body); r != nil {
 			for _, role := range roleValueRe.FindAllStringSubmatch(string(r), -1) {

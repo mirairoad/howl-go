@@ -180,7 +180,7 @@ var Get = api.Define(api.Spec[api.None, api.None, users.User]{
 
 ## Caching
 
-Off by default. `db.Cache{TTL: …}` turns on an in-process LRU, which is correct for one process and wrong the moment there are two — invalidation is per-process, so a second replica keeps serving its own copy. Supply a shared adapter for anything replicated.
+Off by default. `db.Cache{TTL: …}` turns on an in-process LRU, which is correct for one process and wrong the moment there are two — invalidation is per-process, so a second replica keeps serving its own copy. Supply a shared adapter for anything replicated. `db.CacheAdapter` is `cache.Store` from `core/cache`, the same interface endpoint and page caching use, so one adapter serves all three.
 
 Keys are `<prefix>:<collection>:v<version>:get|find:…`. Invalidation moves the version, which makes every key built before it unreachable at once — no pattern scan, no key enumeration. Nothing is deleted; the LRU reclaims the orphans in its own time.
 
