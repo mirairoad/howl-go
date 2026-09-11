@@ -275,11 +275,32 @@ function warmStyles(html) {
   }
 }
 
+// A fragment request can be redirected, and the entry says so rather than
+// pretending it is the page that was asked for:
+//
+//   { location }   leave for this URL as a whole document. The server sent
+//                  X-Howl-Location (app.Redirect), or fetch() followed a
+//                  redirect to something that is not one of our fragments.
+//   { url, html }  fetch() followed a redirect to another page; this is that
+//                  page, and it is shown under its own URL.
+//
+// Neither is cached. A redirect usually depends on who is asking — signed in,
+// signed out — and that is exactly what changes between a hover and a click.
+// Before this, a guard's 302 was followed silently and the sign-in page was
+// swapped in under /dashboard's URL; a reload then disagreed with the screen.
 function prefetch(url) {
   if (CACHE.has(url) || INFLIGHT.has(url)) return INFLIGHT.get(url);
   const p = fetch(url, { headers: { "X-Partial": "1" }, credentials: "same-origin" })
     .then(async (res) => {
       checkBuild(res);
+      const leave = res.headers.get("X-Howl-Location");
+      if (leave) return { location: leave };
+      if (res.redirected) {
+        const to = new URL(res.url, location.href);
+        const html = /^text\/html/i.test(res.headers.get("Content-Type") || "");
+        if (to.origin !== location.origin || !html) return { location: res.url };
+        return { url: to.pathname + to.search, html: await res.text(), title: headerTitle(res), at: performance.now() };
+      }
       const entry = { html: await res.text(), title: headerTitle(res), at: performance.now() };
       CACHE.set(url, entry);
       warmStyles(entry.html);
@@ -772,7 +793,8 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
         /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
       if (busy) {
         navLog && (navLog.textContent = `precached nav → ${url} · 0 RTT · revalidation deferred (input focused)`);
-      } else if (latest && seq === mine && location.pathname + location.search === url && latest.html !== hit.html) {
+      } else if (latest && !latest.location && !latest.url && seq === mine &&
+                 location.pathname + location.search === url && latest.html !== hit.html) {
         // Deliberately untransitioned: this is a background refresh of the page
         // the user is already looking at, and animating it would read as a
         // navigation they did not perform.
@@ -797,10 +819,18 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
     const entry = await prefetch(url);
     if (seq !== mine) return; // a newer navigation won the race
     if (!entry) throw new Error("fetch failed");
-    if (stale) throw new Error("build changed"); // this fragment came from a newer build
-    applyFragment(url, entry, push, restore, transition, replace);
+    if (entry.location) {
+      location.href = entry.location; // the server asked for a document load
+      return;
+    }
+    const landed = entry.url || url;
+    if (stale || isRawRoute(new URL(landed, location.origin).pathname)) {
+      location.href = landed; // a newer build, or redirected to a page that is its own document
+      return;
+    }
+    applyFragment(landed, entry, push, restore, transition, replace);
     navLog && (navLog.textContent =
-      `cold nav → ${url} · fragment ${entry.html.length} B · ${Math.round(performance.now() - t0)} ms (paid the RTT)`);
+      `cold nav → ${landed} · fragment ${entry.html.length} B · ${Math.round(performance.now() - t0)} ms (paid the RTT)`);
   } catch {
     location.href = url; // any failure degrades to a normal page load
   } finally {

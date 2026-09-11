@@ -162,7 +162,8 @@ func decodeError(res response) error {
 }
 
 // EncodeQuery is the inverse of decodeQuery: a query struct back into URL
-// values, using the same `query:"name"` tags. Zero values are omitted, so an
+// values, using the same `query:"name"` tags, and leaving `path:"name"` fields
+// out. Zero values are omitted, so an
 // unset filter does not become `?service=`.
 func EncodeQuery(v any) (url.Values, error) {
 	values := url.Values{}
@@ -186,7 +187,10 @@ func EncodeQuery(v any) (url.Values, error) {
 			continue
 		}
 		name := field.Tag.Get("query")
-		if name == "-" {
+		// A path field travels in the URL's path, as the generated method's
+		// own argument; sending it again as ?id= would be a parameter the
+		// server never reads.
+		if name == "-" || field.Tag.Get("path") != "" {
 			continue
 		}
 		if name == "" {

@@ -91,4 +91,13 @@ templ Page() { … }
 
 The browser fetches it before rendering that route and hands the body to the renderer, so a renderer may decode a different type per route. A route that declares none falls back to `Config.ClientData`. Endpoints are fetched once and cached, so several routes naming the same URL cost one request.
 
+## Caching a public page
+
+```go
+//howl:cache 30s
+templ Page() { … }
+```
+
+The server reuses the rendered response for that long, for visitors who send no cookie and no `Authorization` — see [the HTTP layer](/docs/http). A value `time.ParseDuration` does not accept fails `fsroutes`, not the running server.
+
 Directives attach to the file, not to a Go symbol, which is why several routes can share a package.

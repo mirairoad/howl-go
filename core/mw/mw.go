@@ -21,6 +21,7 @@ package mw
 
 import (
 	"net/http"
+	"strings"
 )
 
 // Middleware decorates a handler. The zero-dependency shape on purpose.
@@ -37,6 +38,63 @@ func Chain(h http.Handler, ms ...Middleware) http.Handler {
 		h = ms[i](h)
 	}
 	return h
+}
+
+// Only applies ms to requests under prefix and lets every other request skip
+// them — a guard for /admin, a stricter CSP for /embed. Matched a whole segment
+// at a time: /admin covers /admin and /admin/users, never /administrator.
+//
+// A function rather than a Config.UseFor map because it composes where the
+// chain is written, keeps its place in the order, and is a Middleware like any
+// other, so it nests and works outside howl-go.
+//
+//	Use: []mw.Middleware{
+//	    mw.RequestID,
+//	    mw.Only("/admin", requireAdmin),
+//	}
+func Only(prefix string, ms ...Middleware) Middleware {
+	return func(next http.Handler) http.Handler {
+		inner := Chain(next, ms...)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if Under(r.URL.Path, prefix) {
+				inner.ServeHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// Except applies ms to every request not under prefix: CSRF for the pages and
+// their forms, but not for a JSON API that authenticates with a bearer token.
+//
+//	mw.Except("/api", mw.CSRF{Secure: true}.Handler)
+func Except(prefix string, ms ...Middleware) Middleware {
+	return func(next http.Handler) http.Handler {
+		inner := Chain(next, ms...)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if Under(r.URL.Path, prefix) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			inner.ServeHTTP(w, r)
+		})
+	}
+}
+
+// Under reports whether path is prefix or below it, a whole segment at a time.
+// A plain strings.HasPrefix would put /administrator under /admin, and a guard
+// written with it protects a page it was never meant to — or, used to exempt
+// a path, exempts one it was never meant to.
+func Under(path, prefix string) bool {
+	prefix = strings.TrimSuffix(prefix, "/")
+	if prefix == "" {
+		return true
+	}
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	return len(path) == len(prefix) || path[len(prefix)] == '/'
 }
 
 // Writer records what a handler did to the response so middleware above it can

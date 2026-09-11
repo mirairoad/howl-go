@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,12 +70,25 @@ func Document(info Info, routes []Route) map[string]any {
 		if body := requestBody(rt, schemas); body != nil {
 			op["requestBody"] = body
 		}
+		description := rt.Description
 		if len(rt.Roles) > 0 {
 			// The scheme is nominal: howl-go does not know how an application
 			// authenticates, only that this endpoint asked for roles. Saying
 			// which ones is more useful than pretending to know the mechanism.
 			op["security"] = []any{map[string]any{"roles": rt.Roles}}
-			op["description"] = "Requires: " + strings.Join(rt.Roles, ", ")
+			if description != "" {
+				description += "\n\n"
+			}
+			description += "Requires: " + strings.Join(rt.Roles, ", ")
+		}
+		if rt.Cache.TTL > 0 {
+			if description != "" {
+				description += "\n\n"
+			}
+			description += "Cached for " + rt.Cache.TTL.String() + " per caller."
+		}
+		if description != "" {
+			op["description"] = description
 		}
 		item[strings.ToLower(rt.Method)] = op
 	}
@@ -171,23 +185,45 @@ func usesRoles(routes []Route) bool {
 // parameters covers both halves of the input that is not a body: the
 // {placeholders} in the path, and the query struct's tagged fields.
 func parameters(rt Route) []any {
-	var out []any
-	for _, seg := range strings.Split(rt.Path, "/") {
-		if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
-			out = append(out, map[string]any{
-				"name": seg[1 : len(seg)-1], "in": "path", "required": true,
-				"schema": map[string]any{"type": "string"},
-			})
+	t := rt.schema.query
+	hasFields := t != nil && t.Kind() == reflect.Struct && !isNone(t)
+
+	// A path field types its placeholder: `ID int64 path:"id"` documents
+	// {id} as an integer rather than the string every placeholder would
+	// otherwise have to be.
+	typed := map[string]reflect.StructField{}
+	if hasFields {
+		for i := range t.NumField() {
+			if name := t.Field(i).Tag.Get("path"); name != "" && t.Field(i).IsExported() {
+				typed[name] = t.Field(i)
+			}
 		}
 	}
 
-	t := rt.schema.query
-	if t == nil || t.Kind() != reflect.Struct || isNone(t) {
+	var out []any
+	for _, seg := range strings.Split(rt.Path, "/") {
+		if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
+			name := seg[1 : len(seg)-1]
+			param := map[string]any{
+				"name": name, "in": "path", "required": true,
+				"schema": map[string]any{"type": "string"},
+			}
+			if field, ok := typed[name]; ok {
+				param["schema"] = schemaFor(field.Type, nil)
+				if doc := field.Tag.Get("doc"); doc != "" {
+					param["description"] = doc
+				}
+			}
+			out = append(out, param)
+		}
+	}
+
+	if !hasFields {
 		return out
 	}
 	for i := range t.NumField() {
 		field := t.Field(i)
-		if !field.IsExported() {
+		if !field.IsExported() || field.Tag.Get("path") != "" {
 			continue
 		}
 		name := field.Tag.Get("query")
@@ -219,14 +255,16 @@ func requestBody(rt Route, schemas map[string]any) any {
 
 func responses(rt Route, schemas map[string]any) map[string]any {
 	t := rt.schema.response
+	var out map[string]any
 	if t == nil || isNone(t) {
-		return map[string]any{"204": map[string]any{"description": "No content"}}
-	}
-	out := map[string]any{
-		"200": map[string]any{
-			"description": "OK",
-			"content":     map[string]any{"application/json": map[string]any{"schema": schemaFor(t, schemas)}},
-		},
+		out = map[string]any{"204": map[string]any{"description": "No content"}}
+	} else {
+		out = map[string]any{
+			"200": map[string]any{
+				"description": "OK",
+				"content":     map[string]any{"application/json": map[string]any{"schema": schemaFor(t, schemas)}},
+			},
+		}
 	}
 	// Every endpoint can fail the same way, and a caller generating from this
 	// document should know the shape it will get when one does.
@@ -238,11 +276,27 @@ func responses(rt Route, schemas map[string]any) map[string]any {
 			"correlation_id": map[string]any{"type": "string"},
 		},
 	}
-	out["400"] = map[string]any{"description": "Invalid input",
-		"content": map[string]any{"application/json": map[string]any{"schema": errorSchema}}}
-	if len(rt.Roles) > 0 {
-		out["401"] = map[string]any{"description": "Unauthorized",
+	failure := func(description string) map[string]any {
+		return map[string]any{"description": description,
 			"content": map[string]any{"application/json": map[string]any{"schema": errorSchema}}}
+	}
+	out["400"] = failure("Invalid input")
+	if len(rt.Roles) > 0 {
+		out["401"] = failure("Unauthorized")
+		// Authorize answers 403 for a caller who is signed in without the
+		// role, which is the more common of the two for a real client.
+		out["403"] = failure("Forbidden")
+	}
+	for _, code := range rt.Errors {
+		key := strconv.Itoa(code)
+		if _, derived := out[key]; derived {
+			continue
+		}
+		text := http.StatusText(code)
+		if text == "" {
+			text = "Error"
+		}
+		out[key] = failure(text)
 	}
 	return out
 }

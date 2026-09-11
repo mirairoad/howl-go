@@ -46,13 +46,18 @@ func decodeBody[B any](r *http.Request, dst *B) error {
 	return nil
 }
 
-// decodeQuery fills dst from the URL query string, using `query:"name"` tags
-// and falling back to the lowercased field name.
+// decodeQuery fills dst from the request: `path:"name"` fields from the path's
+// {placeholders}, everything else from the query string, using `query:"name"`
+// tags and falling back to the lowercased field name.
 //
 // Supported: string, bool, the int and uint widths, float32/64, time.Time
 // (RFC3339), and pointers to any of those for "was it supplied at all". A
 // field of any other type is a programming error and says so at startup rather
 // than silently staying zero.
+//
+// A path field is the typed form of r.Param — howl (TS)'s `params` schema. An
+// ID int64 tagged `path:"id"` that is not a number answers 400 naming the
+// field before the handler runs, and a Validate on the query type sees it.
 func decodeQuery[Q any](r *http.Request, dst *Q) error {
 	if _, none := any(*dst).(None); none {
 		return nil
@@ -69,19 +74,44 @@ func decodeQuery[Q any](r *http.Request, dst *Q) error {
 		if !field.IsExported() {
 			continue
 		}
-		name := field.Tag.Get("query")
-		if name == "-" {
-			continue
+		name, raw := "", ""
+		if param := field.Tag.Get("path"); param != "" {
+			name, raw = param, r.PathValue(param)
+		} else {
+			name = field.Tag.Get("query")
+			if name == "-" {
+				continue
+			}
+			if name == "" {
+				name = strings.ToLower(field.Name)
+			}
+			raw = strings.TrimSpace(values.Get(name))
 		}
-		if name == "" {
-			name = strings.ToLower(field.Name)
-		}
-		raw := strings.TrimSpace(values.Get(name))
 		if raw == "" {
 			continue
 		}
 		if err := setField(v.Field(i), raw); err != nil {
 			return Invalid(name, err.Error())
+		}
+	}
+	return nil
+}
+
+// checkPathFields refuses a `path:"name"` tag that names no {placeholder} in
+// the route's path. It would otherwise stay zero on every request — the typo
+// that turns "load order 42" into "load order 0" — so it fails at Register.
+func checkPathFields(rt Route) error {
+	t := rt.schema.query
+	if t == nil || t.Kind() != reflect.Struct || isNone(t) {
+		return nil
+	}
+	for i := range t.NumField() {
+		param := t.Field(i).Tag.Get("path")
+		if param == "" {
+			continue
+		}
+		if !strings.Contains(rt.Path, "{"+param+"}") {
+			return fmt.Errorf("field %s is tagged path:%q but %s has no {%s}", t.Field(i).Name, param, rt.Path, param)
 		}
 	}
 	return nil

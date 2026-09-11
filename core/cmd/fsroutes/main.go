@@ -34,7 +34,8 @@
 // legal in both, which is why they carry the convention here.
 //
 // A `//howl:route` directive overrides the derived pattern outright when the
-// filesystem cannot express what you need.
+// filesystem cannot express what you need, and `//howl:cache 30s` lets the
+// server reuse the page's rendered response for anonymous visitors.
 //
 // Two reserved names may sit alongside the page component in the same file:
 //
@@ -65,6 +66,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // directive returns the single capture of a //howl: comment, or "".
@@ -82,13 +84,14 @@ type route struct {
 	Mount     bool
 	Unmount   bool
 	Client    bool
-	Data      string // //howl:data — this route's own client-data endpoint
-	Bare      bool   // no layout chain
-	Raw       bool   // no layout chain, no document shell
-	File      string // relative to pagesDir, for logging
-	Dir       string // directory relative to pagesDir; "" for root
-	Component string // the templ func declared in that file
-	Alias     string // import alias; "" when it lives in the root package
+	Data      string        // //howl:data — this route's own client-data endpoint
+	Cache     time.Duration // //howl:cache — reuse the rendered response
+	Bare      bool          // no layout chain
+	Raw       bool          // no layout chain, no document shell
+	File      string        // relative to pagesDir, for logging
+	Dir       string        // directory relative to pagesDir; "" for root
+	Component string        // the templ func declared in that file
+	Alias     string        // import alias; "" when it lives in the root package
 	Import    string
 	Layouts   []string
 }
@@ -107,6 +110,10 @@ var (
 	// route shares one payload, which is only workable while they all want the
 	// same thing.
 	dataRe = regexp.MustCompile(`(?m)^//howl:data\s+(\S+)\s*$`)
+	// A page whose rendered response may be reused, for this long. Parsed
+	// here rather than at startup so "30 s" is a build error, not a panic in
+	// production.
+	cacheRe = regexp.MustCompile(`(?m)^//howl:cache\s+(\S+)\s*$`)
 )
 
 const (
@@ -221,6 +228,13 @@ func crawl(pagesDir, modulePath string) ([]route, string, error) {
 		if m := routeRe.FindSubmatch(src); m != nil {
 			pat = string(m[1]) // explicit override
 		}
+		var ttl time.Duration
+		if raw := directive(cacheRe, src); raw != "" {
+			ttl, err = time.ParseDuration(raw)
+			if err != nil || ttl <= 0 {
+				return fmt.Errorf("%s: //howl:cache %q is not a positive duration like 30s or 5m", path, raw)
+			}
+		}
 		r := route{
 			Pattern:   pat,
 			Label:     label(rel, stem),
@@ -229,6 +243,7 @@ func crawl(pagesDir, modulePath string) ([]route, string, error) {
 			Unmount:   unmountRe.Match(src),
 			Client:    mods["client"],
 			Data:      directive(dataRe, src),
+			Cache:     ttl,
 			Bare:      mods["bare"] || mods["raw"],
 			Raw:       mods["raw"],
 			File:      relFile,
@@ -426,6 +441,11 @@ func render(routes []route, rootPkg, pagesDir, routerPkg string) ([]byte, error)
 		data := ""
 		if r.Data != "" {
 			data = fmt.Sprintf(", Data: %q", r.Data)
+		}
+		if r.Cache > 0 {
+			// Nanoseconds, so the table needs no time import; the comment is
+			// for whoever reads the generated file.
+			data += fmt.Sprintf(", Cache: %d /* %s */", int64(r.Cache), r.Cache)
 		}
 		fmt.Fprintf(&b, "\t\t{Pattern: %q, Label: %q, Page: %s, Head: %s, Mount: %s, Unmount: %s, Layouts: %s, Client: %t, Raw: %t%s},\n",
 			r.Pattern, r.Label, page, qual("Head", r.Head), qual("Mount", r.Mount),
