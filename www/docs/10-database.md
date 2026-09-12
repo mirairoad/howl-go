@@ -182,9 +182,17 @@ var Get = api.Define(api.Spec[api.None, api.None, users.User]{
 
 Off by default. `db.Cache{TTL: …}` turns on an in-process LRU, which is correct for one process and wrong the moment there are two — invalidation is per-process, so a second replica keeps serving its own copy. Supply a shared adapter for anything replicated. `db.CacheAdapter` is `cache.Store` from `core/cache`, the same interface endpoint and page caching use, so one adapter serves all three.
 
-Keys are `<prefix>:<collection>:v<version>:get|find:…`. Invalidation moves the version, which makes every key built before it unreachable at once — no pattern scan, no key enumeration. Nothing is deleted; the LRU reclaims the orphans in its own time.
+`Get`, `GetMany`, `Find`, `One` and `Count` read it. `SkipGet` and `SkipFind` exclude one shape of read; a count is a find that returns a number, so `SkipFind` covers it too. A burst on a key that is not there costs one query rather than one per caller — the first caller queries and the rest wait on its result (20 concurrent `Get`s on a cold key, one query: `TestConcurrentMissesShareOneQuery`).
 
-Two things are never cached: anything carrying `db.Session(tx)`, because an uncommitted read must not be published and a write that may roll back must not evict; and a projected document under its by-id key, because half a document must not be served to a later `Get`.
+Keys are `<prefix>:<collection>:v<shared>.<local>:get|find|count:…`. Invalidation moves a version, which makes every key built before it unreachable at once — no pattern scan, no key enumeration. Nothing is deleted; the LRU reclaims the orphans in its own time. `<local>` is this process's counter; `<shared>` is the one an adapter implementing `db.Versioner` keeps for every process. Both are always present, because they number differently — a key that quietly swapped one for the other would read whatever an earlier window left at the same number.
+
+Two services over one collection — the same table through two document types — need a `Versioner` if they share an adapter, for the reason two replicas do: each service owns its local counter, so a write through one leaves the other's entries reachable. A `Version` that returns an error is not fatal, and not guessed around: that read runs uncached and `CacheStats().Bypassed` counts it. A `Bump` that fails is logged at warn level, and is the one failure this design cannot paper over — the write has happened, and every other replica serves stale documents until the TTL runs out.
+
+`MaxSize` caps the number of entries (default 1000) and `MaxEntryBytes` caps one of them (default 8 MiB, the same ceiling `mw.Cache` puts on a response). An oversize result is still returned, just not stored: without the second cap, one `Find` with no `Limit` on a table that grew is one entry holding a table.
+
+`CacheStats()` reports hits, misses, bypassed and too-large since the service was built. A document read has no `X-Howl-Cache` header to carry a hit the way `mw.Cache` does, so it is the only way to tell a cache that is working from one that never answers.
+
+Never cached: anything carrying `db.Session(tx)`, because an uncommitted read must not be published and a write that may roll back must not evict; a projected document under its by-id key, because half a document must not be served to a later `Get`; and a `Get` passed `db.Deleted()` — where a `Find` with `Deleted: true` *is* cached, the flag being part of the query digest.
 
 ## Testing
 
@@ -194,7 +202,7 @@ Two things are never cached: anything carrying `db.Session(tx)`, because an unco
 users, _ := memdb.NewService[User](db.Options{Collection: "users"})
 ```
 
-Both backends run the same suite in `db/conformance` — 24 cases, over 100 assertions. A contract described in prose drifts, because the first implementation defines what the words meant and the second implements what it read. The live Postgres run lives in `db/pg/livetest`, its own module so the driver it needs stays out of the framework's `go.mod`:
+Both backends run the same suite in `db/conformance` — 25 cases, over 100 assertions. A contract described in prose drifts, because the first implementation defines what the words meant and the second implements what it read. `memdb` runs it three times: uncached, on the in-process counter, and over an adapter that carries the version itself. Every case passes uncached first, so a failure in the other two is an invalidation bug and nothing else — the only way to catch one, since a stale read looks exactly like a correct one until something else changes. The live Postgres run lives in `db/pg/livetest`, its own module so the driver it needs stays out of the framework's `go.mod`:
 
 ```sh
 docker run -d --name howl-conf-pg -p 54329:5432 \
