@@ -1,0 +1,58 @@
+# What `make` and `make test` do locally, on every push — including the two
+# drifts that fail silently: a generated file nobody regenerated, and llms.txt
+# forking from the copy `howl mcp` embeds (it has happened; see DESIGN-LOG.md).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make all
+
+      - name: test
+        run: go test -race ./core/... ./db/...
+
+      - name: vet
+        run: go vet ./core/... ./db/...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go' | grep -v '_templ\.go$'))
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+
+      - name: conventions
+        run: go run ./core/cmd/howl check
+
+      # `make all` regenerates the route tables, the templ output, the docs
+      # pages and both copies of llms.txt. Anything different from what was
+      # committed is a checked-in artifact that was edited by hand or never
+      # regenerated — except the binaries and the wasm, which are outputs and
+      # differ by build.
+      - name: generated files are current
+        run: |
+          git diff --exit-code -- . \
+            ':!examples/toy_app/toy_app' ':!examples/hello/hello' ':!www/www' \
+            ':!**/*.wasm'
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # app.js in jsdom: the morph, the client router, the build-drift reload.
+      # Node is a dependency of this directory only, never of the framework.
+      - run: make test-browser

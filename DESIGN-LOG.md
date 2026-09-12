@@ -1516,6 +1516,85 @@ deleted `howl package` and the menu bar from what agents are told. The embedded
 copy was the newer one and became the root again before anything else was
 written to it.
 
+## The document cache, audited
+
+`db.Cache` had the shape right — an LRU behind a `cache.Store`, version-prefixed
+keys, invalidation on every write, and the conformance suite run a second time
+with it on so a stale read fails a test. Reading it against what the reads
+actually do turned up six gaps. None of them were wrong answers; each was a cost
+or a silence.
+
+### Count was the only read that never asked
+
+`Get` and `Find` consulted the cache; `Count` went to the backend on every call.
+A paginated list is a `Find` and a `Count`, so the page with the cached rows
+still paid for a query — for the one number on it that changes least. It is now
+cached under its own `count:` kind, gated by `SkipFind` (a count is a find that
+returns a number), with `Limit`, `Skip`, `Sort` and `Project` left out of the
+digest: they do not change a count, so page 4's total is page 1's entry. The
+conformance suite's `Count` case creates three documents and then counts, which
+means the two cached runs were already checking that a write retires it.
+
+### A cache that did not protect the thing it exists for
+
+The cache stopped repeat reads and did nothing about the burst that fills a cold
+key: 20 concurrent `Get`s on a key that had just been evicted were 20 identical
+queries, all of them writing the same entry. `db/flight.go` is 72 lines of
+single-flight, half of them explaining the ownership — the leader queries under its own deadline, everyone who arrives
+while it runs waits on the result, and a follower whose own context ends first
+answers with that rather than cancelling the leader, whose result the next reader
+still wants cached. `TestConcurrentMissesShareOneQuery` is 20 readers and one
+query; it reports 20 when the flight is taken out.
+
+Only cached services coalesce. A caller who asked for no cache did not ask to be
+queued behind another caller's deadline, which is what sharing a query is.
+
+### MaxSize counted entries, and an entry could be a table
+
+`mw.Cache` caps a stored response at 8 MiB. The document cache capped the number
+of entries and not their size, so one `Find` with no `Limit` on a table that grew
+was one entry holding a table — and 999 more slots to do it again.
+`MaxEntryBytes` defaults to the same 8 MiB. An oversize result is still returned;
+a cap that dropped the answer would be a correctness bug, where a cap that drops
+the entry is a slower next read.
+
+### The version that was two different numbers
+
+A failed `Version` read fell back to the in-process counter. Those number
+differently — a shared version counts every replica's writes, a local one counts
+this process's — so a read during an adapter outage built a key at, say, `v0` and
+found whatever an *earlier* outage had left there. Both counters are now always
+in the key (`v<shared>.<local>`), and an unreadable shared version means the read
+runs uncached rather than guessing: `CacheStats().Bypassed` counts it, logged at
+debug, because a warn per cached read is one line per query for as long as the
+adapter is down. A failed `Bump` stays a warn — the write has happened, and the
+local counter only fixes this replica.
+
+### Nothing implemented Versioner, so nothing tested it
+
+`db.Versioner` was the documented answer for replicas and the tree contained no
+implementation, which means the read side, the write side and the failure path
+had never run. The test double is 32 lines (`db/memdb/cache_test.go`), and the
+conformance suite now runs a third time over it: 25 cases, uncached, then on the
+local counter, then on a shared version. It also pinned the hazard that was only
+ever a code comment — two services over one collection sharing a plain adapter
+serve each other stale documents, because each owns its local counter. The test
+asserts the stale read, so the limit stays deliberate.
+
+A `Store`-backed versioner looked shippable and is not: `cache.Store.Set` takes a
+TTL and the LRU treats `0` as already expired, so a counter kept in the store it
+guards can be evicted, reset to a lower number, and make a whole window of
+retired entries reachable again. A version counter needs storage the cache
+cannot drop.
+
+### No way to tell a working cache from a silent one
+
+`mw.Cache` says `X-Howl-Cache: hit`. A document read has no response to put that
+on, so a TTL shorter than the gap between reads, or a write on every request,
+looked exactly like a cache doing its job. `CacheStats()` is four counters —
+hits, misses, bypassed, too-large — each one a decision the cache makes and
+nothing else could reveal.
+
 ## 17. Open questions
 
 - **TinyGo** — would it bring 1.71 MB gzipped down to the 200–800 KB range, and

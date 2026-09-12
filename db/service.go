@@ -38,6 +38,9 @@ type Options struct {
 const (
 	defaultTimeout  = 30 * time.Second
 	bulkTimeoutMult = 10
+	// The largest single cached result, when [Cache.MaxEntryBytes] does not
+	// say. The same 8 MiB mw.Cache allows a response.
+	defaultMaxEntryBytes = 8 << 20
 	// A patch reads, then writes under an optimistic lock. Two attempts
 	// absorb the ordinary case of one concurrent writer; past that, retrying
 	// is just a slower way to lose to sustained contention on the same
@@ -59,10 +62,13 @@ type Service[T any, PT Document[T]] struct {
 
 	cache     CacheAdapter
 	ttl       time.Duration
+	maxEntry  int
 	cacheGet  bool
 	cacheFind bool
 	versioner Versioner
 	local     atomic.Int64
+	stats     counters
+	flight    flight
 }
 
 // NewService wires a backend into the contract. Backends call it; an
@@ -82,6 +88,7 @@ func NewService[T any, PT Document[T]](backend Backend, o Options) (*Service[T, 
 
 	if o.Cache.TTL > 0 {
 		s.ttl = o.Cache.TTL
+		s.maxEntry = cmp.Or(o.Cache.MaxEntryBytes, defaultMaxEntryBytes)
 		s.cacheGet = !o.Cache.SkipGet
 		s.cacheFind = !o.Cache.SkipFind
 		s.cache = o.Cache.Adapter
@@ -124,24 +131,38 @@ func (s *Service[T, PT]) Get(ctx context.Context, id string, options ...Option) 
 	defer cancel()
 	defer s.trace(time.Now(), "get", "id", id)
 
-	key := ""
-	if s.caches(o.session) && s.cacheGet && !o.deleted {
-		key = s.key(ctx, "get", id)
-		if raw, hit := s.cache.Get(ctx, key); hit {
-			return decode[T, PT](raw)
-		}
-	}
-
 	where := M{IDPath: id}
 	if !o.deleted {
 		where = active(where)
 	}
-	raw, err := s.backend.FindOne(ctx, where, OpOptions{Session: o.session})
+	read := func(ctx context.Context) (json.RawMessage, error) {
+		return s.backend.FindOne(ctx, where, OpOptions{Session: o.session})
+	}
+
+	key := ""
+	if s.caches(o.session) && s.cacheGet && !o.deleted {
+		key = s.key(ctx, "get", id)
+	}
+	if key == "" {
+		raw, err := read(ctx)
+		if err != nil {
+			return zero, err
+		}
+		return decode[T, PT](raw)
+	}
+	if raw, hit := s.hit(ctx, key); hit {
+		return decode[T, PT](raw)
+	}
+	raw, err := share(&s.flight, ctx, key, func(ctx context.Context) (json.RawMessage, error) {
+		raw, err := read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		s.store(ctx, key, raw)
+		return raw, nil
+	})
 	if err != nil {
 		return zero, err
-	}
-	if key != "" {
-		s.cache.Set(ctx, key, raw, s.ttl)
 	}
 	return decode[T, PT](raw)
 }
@@ -159,14 +180,20 @@ func (s *Service[T, PT]) GetMany(ctx context.Context, ids []string, options ...O
 	defer cancel()
 	defer s.trace(time.Now(), "get_many", "ids", len(ids))
 
-	cached := s.caches(o.session) && s.cacheGet && !o.deleted
+	// The version is read once for the whole batch. s.key per id reads it per
+	// id, which is one network round trip per id the moment the versioner is
+	// not in this process.
+	space := ""
+	if s.caches(o.session) && s.cacheGet && !o.deleted {
+		space, _ = s.keyspace(ctx)
+	}
 	misses := make([]string, 0, len(ids))
 	for _, id := range ids {
 		if _, seen := out[id]; seen || id == "" {
 			continue
 		}
-		if cached {
-			if raw, hit := s.cache.Get(ctx, s.key(ctx, "get", id)); hit {
+		if space != "" {
+			if raw, hit := s.hit(ctx, space+"get:"+id); hit {
 				doc, err := decode[T, PT](raw)
 				if err != nil {
 					return nil, err
@@ -196,8 +223,8 @@ func (s *Service[T, PT]) GetMany(ctx context.Context, ids []string, options ...O
 		}
 		id := PT(&doc).envelope().ID
 		out[id] = doc
-		if cached {
-			s.cache.Set(ctx, s.key(ctx, "get", id), raw, s.ttl)
+		if space != "" {
+			s.store(ctx, space+"get:"+id, raw)
 		}
 	}
 	return out, nil
@@ -211,33 +238,56 @@ func (s *Service[T, PT]) Find(ctx context.Context, q Query) ([]T, error) {
 	defer cancel()
 	defer s.trace(time.Now(), "find", "collection", s.name)
 
+	read := func(ctx context.Context) ([]json.RawMessage, error) {
+		rows, err := s.backend.FindMany(ctx, q.filter(), q.findOptions())
+		if err != nil {
+			return nil, err
+		}
+		if len(q.Project) > 0 {
+			for i, raw := range rows {
+				rows[i] = prune(raw, q.Project)
+			}
+		}
+		return rows, nil
+	}
+
 	key := ""
 	if s.caches(q.Session) && s.cacheFind {
 		key = s.key(ctx, "find", queryDigest(q))
-		if raw, hit := s.cache.Get(ctx, key); hit {
-			var rows []json.RawMessage
-			if json.Unmarshal(raw, &rows) == nil {
-				return decodeAll[T, PT](rows)
-			}
-		}
 	}
-
-	rows, err := s.backend.FindMany(ctx, q.filter(), q.findOptions())
+	if key == "" {
+		rows, err := read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return decodeAll[T, PT](rows)
+	}
+	if blob, hit := s.hit(ctx, key); hit {
+		var rows []json.RawMessage
+		if json.Unmarshal(blob, &rows) == nil {
+			return decodeAll[T, PT](rows)
+		}
+		// An entry that will not decode is worse than no entry: it would be
+		// re-read, and fail, until its TTL ran out. Drop it and query.
+		s.cache.Del(ctx, key)
+		s.stats.hits.Add(-1)
+		s.stats.misses.Add(1)
+	}
+	rows, err := share(&s.flight, ctx, key, func(ctx context.Context) ([]json.RawMessage, error) {
+		rows, err := read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// The result set is cached under a key that includes the projection,
+		// but a projected document is never written to its by-id key: half a
+		// document must not be served to a later Get.
+		if blob, err := json.Marshal(rows); err == nil {
+			s.store(ctx, key, blob)
+		}
+		return rows, nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	if len(q.Project) > 0 {
-		for i, raw := range rows {
-			rows[i] = prune(raw, q.Project)
-		}
-	}
-	// The result set is cached under a key that includes the projection, but a
-	// projected document is never written to its by-id key: half a document
-	// must not be served to a later Get.
-	if key != "" {
-		if blob, err := json.Marshal(rows); err == nil {
-			s.cache.Set(ctx, key, blob, s.ttl)
-		}
 	}
 	return decodeAll[T, PT](rows)
 }
@@ -259,11 +309,48 @@ func (s *Service[T, PT]) One(ctx context.Context, q Query) (T, error) {
 
 // Count returns how many documents match. Limit, Skip, Sort and Project are
 // ignored.
+//
+// It is cached on the same terms as [Service.Find] — a count is a find that
+// returns a number, and a total next to a cached first page that is not itself
+// cached is a query per request for the one value on the page that changes
+// least.
 func (s *Service[T, PT]) Count(ctx context.Context, q Query) (int64, error) {
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
 	defer s.trace(time.Now(), "count", "collection", s.name)
-	return s.backend.Count(ctx, q.filter(), q.opOptions())
+
+	read := func(ctx context.Context) (int64, error) {
+		return s.backend.Count(ctx, q.filter(), q.opOptions())
+	}
+
+	key := ""
+	if s.caches(q.Session) && s.cacheFind {
+		// Limit, Skip, Sort and Project do not change a count, so they are not
+		// in its key: two counts differing only in the page they belong to
+		// share one entry.
+		key = s.key(ctx, "count", queryDigest(Query{Where: q.Where, Deleted: q.Deleted}))
+	}
+	if key == "" {
+		return read(ctx)
+	}
+	if raw, hit := s.hit(ctx, key); hit {
+		if n, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+			return n, nil
+		}
+		// As in Find: an entry that will not parse would fail every read until
+		// its TTL ran out.
+		s.cache.Del(ctx, key)
+		s.stats.hits.Add(-1)
+		s.stats.misses.Add(1)
+	}
+	return share(&s.flight, ctx, key, func(ctx context.Context) (int64, error) {
+		n, err := read(ctx)
+		if err != nil {
+			return 0, err
+		}
+		s.store(ctx, key, strconv.AppendInt(nil, n, 10))
+		return n, nil
+	})
 }
 
 // ============================================================
@@ -639,23 +726,77 @@ func (s *Service[T, PT]) trace(start time.Time, op string, args ...any) {
 // visible to anyone else yet, and its writes may still roll back.
 func (s *Service[T, PT]) caches(session any) bool { return s.cache != nil && session == nil }
 
-// key builds <prefix>:<collection>:v<version>:<kind>:<suffix>. The version is
-// what makes invalidation O(1): bumping it makes every key built before it
+// key builds <keyspace><kind>:<suffix>, or "" when the cache cannot be used
+// for this read. Bumping a version makes every key built before it
 // unreachable, with no pattern scan and no key enumeration.
 func (s *Service[T, PT]) key(ctx context.Context, kind, suffix string) string {
-	return s.backend.Prefix() + ":" + s.name + ":v" + strconv.FormatInt(s.version(ctx), 10) + ":" + kind + ":" + suffix
+	space, ok := s.keyspace(ctx)
+	if !ok {
+		return ""
+	}
+	return space + kind + ":" + suffix
 }
 
-func (s *Service[T, PT]) version(ctx context.Context) int64 {
+// keyspace is <prefix>:<collection>:v<shared>.<local>: — the part of a key
+// every entry for this collection shares, and the reason invalidation is O(1).
+// Callers that build more than one key hold it rather than calling [key] per
+// key: with an adapter [Versioner] the shared half costs a round trip.
+//
+// Both counters are always present, rather than one standing in for the other
+// when a version read fails. They number differently — a shared version is
+// every replica's writes, a local one is this process's — so a key that
+// silently switched from one to the other would read the entries of whichever
+// earlier window happened to land on the same number.
+//
+// ok is false when the shared version could not be read. The read then runs
+// uncached: a key built on a guessed version is a key pointing at somebody
+// else's documents.
+func (s *Service[T, PT]) keyspace(ctx context.Context) (string, bool) {
+	shared := int64(0)
 	if s.versioner != nil {
-		if v, err := s.versioner.Version(ctx, s.name); err == nil {
-			return v
+		v, err := s.versioner.Version(ctx, s.name)
+		if err != nil {
+			// Debug, not Warn: this is on the path of every cached read, so an
+			// adapter that is down would write one line per query. The count
+			// is in CacheStats().Bypassed, which is where an operator looks.
+			s.stats.bypassed.Add(1)
+			s.log.Debug("db cache version unreadable; serving uncached",
+				"collection", s.name, "error", err)
+			return "", false
 		}
-		// A version read that fails must not fail the operation: fall through
-		// to the local counter and take the miss.
+		shared = v
 	}
-	return s.local.Load()
+	return s.backend.Prefix() + ":" + s.name +
+		":v" + strconv.FormatInt(shared, 10) +
+		"." + strconv.FormatInt(s.local.Load(), 10) + ":", true
 }
+
+// hit reads an entry and counts what happened, because a document read has no
+// response header to say so the way mw.Cache does.
+func (s *Service[T, PT]) hit(ctx context.Context, key string) ([]byte, bool) {
+	raw, ok := s.cache.Get(ctx, key)
+	if ok {
+		s.stats.hits.Add(1)
+	} else {
+		s.stats.misses.Add(1)
+	}
+	return raw, ok
+}
+
+// store keeps a result unless it is too big to be worth a cache. The caller
+// has already been served either way: a cap that dropped the answer would be a
+// correctness bug, where a cap that drops the entry is only a slower next read.
+func (s *Service[T, PT]) store(ctx context.Context, key string, value []byte) {
+	if len(value) > s.maxEntry {
+		s.stats.tooLarge.Add(1)
+		return
+	}
+	s.cache.Set(ctx, key, value, s.ttl)
+}
+
+// CacheStats reports what the cache has done since this service was built. The
+// zero value comes back from a service with no cache configured.
+func (s *Service[T, PT]) CacheStats() CacheStats { return s.stats.snapshot() }
 
 // invalidate retires every cache key for this collection. Nothing is deleted:
 // the entries become unreachable the moment the version moves, and the LRU
@@ -668,6 +809,9 @@ func (s *Service[T, PT]) invalidate(ctx context.Context, session any) {
 		if _, err := s.versioner.Bump(ctx, s.name); err == nil {
 			return
 		}
+		// Warn, unlike a failed version read: the write has already happened,
+		// so every other replica is now serving documents it should not, and
+		// the local counter below fixes only this one.
 		s.log.Warn("db cache version bump failed; falling back to the local counter",
 			"collection", s.name)
 	}

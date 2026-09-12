@@ -1373,7 +1373,9 @@ snapshot serialised by the server into the page, restored in `Mount` without a f
 `Element.Render` (`howl.morph(el, html)` in `app.js`; keyed by `data-key` or `id`), the
 store's `Offline`/`Queued` and its ordered sender with backoff (an outage queues ops,
 never drops them), `api.Refused`, `core/cache` (`db.CacheAdapter` is now an alias of
-`cache.Store`), `api.Request.Header`/`SetCookie`, `api.Spec.Description`/`Errors`/`Cache`,
+`cache.Store`), `db.Cache.MaxEntryBytes` + `Service.CacheStats()` + a cached `Count` (and
+one query per cold key rather than one per caller), `api.Request.Header`/`SetCookie`,
+`api.Spec.Description`/`Errors`/`Cache`,
 `api.Config.Cache`/`Identity`, `path:"…"` query fields, `app.Redirect`/`IsPartial`/
 `StaticFiles`/`HeaderLocation`, `app.Config.Logger`/`Cache`/`RedirectTrailingSlash`, `//howl:cache` + `Route.Cache`,
 `mw.Cache`/`SecureHeaders`/`Proxy`/`Only`/`Except`/`Under`/`ClientIP`, and
