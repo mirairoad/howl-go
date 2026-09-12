@@ -34,6 +34,7 @@ The chain wraps everything — pages, static files, and any handler the applicat
 | `mw.CSP{…}` | Content-Security-Policy, with a per-request nonce |
 | `mw.Coalesce{}` | identical concurrent requests share one render |
 | `mw.Cache{…}` | keeps a GET's 200 response for a TTL — the store behind endpoint and page caching |
+| `mw.RateLimit{…}` | a token bucket per caller; past it, `429` with `Retry-After` — the counter behind `api.Spec.Limit` |
 | `mw.SecureHeaders{}` | `nosniff`, `Referrer-Policy`, `X-Frame-Options`, and HSTS when asked |
 | `mw.Proxy{…}` | forwards some paths to another server |
 | `mw.Only(prefix, …)`, `mw.Except(prefix, …)` | middleware for one part of the site |
@@ -96,6 +97,34 @@ It refuses to share four things, because sharing them would be a bug:
 - responses past `MaxBody` (8 MiB), where the waiters simply run the handler themselves.
 
 The key includes `X-Partial` by default: a fragment and a document share a URL but are not the same response.
+
+### RateLimit
+
+```go
+Use: []mw.Middleware{
+	mw.Only("/api", mw.RateLimit{Requests: 600, Window: time.Minute}.Handler),
+}
+```
+
+A token bucket per caller, not a window counter. A counter resets on a boundary, so "60 per minute" lets 120 requests through in the two seconds either side of it — the limit it advertises is not the limit it enforces. A bucket refills continuously: `Burst` is how many may arrive together, and it is never twice that.
+
+The default `Key` is the client's IP address, which is the right default because the traffic worth limiting comes from callers who have not signed in. Whatever you key on, it must not be something the caller picks freely: a key built from a query parameter or a path id is a limit with an opt-out. `Key` returning `""` lets a request past uncounted — a health check, an internal caller.
+
+`TrustProxy: true` reads the address from `X-Forwarded-For`, and is only safe behind a proxy that *overwrites* that header: anyone can send one, and a limit keyed by a value the caller chooses is not a limit. Leave it off behind a proxy and the opposite happens — every caller shares the proxy's address, so they share one bucket.
+
+Every response carries `X-RateLimit-Limit`, `-Remaining` and `-Reset` (an epoch second, as GitHub's is); a refusal adds `Retry-After` in whole seconds, rounded up and never `0`. Those headers are set before the handler runs, which is also what keeps them out of `mw.Cache` — it stores what the *handler* added.
+
+**Counting happens in this process unless you say otherwise.** Three replicas behind a load balancer then allow three times the rate, because each limits against the third of the traffic it sees. That is fine for keeping a scraper off one process and not fine for a sign-in form. `Store` takes anything implementing `mw.Limiter`:
+
+```go
+type Limiter interface {
+	Take(ctx context.Context, key string, rate mw.Rate) mw.Decision
+}
+```
+
+One method, and it both counts and decides, because a limiter split into "read the count" and "write the count" is a race between the two — and an atomic increment is the entire reason to put this in Redis. `mw.NewLimiter(max)` is the in-process one: `max` buckets, least-recently-seen evicted, 20000 by default, measured at 3.4 MB.
+
+Eviction prefers a bucket that is *not* currently refusing requests. Plain LRU would make "send requests under ten thousand invented keys" the way to clear the bucket that is throttling you; skipping the empty ones closes that, and when every candidate is empty the oldest goes anyway — which is the honest reason a shared `Store` exists.
 
 ### CSRF
 
@@ -278,6 +307,40 @@ howl (TS)'s `caching: { ttl }`, with its key: path, query, caller. `api.Config.I
 Responses say `X-Howl-Cache: hit` or `miss`, and a hit carries `Age`. There is no purge: a TTL is the whole contract, so cache what may be that stale. A read that must show the write that just happened belongs uncached, or in `db`'s document cache, which the write itself invalidates.
 
 `api.Config.Cache` is the store — `nil` is one in-process LRU for the table. It is a `cache.Store` (`core/cache`), the same interface as `db.Cache.Adapter` and `app.Config.Cache`, so one Redis adapter serves all three, and `cache.Try(redis, cache.NewLRU(1000), 150*time.Millisecond)` falls back to memory when Redis is slow or gone.
+
+### Limiting an endpoint
+
+```go
+var SignIn = api.Define(api.Spec[api.None, Credentials, Session]{
+	Name:  "Sign In",
+	Limit: api.Limit{Requests: 5, Window: time.Minute},
+	Handler: …,
+})
+```
+
+howl (TypeScript) had no equivalent, so every endpoint that needed a limit counted by hand in its own handler against its own column, and the ones that did not need one until the day they did had nothing.
+
+A bucket per caller **per endpoint**, so one endpoint's allowance is never spent by traffic to another. The caller is `api.Config.Identity(r)` when it names somebody and the client's IP address when it does not — and that fallback is the point rather than a detail. The endpoints worth limiting are sign-in, sign-up, password reset and anything that sends mail, where nobody is signed in yet; keying those by identity alone gives every anonymous request one shared bucket, and then a single attacker locks out every visitor at once. Set `Config.TrustProxy` if a proxy terminates TLS, and `api.Limit{By: …}` to count something else entirely — an API key, a tenant.
+
+| rule | why |
+|---|---|
+| keyed by the registered pattern, not the URL | `/orders/1` and `/orders/2` are one endpoint; a bucket per id is a limit the caller escapes by counting |
+| checked before `Authorize` | the password spray arrives with no session, and refusing it should not cost a session lookup and a query |
+| outside `Cache`, so a hit still spends a token | it is the request that costs bandwidth, not the handler |
+| the refusal is an ordinary endpoint error | same JSON envelope, same correlation id, and `OnError` sees it — so "somebody is being throttled" is something you can alert on |
+
+The response carries `Retry-After` and the `X-RateLimit-*` headers, and the document generated for the endpoint lists `429` with the rate in its description, so a generated client does not treat being throttled as an unknown failure. `api.Throttled(err)` is the client-side test — the one refusal where retrying later is correct rather than a bug.
+
+`api.Config.Limiter` is the counter, and `nil` is one in-process bucket map for the whole table: **per process**, so replicas each limit their own share. Hand in a shared `mw.Limiter` for anything replicated.
+
+For a limit the framework cannot know — a cooldown between two data exports, one invitation a day — return `api.TooManyRequests(…)` from the handler and set `Retry-After` with `r.Header()`:
+
+```go
+if next := last.Add(30 * 24 * time.Hour); time.Now().Before(next) {
+	r.Header().Set("Retry-After", strconv.Itoa(int(time.Until(next).Seconds())))
+	return Export{}, api.TooManyRequests("one export a month; the next is available " + next.Format(time.DateOnly))
+}
+```
 
 ### Caching a page
 

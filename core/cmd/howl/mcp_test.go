@@ -165,3 +165,57 @@ func FsClientRoutes() []router.Route {
 		t.Errorf("pricing = %+v, want cache 30s and no mount", pricing)
 	}
 }
+
+// howl_endpoints is how an agent learns what an endpoint declares before
+// editing it — a limit it cannot see is a limit it will write a second time.
+func TestEndpointsReadsWhatTheSpecDeclares(t *testing.T) {
+	root := t.TempDir()
+	api := `package apis
+
+var SignIn = api.Define(api.Spec[api.None, Credentials, Session]{
+	Name:        "Sign In",
+	Description: "Exchange credentials for a session cookie.",
+	Roles:       []string{"admin", "user"},
+	Cache:       api.Cache{TTL: 5 * time.Second},
+	Limit: api.Limit{
+		Requests: 5,
+		Window:   time.Minute,
+	},
+	Handler: func(r *api.Request[api.None, Credentials]) (Session, error) { return Session{}, nil },
+})
+`
+	gen := `package apis
+
+func FsApiRoutes() []api.Route {
+	return []api.Route{
+		api.At("POST", "/api/sign-in", SignIn),
+	}
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "sign-in.post.api.go"), []byte(api), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "apis_gen.go"), []byte(gen), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := json.Marshal(readEndpoints(root))
+	var got struct{ Endpoints []endpointInfo }
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Endpoints) != 1 {
+		t.Fatalf("read %d endpoints, want 1: %s", len(got.Endpoints), raw)
+	}
+	e := got.Endpoints[0]
+	if e.Method != "POST" || e.Path != "/api/sign-in" || e.Name != "Sign In" {
+		t.Errorf("endpoint = %+v", e)
+	}
+	// Written over two lines, reported on one.
+	if e.Limit != "Requests: 5, Window: time.Minute" {
+		t.Errorf("limit = %q", e.Limit)
+	}
+	if e.Cache != "5 * time.Second" || len(e.Roles) != 2 {
+		t.Errorf("cache = %q, roles = %v", e.Cache, e.Roles)
+	}
+}

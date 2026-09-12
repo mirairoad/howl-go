@@ -1516,6 +1516,62 @@ deleted `howl package` and the menu bar from what agents are told. The embedded
 copy was the newer one and became the root again before anything else was
 written to it.
 
+### No limit anywhere
+
+`factory`'s audit asked what protects the sign-in endpoint from being called ten
+thousand times, and the answer was nothing — not in the endpoint, not in `mw`,
+not in the docs. The assumption was that this had been dropped in the port.
+It had not: hushkey has no framework-level limiter either. Its 82 `defineApi`
+files declare `caching: { ttl }` and roles and nothing about a rate; the only
+limit in the repository is hand-written in `request-data-export.api.ts`, a
+30-day cooldown compared against a column and thrown as `HttpError(429)`. The
+mobile client maps 429 to "Too many sign-in attempts. Please try again in a few
+minutes" — a message for a status the server never sends.
+
+So it is a gap in both, and worth building once at the layer that can:
+
+**A token bucket, not a window counter.** A counter that resets on a boundary
+lets 2x the rate through in the seconds either side of it, so "60 per minute"
+enforces 120 and the number in the config is not the number in effect. A bucket
+refills continuously; `Burst` is the only burst there is.
+
+**Keyed by the registered pattern and, by default, the IP.** Two mistakes were
+available here and both are silent. Keying by `r.URL.Path` gives `/orders/1` and
+`/orders/2` separate buckets, and the caller escapes the limit by counting.
+Keying anonymous callers by identity gives every one of them the same bucket,
+and then one attacker locks out every visitor on the sign-in form — which is the
+endpoint the feature exists for, and the one place nobody has an identity yet.
+So `Identity` names the caller when it can and `mw.ClientIP` does when it
+cannot, and `TrustProxy` stays off by default because a limit keyed by a header
+the caller writes is not a limit.
+
+**Before `Authorize`, outside `Cache`.** The flood arrives with no session:
+checking the limit first makes it cost a bucket lookup instead of a session
+lookup and a query. And a cached response still costs bandwidth, so a hit still
+spends a token. The refusal is the ordinary error envelope with a correlation
+id, which is what makes "somebody is being throttled" visible to `OnError`
+rather than a status the application never hears about.
+
+`cache.Store` looked like the place to keep the counts and cannot be: `Get` then
+`Set` is not an increment, so two concurrent requests both read 4 and both write
+5, and the LRU may drop the counter that is doing the limiting — the same hazard
+§16 found with a version counter kept in the store it guards. `mw.Limiter` is
+its own one-method interface (`Take(ctx, key, Rate) Decision`) because the whole
+reason to put this in Redis is that `INCR` is atomic, and an interface split into
+a read and a write cannot be.
+
+The in-process store is a bounded LRU: 20000 buckets, **measured at 3.4 MB**
+(178 bytes a bucket plus the key). Plain LRU eviction turned out to be an
+attack — a flood under invented keys evicts the bucket that is refusing you,
+and refusing traffic is exactly when the table is full — so eviction scans the
+oldest eight and prefers one that is *not* currently refusing. When all eight
+are, the oldest goes anyway, which is honest about what a single process can
+promise: three replicas allow three times the rate until `Store` points at
+something shared.
+
+There is no framework-wide default rate. A number nobody chose, applied to every
+endpoint, is either too low for the dashboard's polling or too high to matter.
+
 ## The document cache, audited
 
 `db.Cache` had the shape right — an LRU behind a `cache.Store`, version-prefixed

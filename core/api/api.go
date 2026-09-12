@@ -86,6 +86,9 @@ type Spec[Q, B, R any] struct {
 	// Cache reuses successful responses for Cache.TTL. GET only; the zero
 	// value caches nothing. See Cache for who shares an entry.
 	Cache Cache
+	// Limit refuses a caller asking for more than this endpoint allows, with a
+	// 429. The zero value does not limit. See Limit for what a caller is.
+	Limit Limit
 	// Handler receives decoded, validated input and returns a value to encode.
 	// Return an *api.Error to choose the status; anything else is a 500 with
 	// its details kept server-side.
@@ -116,6 +119,50 @@ type Cache struct {
 	// say — so each value gets its own entry.
 	Vary []string
 }
+
+// Limit is an endpoint's rate limit — the thing howl (TS) never had, so every
+// endpoint that needed one counted by hand in its own handler, against its own
+// column, and the ones that did not need one until the day they did had
+// nothing.
+//
+//	Limit: api.Limit{Requests: 5, Window: time.Minute},
+//
+// It is a token bucket per caller per endpoint, so one endpoint's limit is
+// never spent by traffic to another. The caller is Config.Identity when it
+// names somebody, and the client's IP address when it does not — and that
+// fallback is the point rather than a detail: the endpoints worth limiting are
+// sign-in, sign-up, password reset and anything that sends mail, where nobody
+// is signed in yet. Keying those by identity alone would give every anonymous
+// request one shared bucket, and a single attacker could then lock out every
+// visitor at once.
+//
+// The limit is checked before Config.Authorize, so a flood costs a bucket
+// lookup rather than a session lookup and a database round trip. It is also
+// outside Cache, so a cached response still spends a token: it is the request
+// that costs bandwidth, not the handler.
+//
+// The refusal is an ordinary endpoint error — the same JSON envelope, with a
+// correlation id — plus Retry-After and the X-RateLimit-* headers, and it is
+// never cached. OnError sees it like any other failure, which is what makes
+// "somebody is being throttled" something the application can alert on.
+//
+// Counting happens in this process unless Config.Limiter says otherwise, which
+// three replicas allow three times over. See mw.Limiter.
+type Limit struct {
+	// Requests per Window. Zero does not limit.
+	Requests int
+	Window   time.Duration
+	// Burst is how many may arrive together after a quiet spell; zero means
+	// Requests. See mw.Rate.
+	Burst int
+	// By overrides who is being limited. Return "" to let a request past
+	// uncounted. Use it for a limit per API key or per tenant instead of per
+	// caller — never for anything the caller picks freely, such as a query
+	// parameter, which is a limit with an opt-out.
+	By func(*http.Request) string
+}
+
+func (l Limit) on() bool { return l.Requests > 0 && l.Window > 0 }
 
 // Request is what a handler is given: the decoded query and body, plus the
 // underlying *http.Request for cookies, headers and path values.
@@ -174,6 +221,7 @@ type Route struct {
 	Description string
 	Errors      []int
 	Cache       Cache
+	Limit       Limit
 	// Types records the query, body and response type names for the generated
 	// client and the OpenAPI document. Filled by Define.
 	Types TypeNames
@@ -181,7 +229,7 @@ type Route struct {
 	// accurate OpenAPI document possible without a schema library: generics
 	// erase at run time, but reflect still knows what Q, B and R were.
 	schema shapes
-	handle func(Config) http.Handler
+	handle func(Config, string) http.Handler
 }
 
 type shapes struct{ query, body, response reflect.Type }
@@ -221,7 +269,23 @@ type Config struct {
 	// themselves — never wrong, but every browser with any cookie at all, a
 	// CSRF token included, gets its own entry. An application with sessions
 	// does better returning the user id.
+	//
+	// Spec.Limit uses it too, for who is being rate limited — and there the
+	// nil behaviour does not apply: a caller Identity cannot name is limited
+	// by IP address, never by the contents of a header they control.
 	Identity func(r *http.Request) string
+	// Limiter counts for endpoints that declare Spec.Limit. Nil counts in this
+	// process, in one bucket map shared by the whole table — which limits each
+	// replica separately, so N replicas allow N times the rate. Hand in a
+	// shared implementation (Redis INCR) for anything replicated; see
+	// mw.Limiter for why the interface is one method.
+	Limiter mw.Limiter
+	// TrustProxy reads the caller's address from X-Forwarded-For when
+	// Spec.Limit falls back to limiting by IP. Set it only behind a proxy that
+	// overwrites that header — anyone can send one, and a limit keyed by a
+	// value the caller chooses is not a limit. Left off behind a proxy, every
+	// anonymous caller shares the proxy's address and so shares one bucket.
+	TrustProxy bool
 }
 
 // Define erases the type parameters and produces the registerable Route.
@@ -235,6 +299,14 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 	if s.Cache.TTL < 0 {
 		panic("api: " + s.Name + " has a negative Cache.TTL")
 	}
+	// A Requests with no Window is the mistake worth catching here: it reads
+	// like a limit, and silently is not one.
+	if s.Limit.Requests > 0 && s.Limit.Window <= 0 {
+		panic("api: " + s.Name + " declares Limit.Requests with no Limit.Window — nothing would be limited")
+	}
+	if s.Limit.Requests < 0 || s.Limit.Burst < 0 {
+		panic("api: " + s.Name + " has a negative Limit")
+	}
 	return Route{
 		Name:        s.Name,
 		Method:      strings.ToUpper(s.Method),
@@ -243,9 +315,10 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 		Description: s.Description,
 		Errors:      s.Errors,
 		Cache:       s.Cache,
+		Limit:       s.Limit,
 		Types:       TypeNames{Query: typeName[Q](), Body: typeName[B](), Response: typeName[R]()},
 		schema:      shapes{query: reflectType[Q](), body: reflectType[B](), response: reflectType[R]()},
-		handle: func(cfg Config) http.Handler {
+		handle: func(cfg Config, pattern string) http.Handler {
 			var run http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				req := &Request[Q, B]{HTTP: r, w: w}
 				if err := decodeQuery(r, &req.Query); err != nil {
@@ -278,7 +351,7 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 			if s.Cache.TTL > 0 {
 				run = mw.Cache{Store: cfg.Cache, TTL: s.Cache.TTL, Vary: s.Cache.Vary, Key: cfg.cacheKey}.Handler(run)
 			}
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			guarded := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Before the cache, always: an entry filled by an admin must
 				// not become the way a caller without the role reads it.
 				if err := authorize(cfg, r, s.Roles); err != nil {
@@ -286,7 +359,28 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 					return
 				}
 				run.ServeHTTP(w, r)
-			})
+			}))
+			if s.Limit.on() {
+				// Outside authorize: the password spray this exists to stop
+				// arrives with no session, and answering it should not cost a
+				// session lookup. Keyed by the registered pattern, not the
+				// URL — /orders/1 and /orders/2 are one endpoint, and a bucket
+				// per id is a limit the caller escapes by counting.
+				guarded = mw.RateLimit{
+					Requests:   s.Limit.Requests,
+					Window:     s.Limit.Window,
+					Burst:      s.Limit.Burst,
+					Store:      cfg.Limiter,
+					Key:        cfg.limitKey(pattern, s.Limit.By),
+					TrustProxy: cfg.TrustProxy,
+					OnLimit: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						// Retry-After is already on the response; repeating it
+						// in the message is what a caller reads in a toast.
+						fail(cfg, w, r, TooManyRequests("too many requests, retry in "+w.Header().Get("Retry-After")+"s"))
+					}),
+				}.Handler(guarded)
+			}
+			return guarded
 		},
 	}
 }
@@ -325,6 +419,12 @@ func Register(mux *http.ServeMux, cfg Config, routes ...Route) {
 		}
 	}
 	for _, rt := range routes {
+		if rt.Limit.on() && cfg.Limiter == nil {
+			cfg.Limiter = mw.NewLimiter(0) // likewise: one bucket map for the table
+			break
+		}
+	}
+	for _, rt := range routes {
 		if len(rt.Roles) > 0 && cfg.Authorize == nil {
 			panic(fmt.Sprintf("api: %q declares roles %v but Config.Authorize is nil — every caller would be let through", rt.Name, rt.Roles))
 		}
@@ -339,7 +439,7 @@ func Register(mux *http.ServeMux, cfg Config, routes ...Route) {
 		if err := checkPathFields(rt); err != nil {
 			panic("api: " + rt.Name + ": " + err.Error())
 		}
-		mux.Handle(rt.Method+" "+rt.Path, rt.handle(cfg))
+		mux.Handle(rt.Method+" "+rt.Path, rt.handle(cfg, rt.Method+" "+rt.Path))
 	}
 }
 
@@ -354,6 +454,33 @@ func (cfg Config) cacheKey(r *http.Request) string {
 		who = "credentials\x00" + auth + "\x00" + cookie
 	}
 	return "api\x00" + r.URL.Path + "?" + r.URL.Query().Encode() + "\x00" + who
+}
+
+// limitKey is Spec.Limit's key: the endpoint, then the caller. The endpoint is
+// the registered pattern rather than the request's URL, so a path parameter or
+// a query string cannot split one bucket into thousands.
+//
+// The caller is Identity, or the IP address when Identity names nobody. Both
+// are kept apart by a prefix: a user id that happens to read like an address
+// must not share a bucket with that address.
+func (cfg Config) limitKey(pattern string, by func(*http.Request) string) func(*http.Request) string {
+	if by != nil {
+		return func(r *http.Request) string {
+			who := by(r)
+			if who == "" {
+				return "" // the endpoint's own rule for who goes uncounted
+			}
+			return "limit\x00" + pattern + "\x00by\x00" + who
+		}
+	}
+	return func(r *http.Request) string {
+		if cfg.Identity != nil {
+			if who := cfg.Identity(r); who != "" {
+				return "limit\x00" + pattern + "\x00id\x00" + who
+			}
+		}
+		return "limit\x00" + pattern + "\x00ip\x00" + mw.ClientIP(r, cfg.TrustProxy)
+	}
 }
 
 // Routes is sugar for building a table by hand, in tests or a small app.
