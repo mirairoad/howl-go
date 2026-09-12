@@ -409,6 +409,7 @@ Use: []mw.Middleware{
 	mw.CORS{Origins: []string{"https://app.example.com"}}.Handler,
 	mw.Except("/api", mw.CSRF{Secure: true}.Handler),          // origin check + double-submit token, not for the API
 	mw.Only("/embed", mw.CSP{Policy: "default-src 'self' 'nonce-{nonce}'"}.Handler),
+	mw.Only("/api", mw.RateLimit{Requests: 600, Window: time.Minute}.Handler), // 429 + Retry-After past the bucket
 }
 ```
 
@@ -424,6 +425,16 @@ Use: []mw.Middleware{
   `//howl:cache`, usable on any handler: GET only, 200 only, never a response that sets a
   cookie or flushes; `X-Howl-Cache: hit|miss` and `Age` on the way out. The default `Key`
   skips requests carrying `Cookie`/`Authorization`.
+- `mw.RateLimit{Requests, Window, Burst, Key, TrustProxy, Store, Max, OnLimit}` is the counter
+  behind `api.Spec.Limit`, usable on any handler. A **token bucket**, not a window counter: a
+  counter lets 2x the rate through around its boundary. Default `Key` is `mw.ClientIP`; return
+  `""` to go uncounted. Every response carries `X-RateLimit-Limit`/`-Remaining`/`-Reset` (epoch
+  second), a refusal adds `Retry-After` (whole seconds, never 0). Only set `TrustProxy` behind a
+  proxy that overwrites `X-Forwarded-For` — a limit keyed by a header the caller writes is not a
+  limit. **Counting is in-process unless `Store` says otherwise, so N replicas allow N times the
+  rate**; `Store` is `mw.Limiter` (one method: `Take(ctx, key, Rate) Decision`), and
+  `mw.NewLimiter(max)` is the in-process one (20000 buckets ≈ 3.4 MB, evicting buckets that are
+  not currently refusing so a flood of invented keys cannot clear the one that is).
 - `mw.Proxy` is `httputil.ReverseProxy`: `Paths` match by segment with `{name}` wildcards,
   `StripPrefix` removes the match, `X-Forwarded-*` are rewritten (never passed through from the
   client), a target's cookie `Domain` is dropped, and a dead or slow target is 502/504 without
@@ -938,6 +949,18 @@ Rules:
   `Authorize` runs before the cache on every request. A response that sets a cookie is never
   stored; a cached POST panics at `Register`. TTL only — there is no purge.
   `api.Config.Cache` is the `cache.Store` (nil = one in-process LRU for the table).
+- `Limit: api.Limit{Requests: 5, Window: time.Minute}` rate limits the endpoint — a token bucket
+  per caller per endpoint, keyed by the **registered pattern** (not the URL, or a path id would be
+  an opt-out). The caller is `api.Config.Identity(r)`, falling back to the client's IP when it
+  names nobody: an anonymous bucket shared by everyone would let one attacker lock out every
+  visitor at the sign-in endpoint. `api.Limit{By: …}` counts something else (an API key, a
+  tenant; `""` skips). Checked **before `Authorize`** and **outside `Cache`** (a hit still spends
+  a token). The refusal is the ordinary error envelope plus `Retry-After`, `OnError` sees it, and
+  `429` lands in the OpenAPI document; `api.Throttled(err)` is the client-side test.
+  `api.Config.Limiter` is the `mw.Limiter` (nil = one in-process bucket map for the table, so
+  replicas each limit their own share) and `api.Config.TrustProxy` applies to the IP fallback.
+  For a limit only the application knows — a monthly export — return `api.TooManyRequests(…)` and
+  set `Retry-After` with `r.Header()`.
 - Validation is a `Validate() error` method on the query or body type. It runs before the
   handler; a plain error becomes a 400.
 - Return `*api.Error` (`api.NotFound`, `api.Invalid`, `api.Forbidden`, …) to choose a status.
@@ -1277,6 +1300,8 @@ actually serves.
 | add an API endpoint | a `*.api.go` file under `server/apis/`; run `fsapis`; register the generated table |
 | set a cookie from an endpoint | `r.SetCookie(&http.Cookie{…})` in the handler |
 | cache an endpoint | `Cache: api.Cache{TTL: 5 * time.Second}` on the Spec (GET only) |
+| rate limit an endpoint | `Limit: api.Limit{Requests: 5, Window: time.Minute}` on the Spec |
+| rate limit everything else | `mw.Only("/api", mw.RateLimit{Requests: 600, Window: time.Minute}.Handler)` in `Use` |
 | cache a public page | `//howl:cache 30s` in the page file (anonymous visitors only) |
 | redirect from a guard | `app.Redirect(w, r, "/sign-in", http.StatusSeeOther)` |
 | one URL per page | `app.Config{RedirectTrailingSlash: true}` |
@@ -1375,8 +1400,9 @@ store's `Offline`/`Queued` and its ordered sender with backoff (an outage queues
 never drops them), `api.Refused`, `core/cache` (`db.CacheAdapter` is now an alias of
 `cache.Store`), `db.Cache.MaxEntryBytes` + `Service.CacheStats()` + a cached `Count` (and
 one query per cold key rather than one per caller), `api.Request.Header`/`SetCookie`,
-`api.Spec.Description`/`Errors`/`Cache`,
-`api.Config.Cache`/`Identity`, `path:"…"` query fields, `app.Redirect`/`IsPartial`/
+`api.Spec.Description`/`Errors`/`Cache`/`Limit`,
+`api.Config.Cache`/`Identity`/`Limiter`/`TrustProxy`, `api.TooManyRequests`/`Throttled`,
+`mw.RateLimit`/`Limiter`/`NewLimiter`, `path:"…"` query fields, `app.Redirect`/`IsPartial`/
 `StaticFiles`/`HeaderLocation`, `app.Config.Logger`/`Cache`/`RedirectTrailingSlash`, `//howl:cache` + `Route.Cache`,
 `mw.Cache`/`SecureHeaders`/`Proxy`/`Only`/`Except`/`Under`/`ClientIP`, and
 `app.js` following redirected fragment requests.

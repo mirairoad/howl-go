@@ -4,6 +4,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"sort"
@@ -286,6 +287,13 @@ func responses(rt Route, schemas map[string]any) map[string]any {
 		// Authorize answers 403 for a caller who is signed in without the
 		// role, which is the more common of the two for a real client.
 		out["403"] = failure("Forbidden")
+	}
+	// A rate-limited endpoint answers 429 whether or not it lists one, and a
+	// generated client that does not expect it treats being throttled as an
+	// unknown failure. The rate is in the description because it is the one
+	// number a caller needs to not be throttled again.
+	if rt.Limit.on() {
+		out["429"] = failure(fmt.Sprintf("Too many requests — %d per %s per caller", rt.Limit.Requests, rt.Limit.Window))
 	}
 	for _, code := range rt.Errors {
 		key := strconv.Itoa(code)

@@ -40,6 +40,7 @@ const (
 	statusForbidden          = 403
 	statusNotFound           = 404
 	statusConflict           = 409
+	statusTooManyRequests    = 429
 	statusInternalError      = 500
 	statusServiceUnavailable = 503
 )
@@ -56,6 +57,14 @@ func Unavailable(message string) *Error {
 	return &Error{Code: statusServiceUnavailable, Message: message}
 }
 
+// TooManyRequests is the refusal Spec.Limit returns, and the one to return by
+// hand for a limit only the application can know — a cooldown between two
+// exports, one invitation a day. Set Retry-After with r.Header() when the
+// handler knows when: a 429 without it tells the caller to guess.
+func TooManyRequests(message string) *Error {
+	return &Error{Code: statusTooManyRequests, Message: message}
+}
+
 // Refused reports whether err is the server declining the request — a 4xx the
 // caller has to act on, such as rolling back an optimistic write — as opposed
 // to a transport failure or a 5xx, which are the server being unreachable or
@@ -63,6 +72,15 @@ func Unavailable(message string) *Error {
 func Refused(err error) bool {
 	var e *Error
 	return errors.As(err, &e) && e.Code >= 400 && e.Code < 500
+}
+
+// Throttled reports whether err is a 429 — the one refusal worth telling apart
+// from the rest of Refused, because it is the only one where trying the same
+// request again later is the correct response rather than a bug. Read
+// Retry-After from the response for how much later.
+func Throttled(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Code == statusTooManyRequests
 }
 
 // badRequest keeps a deliberate *Error as it is and promotes anything else to

@@ -591,6 +591,7 @@ type endpointInfo struct {
 	File        string   `json:"file,omitempty"`
 	Roles       []string `json:"roles,omitempty"`
 	Cache       string   `json:"cache,omitempty"`
+	Limit       string   `json:"limit,omitempty"`
 	Query       string   `json:"query,omitempty"`
 	Body        string   `json:"body,omitempty"`
 	Response    string   `json:"response,omitempty"`
@@ -602,6 +603,11 @@ var (
 	specNameRe  = regexp.MustCompile(`Name:\s*"([^"]*)"`)
 	specDescRe  = regexp.MustCompile(`Description:\s*"([^"]*)"`)
 	specCacheRe = regexp.MustCompile(`Cache:\s*api\.Cache\{TTL:\s*([^,}\n]+)`)
+	// Reported whole and unparsed, fields in whatever order they were written:
+	// an agent asking what an endpoint declares wants to see the rate, and a
+	// reader that only understood Requests-then-Window would drop the rest.
+	specLimitRe = regexp.MustCompile(`Limit:\s*api\.Limit\{([^}]*)\}`)
+	spaceRe     = regexp.MustCompile(`\s+`)
 	roleValueRe = regexp.MustCompile(`"([^"]*)"`)
 )
 
@@ -636,6 +642,9 @@ func readEndpoints(root string) any {
 		}
 		if c := specCacheRe.FindSubmatch(f.Body); c != nil {
 			info.Cache = strings.TrimSpace(string(c[1]))
+		}
+		if l := specLimitRe.FindSubmatch(f.Body); l != nil {
+			info.Limit = strings.Trim(spaceRe.ReplaceAllString(string(l[1]), " "), " ,")
 		}
 		if r := rolesRe.Find(f.Body); r != nil {
 			for _, role := range roleValueRe.FindAllStringSubmatch(string(r), -1) {
