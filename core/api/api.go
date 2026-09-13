@@ -31,9 +31,15 @@
 // cookie, and an endpoint that cannot set one sends the application off to
 // write a second, untyped handler for the one call that needed it.
 //
-// It is also JSON-only. An endpoint speaking protobuf, serving a file, or
-// streaming is an ordinary http.Handler on the mux; wrapping those in a typed
-// envelope would buy nothing.
+// It is JSON by default and not JSON-only. A handler that returns api.Text,
+// api.HTML, api.XML, api.Bytes, api.Redirect, api.Stream or api.SSE writes
+// that instead of the envelope — howl (TS)'s ctx.text, ctx.html, ctx.sse and
+// ctx.stream, as response types rather than context methods, so the OpenAPI
+// document and the generated client see them. That matters more than it looks:
+// robots.txt, sitemap.xml and a web app manifest are endpoints at fixed URLs
+// (Spec.Path), and without a way to answer text/plain they have to be written
+// as loose http.Handlers outside the tree, where nothing checks that they have
+// a test or that the table describes them. See responses.go.
 //
 // # Two halves, one of which runs in a browser
 //
@@ -299,6 +305,14 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 	if s.Cache.TTL < 0 {
 		panic("api: " + s.Name + " has a negative Cache.TTL")
 	}
+	// mw.Cache stores a response by buffering it whole, which for a stream
+	// means holding it open until it ends and then serving that recording to
+	// everybody. Caught here rather than discovered as a hung request.
+	if s.Cache.TTL > 0 {
+		if t := reflectType[R](); t == reflect.TypeOf(Stream{}) || t == reflect.TypeOf(SSE{}) {
+			panic("api: " + s.Name + " caches a stream — the body is written as it is produced, so there is nothing to store")
+		}
+	}
 	// A Requests with no Window is the mistake worth catching here: it reads
 	// like a limit, and silently is not one.
 	if s.Limit.Requests > 0 && s.Limit.Window <= 0 {
@@ -346,7 +360,7 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 					fail(cfg, w, r, err)
 					return
 				}
-				write(w, out)
+				write(w, r, out)
 			})
 			if s.Cache.TTL > 0 {
 				run = mw.Cache{Store: cfg.Cache, TTL: s.Cache.TTL, Vary: s.Cache.Vary, Key: cfg.cacheKey}.Handler(run)
@@ -497,7 +511,13 @@ func authorize(cfg Config, r *http.Request, roles []string) error {
 // Responses
 // ---------------------------------------------------------------------------
 
-func write(w http.ResponseWriter, out any) {
+func write(w http.ResponseWriter, r *http.Request, out any) {
+	// A response that writes itself: not JSON, so none of what follows applies
+	// — including the Content-Type this function would otherwise overwrite.
+	if responder, ok := out.(Responder); ok {
+		responder.Respond(w, r)
+		return
+	}
 	code := http.StatusOK
 	if s, ok := out.(Status); ok && s.Status() != 0 {
 		code = s.Status()

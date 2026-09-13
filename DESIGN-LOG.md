@@ -1572,6 +1572,59 @@ something shared.
 There is no framework-wide default rate. A number nobody chose, applied to every
 endpoint, is either too low for the dashboard's polling or too high to matter.
 
+### An endpoint that could not answer robots.txt
+
+The same shape of gap, found the same way. §13 wrote down "it is also JSON-only.
+An endpoint speaking protobuf, serving a file, or streaming is an ordinary
+`http.Handler` on the mux" — which sounds like a boundary and is really a hole,
+because the documents at fixed URLs are not exotic. `robots.txt`, `sitemap.xml`,
+`.well-known/security.txt` and `manifest.json` are on every site, and hushkey
+has all four as ordinary `defineApi` files under `apis/public/`, returning
+`new Response(txt, {headers: {'Content-Type': 'text/plain'}})`.
+
+`Spec.Path` could already put an endpoint at `/robots.txt` — it is in the
+`fsapis` package comment, next to `/healthz`. What could not happen was the
+body: `write` set `Content-Type: application/json` on every response, and
+`Request.Header()`'s own doc said so. A crawler handed `application/json`
+ignores the file.
+
+So factory wrote them as three loose packages — `server/crawler`, `server/meta`,
+`server/admin` — each with a comment explaining that the framework left it no
+choice, and each outside the tree its own `factory check` enforces tests and
+README entries over. The framework's boundary had pushed four documents out of
+the one place that checks anything.
+
+The fix is howl (TS)'s `ctx.text` / `ctx.html` / `ctx.sse` / `ctx.stream` /
+`ctx.redirect`, as **response types** rather than context methods. That is
+forced by the shape here and is the better half of the trade: `Spec`'s `R` is
+what the OpenAPI document and the generated client are built from, so
+`Spec[…, api.Raw]` puts "this endpoint answers bytes, not JSON" in the one place
+both of them read. A handler writing to a `ResponseWriter` instead would be
+invisible to both, and would also be able to write half a response and then
+return an error with nowhere to go — the thing §13 kept the writer away for.
+
+`api.Responder` is one method, `Respond(w, r)`, and the four implementations are
+`Raw`, `Redirect`, `Stream` and `SSE`. Three things fell out of writing them:
+
+- **An error is still the JSON envelope.** Answering `text/plain` on success is
+  not opting out of the correlation id. `write` dispatches to `Respond`; `fail`
+  is untouched.
+- **`Cache` on a stream panics at `Define`.** `mw.Cache` stores a response by
+  buffering it whole, which for a stream means holding it open until it ends and
+  then serving the recording to everyone. A startup panic beats a hung request.
+- **The SSE writer already existed**, in `app.SSE`, for the dev server's reload
+  channel. Two copies of a format whose failure mode is *half an event
+  delivered* is not a duplication worth keeping, so it moved to `core/sse` —
+  `Event`/`Frame` in one file, `Open`/`Stream` in another. `core/app` aliases
+  both. `core/api` cannot: its shared half is compiled into wasm and
+  `core/sse`'s stream half names `net/http`, which is 2.05 MB gzipped there. So
+  `api.Event` is declared again, field for field, and `respond.go` converts with
+  `sse.Event(e)` — a conversion the compiler rejects the moment the two stop
+  matching, which is the guarantee the alias would have given.
+
+What stays an ordinary handler: protobuf, and serving a directory of files.
+Those have no fixed URL a route table wants to know about.
+
 ## The document cache, audited
 
 `db.Cache` had the shape right — an LRU behind a `cache.Store`, version-prefixed

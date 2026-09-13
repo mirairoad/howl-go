@@ -134,6 +134,17 @@ func Call[R any](ctx context.Context, t *Transport, method, path string, query, 
 	if _, none := any(out).(None); none {
 		return out, nil
 	}
+	// A response the framework did not encode. json.Unmarshal on text/plain
+	// fails with a decode error that describes nothing, so the four types that
+	// write themselves are handled before it: Raw hands the bytes back, and a
+	// redirect or a stream has nothing a typed client can return.
+	switch typed := any(&out).(type) {
+	case *Raw:
+		typed.Body, typed.Code = res.Body, res.Status
+		return out, nil
+	case *Redirect, *Stream, *SSE:
+		return out, nil
+	}
 	if err := json.Unmarshal(res.Body, &out); err != nil {
 		return out, fmt.Errorf("api: decode response from %s: %w", path, err)
 	}
