@@ -979,7 +979,7 @@ Rules:
   | `api.Bytes(ct, b)` | `api.Raw` | `ct`, verbatim — empty is `application/octet-stream` |
   | `api.Redirect{To: p}` | `api.Redirect` | `Location`, 302 by default; a leading `//` is collapsed, so a target built from user input is not an open redirect |
   | `api.Stream{Write: f}` | `api.Stream` | the body `f` writes, flushed per write |
-  | `api.SSE{Events: seq}` | `api.SSE` | `text/event-stream`; one `data:` per line, `Cache-Control: no-cache`, `X-Accel-Buffering: no` |
+  | `api.SSE{Events: seq}` | `api.SSE` | `text/event-stream`; one `data:` per line, `Cache-Control: no-store`, `X-Accel-Buffering: no` |
 
   `.WithStatus(code)` on a `Raw` picks the status. Headers and cookies set with `r.Header()` /
   `r.SetCookie()` still go out; `Content-Type` is the one the response type owns. **An error is

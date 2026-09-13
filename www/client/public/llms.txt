@@ -45,6 +45,7 @@ Components never branch on which one is happening. One switch in `core/app` does
 | `core/dom` | browser API — real under `GOOS=js`, no-ops elsewhere |
 | `core/runtime` | embeds `app.js` + `transitions.css`, served from `/static/` |
 | `core/api` | the typed endpoint layer: `api.Define(api.Spec[Q, B, R]{…})`, plus the generated client's transport |
+| `core/sse` | the Server-Sent Events wire format, shared by `app.SSE` (a plain handler) and `api.SSE` (an endpoint) |
 | `core/cmd/howl` | `howl dev` (watch/rebuild/reload), `howl check` (conventions, enforced), `howl mcp` (the same as MCP tools) |
 | `core/cmd/fsapis` | endpoint tree → route table + typed client (build time) |
 | `core/cmd/fsroutes` | directory tree → generated route table (build time) |
@@ -966,11 +967,35 @@ Rules:
 - Return `*api.Error` (`api.NotFound`, `api.Invalid`, `api.Forbidden`, …) to choose a status.
   Any other error is a 500 whose details stay server-side, with a correlation id on both.
 - A response type may implement `Status() int` for 201/202.
+- **Not JSON?** Return one of the response types instead of a struct — howl TS's `ctx.text`,
+  `ctx.html`, `ctx.sse`, `ctx.stream` and `ctx.redirect`, as the endpoint's `R` so the OpenAPI
+  document and the generated client see them:
+
+  | return | `R` | what goes out |
+  |---|---|---|
+  | `api.Text(s)` | `api.Raw` | `text/plain; charset=utf-8` |
+  | `api.HTML(s)` | `api.Raw` | `text/html; charset=utf-8` |
+  | `api.XML(s)` | `api.Raw` | `application/xml; charset=utf-8` |
+  | `api.Bytes(ct, b)` | `api.Raw` | `ct`, verbatim — empty is `application/octet-stream` |
+  | `api.Redirect{To: p}` | `api.Redirect` | `Location`, 302 by default; a leading `//` is collapsed, so a target built from user input is not an open redirect |
+  | `api.Stream{Write: f}` | `api.Stream` | the body `f` writes, flushed per write |
+  | `api.SSE{Events: seq}` | `api.SSE` | `text/event-stream`; one `data:` per line, `Cache-Control: no-store`, `X-Accel-Buffering: no` |
+
+  `.WithStatus(code)` on a `Raw` picks the status. Headers and cookies set with `r.Header()` /
+  `r.SetCookie()` still go out; `Content-Type` is the one the response type owns. **An error is
+  still the JSON envelope** — answering `text/plain` on success is not opting out of how failure
+  is reported. `Cache` on a `Stream` or `SSE` panics at `Define`. Implement `api.Responder`
+  for anything else.
+
+  This is what makes a document at a fixed URL an endpoint rather than a loose handler:
+  `robots.txt`, `sitemap.xml`, `.well-known/security.txt`, `manifest.json` and `/healthz` are
+  `Path:` overrides returning `api.Text`/`api.XML`/`api.Bytes`, so they are in the route table,
+  in the OpenAPI document, and covered by whatever checks the project runs over `server/apis/`.
 - **Roles are not implemented by howl-go.** The endpoint declares strings; the application
   supplies `api.Config{Authorize: func(*http.Request, []string) error}`. Declaring roles
   with no Authorize wired panics at registration — it would otherwise let everyone through.
 - Generate with `fsapis`, register with `api.Register(mux, cfg, apis.FsApiRoutes()...)`.
-- Protobuf, file serving and streaming stay ordinary `http.Handler`s on the mux.
+- Protobuf and serving a directory of files stay ordinary `http.Handler`s on the mux.
 
 The OpenAPI document is built at startup from the same table, so it cannot
 describe an endpoint the binary does not serve:

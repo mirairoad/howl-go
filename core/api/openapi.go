@@ -140,11 +140,18 @@ func OpenAPI(info Info, routes ...Route) http.HandlerFunc {
 // megabyte of JavaScript to describe why it does not ship megabytes of
 // JavaScript.
 func Docs(specURL string) http.HandlerFunc {
-	page := strings.ReplaceAll(docsHTML, "{{spec}}", specURL)
+	page := DocsHTML(specURL)
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(page)) //nolint:errcheck
 	}
+}
+
+// DocsHTML is the reader's page, for an application that serves it as an
+// endpoint (api.HTML) rather than a handler on the mux — where it can be gated
+// by Roles and appear in the route table like everything else it describes.
+func DocsHTML(specURL string) string {
+	return strings.ReplaceAll(docsHTML, "{{spec}}", specURL)
 }
 
 // ---------------------------------------------------------------------------
