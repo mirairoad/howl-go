@@ -1,4 +1,4 @@
-.PHONY: all core db test test-db-pg test-browser sync-llms toy www hello desktop run-desktop dev-desktop dev-toy dev-www clean
+.PHONY: all core db test test-db-pg test-browser test-e2e test-otel sync-llms toy www hello desktop run-desktop dev-desktop dev-toy dev-www clean
 
 APPS := examples/toy_app www
 
@@ -12,8 +12,14 @@ core: sync-llms
 db:
 	go build ./db/...
 
-test:
+test: test-otel
 	go test ./core/... ./db/...
+
+# The OpenTelemetry module has its own go.mod so the SDK never enters the
+# framework's; its tests run the SDK against core/observe with in-memory
+# exporters, so they need no collector.
+test-otel:
+	cd otel && go vet ./... && go test ./...
 
 # The live Postgres conformance run. Its driver lives in a nested module so
 # the framework's go.mod keeps its single dependency.
@@ -29,6 +35,15 @@ test-db-pg:
 # separate target you have to ask for.
 test-browser:
 	cd test/browser && npm install --no-audit --no-fund --loglevel=error && npm test
+
+# The real views.wasm in a real headless Chromium, against the toy app served
+# in-process: the one place the GOOS=js half of an application actually runs.
+# chromedp lives in test/e2e's own go.mod, like db/pg/livetest's driver, so the
+# framework keeps its single dependency. The binary is embedded when the test
+# compiles, which is why it is built first.
+test-e2e:
+	$(MAKE) -C examples/toy_app wasm
+	cd test/e2e && go test -count=1 ./...
 
 # llms.txt is the source of truth at the repo root. `howl mcp` embeds a copy so
 # the conventions tool answers the same way from a downloaded module as from a

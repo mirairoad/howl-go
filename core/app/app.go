@@ -27,6 +27,7 @@ import (
 
 	"github.com/mirairoad/howl-go/core/cache"
 	"github.com/mirairoad/howl-go/core/mw"
+	"github.com/mirairoad/howl-go/core/observe"
 	"github.com/mirairoad/howl-go/core/router"
 	"github.com/mirairoad/howl-go/core/runtime"
 )
@@ -92,6 +93,16 @@ type Config struct {
 	// Leave it off when Use already lists a logger: every request would be
 	// logged twice.
 	Logger bool
+
+	// Telemetry is the URL app.js posts navigation timings to, and nothing is
+	// reported unless it is set. The otel module serves the other end:
+	//
+	//	mux.Handle("POST /api/telemetry/navigations", otel.Navigations())
+	//	app.Config{Telemetry: "/api/telemetry/navigations"}
+	//
+	// It is the only half of a navigation the server cannot measure — a
+	// browser-rendered route never contacts it at all.
+	Telemetry string
 
 	// Cache stores the rendered responses of pages that declare
 	// `//howl:cache 30s`. Nil is an in-process LRU of 1000 entries, created
@@ -185,11 +196,12 @@ func New(cfg Config) *App {
 			Reload:    cfg.Dev || cfg.PublicDir != "",
 		},
 		client: router.Client{
-			Wasm:  router.NeedsWasm(cfg.Routes),
-			Raw:   router.RawRoutes(cfg.Routes),
-			Data:  cfg.ClientData,
-			Pages: router.PageData(cfg.Routes),
-			Live:  liveEndpoint(),
+			Wasm:      router.NeedsWasm(cfg.Routes),
+			Telemetry: cfg.Telemetry,
+			Raw:       router.RawRoutes(cfg.Routes),
+			Data:      cfg.ClientData,
+			Pages:     router.PageData(cfg.Routes),
+			Live:      liveEndpoint(),
 		},
 		params: params,
 		cache:  pages,
@@ -322,16 +334,52 @@ func (a *App) Render(w http.ResponseWriter, r *http.Request, rt router.Route, c 
 // still change (see router.SetStatus), an error page instead of a truncated document
 // when a component fails, and a Content-Length.
 func (a *App) render(w http.ResponseWriter, r *http.Request, rt router.Route, c templ.Component, status int) {
+	// The request span belongs to whoever opened it (the otel module's
+	// middleware, or nobody); this is where the route is first known, so this
+	// is where it learns its name. The render is a child under it, opened
+	// before Config.Data runs so that a database read the page depends on
+	// nests inside the page — the span that tells a slow server from a slow
+	// network on a fragment navigation, which is the question the whole client
+	// runtime exists to make moot.
+	//
+	// The 404 render has no pattern: it is the catch-all, reached by any
+	// method and any path. Naming it after the route it did not match would
+	// put an empty http.route on the request span and rename it to a bare
+	// method — so it is named for what it is, and the mux's own pattern (the
+	// catch-all "/") is left to say where it came from.
+	name, route := rt.Label, rt.Pattern
+	if route != "" {
+		name = route
+	}
+	if route != "" {
+		observe.Current(r.Context()).Set("http.route", route)
+	}
+	ctx, span := observe.Start(r.Context(), "howl.render "+name)
+	span.Set(observe.Kind, "render")
+	span.Set("howl.route", name)
+	span.Set("howl.client", rt.Client)
+	switch {
+	case IsPartial(r):
+		span.Set("howl.mode", "fragment")
+	case rt.Raw:
+		span.Set("howl.mode", "raw")
+	default:
+		span.Set("howl.mode", "document")
+	}
+
 	// A component may change this while it renders — see router.NotFound.
-	ctx := router.WithStatus(a.context(r.Context(), Canonical(r.URL.Path), a.pathValues(rt.Pattern, r)), status)
+	ctx = router.WithStatus(a.context(ctx, Canonical(r.URL.Path), a.pathValues(rt.Pattern, r)), status)
 
 	body := getBuf()
 	defer bufPool.Put(body)
 	if err := c.Render(ctx, body); err != nil {
+		span.End(err)
 		a.fail(w, r, fmt.Errorf("render %s: %w", r.URL.Path, err))
 		return
 	}
 	title, head := rt.HeadParts(ctx, rt.Label)
+	span.Set("howl.bytes", body.Len())
+	span.End(nil)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// A rendered page is never reused without asking.

@@ -153,7 +153,14 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 				"DOM and no dependency array here, so a page written from JS habits compiles and then silently " +
 				"never updates — the modal and the store are where that happens most. A page with a store must " +
 				"embed the server's snapshot in its markup and restore it in Mount; a modal is one signal and one " +
-				"effect. Before editing a .client route, its layouts or shared components, call " +
+				"effect. Deciding whether a route should be server-rendered or a browser-rendered SPA is a " +
+				"per-file call, not a project setting: call howl_conventions with " +
+				"section=\"Choosing server or client rendering\". Renaming index.templ to index.client.templ " +
+				"makes that one route render in the browser — 0.08 ms and 0 bytes per navigation, after a cold " +
+				"request that is still full server-rendered HTML — for a 2.27 MB gzipped wasm binary loaded " +
+				"lazily. Suggest it for routes behind a login (dashboard, admin, editor) where the payload " +
+				"amortises, not for public pages on mobile data; the mix is the application author's choice " +
+				"and any mix compiles. Before editing a .client route, its layouts or shared components, call " +
 				"howl_conventions with section=\"Client render safety\": process globals describe the wasm " +
 				"build after local navigation, not the running server. Before packaging the app as a native " +
 				"window, call howl_conventions with section=\"Native window\": desktop is a separate module " +
@@ -163,6 +170,20 @@ func dispatch(root string, req rpcRequest) (any, *rpcError) {
 				"desktop/packaging/icon.png: do not hand-write an Info.plist or a .desktop entry, do not build " +
 				"an icns by shelling out to iconutil and sips, and do not try to cross-compile the desktop " +
 				"binary, which needs cgo and the platform's webview. " +
+				"Before adding tracing, metrics or OpenTelemetry, call howl_conventions with " +
+				"section=\"Observability\": requests, renders, endpoints, guards and db operations are already " +
+				"traced by the framework through core/observe — do not open spans for them again. The SDK lives " +
+				"in the otel nested module (otel.Setup reads the standard OTEL_* environment, otel.HTTP() goes " +
+				"first in Use, a guard is mw.Named(\"guard.x\", guard), and a.Listen(otel.Routes(mux)) names the " +
+				"requests served by hand-written mux handlers — form posts and webhooks — which otherwise trace " +
+				"as a bare POST), and nothing under client/ may import core/observe. Query filters, update " +
+				"values and endpoint bodies ARE recorded on spans, redacted: shape always, values only when " +
+				"they cannot be personal data, and an email address never, in any mode. Do not add your own " +
+				"span attribute holding a filter or a body — use db.Options.Trace and api.Config.Trace. " +
+				"The browser half is built in: app.js mints a traceparent per navigation and reports what " +
+				"the server cannot see to app.Config.Telemetry + otel.Navigations(); do not add a browser " +
+				"OpenTelemetry SDK. An endpoint's method is api.GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS, a " +
+				"named type — anything else panics at Register. " +
 				"Prefer howl_scaffold over writing a page, an endpoint, a store or a " +
 				"collection by hand — it writes the wiring that has no analogue elsewhere. Call howl_check " +
 				"after editing.",
@@ -220,9 +241,9 @@ func tools() []tool {
 	// the API on its own implies none of the shape a reactive page needs.
 	sections := "Mental model, Packages, Application layout, Bootstrap a new app, Routing conventions, " +
 		"Page anatomy, core/router API, core/app API, core/mw, Logging, core/state, core/signal, " +
-		"Browser: core/dom and window.howl, Making a page interactive, Client render safety, " +
-		"The wasm renderer, Endpoints, " +
-		"The document store (db), Native window (desktop), " +
+		"Browser: core/dom and window.howl, Making a page interactive, " +
+		"Choosing server or client rendering, Client render safety, The wasm renderer, Endpoints, " +
+		"The document store (db), Observability (otel), Native window (desktop), " +
 		"Tooling for agents, Common tasks, Hard constraints and gotchas, Non-goals"
 	topics := "checklist, page, store, events, list, form, modal, filter, navigation, animation, islands"
 	return []tool{
@@ -247,11 +268,16 @@ func tools() []tool {
 				"page anatomy, the shell contract, the package layering rule, the endpoint layer, how a page is " +
 				"made reactive, and an explicit list of things not to invent. Read this before writing howl-go " +
 				"code — Go rejects _layout.templ and [id].templ, and there are no hooks and no re-render, so the " +
-				"answers here look different from every JS framework on purpose. Client render safety also " +
+				"answers here look different from every JS framework on purpose. \"Choosing server or client " +
+				"rendering\" is the hybrid guidance — a route is server-rendered until its file is named " +
+				".client.templ, so a login-gated dashboard can be a full SPA in the same app as a " +
+				"server-rendered marketing site; suggest the split, do not impose it. Client render safety also " +
 				"defines which runtime values must be bootstrapped instead of read from Go globals. \"Native window\" " +
 				"covers shipping the app as a single binary that opens an OS webview, packaging it with " +
 				"`howl package` so the OS shows an icon for it, and the macOS menu bar the window installs " +
-				"(without which there is no working ⌘C anywhere in the page). Sections: " + sections,
+				"(without which there is no working ⌘C anywhere in the page). \"Observability\" is tracing and " +
+				"metrics: the otel module, what is already traced without application code, and the one seam " +
+				"(core/observe) an application may not import from client/. Sections: " + sections,
 			InputSchema: object(map[string]any{
 				"section": str("optional heading to return on its own, e.g. \"Routing conventions\" or " +
 					"\"Making a page interactive\". One of: " + sections),

@@ -139,3 +139,40 @@ func (s Sort) Asc(field string) Sort { return append(s, SortKey{Field: field}) }
 
 // Desc appends a descending term.
 func (s Sort) Desc(field string) Sort { return append(s, SortKey{Field: field, Desc: true}) }
+
+// trace is the query as a span records it: the filter, and the parts that
+// shape the answer. Limit, Skip, Sort and Project are numbers and field names
+// — never data — so they are recorded whatever the mode, and they are half of
+// why a slow read was slow.
+func (q Query) trace() map[string]any {
+	out := map[string]any{"where": q.filter()}
+	if q.Limit > 0 {
+		out["limit"] = q.Limit
+	}
+	if q.Skip > 0 {
+		out["skip"] = q.Skip
+	}
+	// Field names go in key position, and their direction in value position,
+	// rather than the other way round. A key is schema and is always recorded;
+	// a string value is data and is redacted unless it is an identifier — so a
+	// sort written as ["-created"] would render as ["?"] and say nothing.
+	// 1 and -1 for the direction, as every document store spells it.
+	if len(q.Sort) > 0 {
+		keys := make(map[string]any, len(q.Sort))
+		for _, k := range q.Sort {
+			keys[k.Field] = 1
+			if k.Desc {
+				keys[k.Field] = -1
+			}
+		}
+		out["sort"] = keys
+	}
+	if len(q.Project) > 0 {
+		fields := make(map[string]any, len(q.Project))
+		for _, f := range q.Project {
+			fields[f] = 1
+		}
+		out["project"] = fields
+	}
+	return out
+}

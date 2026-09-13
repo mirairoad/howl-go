@@ -147,3 +147,28 @@ test("a redirect that leaves the origin, or lands on a .raw route, is a document
   await raw.howl.navigate("/invoice");
   assert.equal(raw.navigations.length, 1);
 });
+
+test("active links follow router.Under by default and router.Current with data-active=exact", async () => {
+  // A header link to the section and a tab bar inside it, as the toy app has —
+  // outside #outlet, where a real shell keeps them, so they survive the swap.
+  const { document, howl } = boot({
+    path: "/dashboard/metrics",
+    fetch: () => fragment("Overview", `<p>overview</p>`),
+  });
+  document.body.insertAdjacentHTML("afterbegin", `<a id="section" href="/dashboard">Dashboard</a>
+    <nav><a id="overview" href="/dashboard" data-active="exact">Overview</a>
+         <a id="metrics" href="/dashboard/metrics" data-active="exact">Metrics</a></nav>`);
+  const active = () => [...document.querySelectorAll("a.active")].map((a) => a.id);
+
+  // The boot pass ran before the links existed; a navigation re-marks everything.
+  await howl.navigate("/dashboard/metrics/deeper");
+  assert.deepEqual(active(), ["section"], "under /dashboard, but no tab is exactly this path");
+
+  await howl.navigate("/dashboard/metrics");
+  assert.deepEqual(active(), ["section", "metrics"], "the section is under; Overview is a sibling, not a parent");
+  assert.equal(document.getElementById("overview").getAttribute("aria-current"), null);
+  assert.equal(document.getElementById("metrics").getAttribute("aria-current"), "page");
+
+  await howl.navigate("/dashboard");
+  assert.deepEqual(active(), ["section", "overview"]);
+});

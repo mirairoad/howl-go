@@ -20,8 +20,11 @@
 package mw
 
 import (
+	"context"
 	"net/http"
 	"strings"
+
+	"github.com/mirairoad/howl-go/core/observe"
 )
 
 // Middleware decorates a handler. The zero-dependency shape on purpose.
@@ -148,4 +151,62 @@ func (w *Writer) Flush() {
 	}
 	//nolint:errcheck // a failed flush surfaces on the next write
 	http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+// Named gives a middleware a span of its own, so a guard — or anything else
+// in Use — shows up in a trace as itself and not as time unaccounted for
+// between the request and the render.
+//
+//	mw.Named("guard.session", guards.Session)
+//
+// The span covers what the middleware does before it hands over: it ends the
+// moment next is entered, so the guard's own cost stands apart from the page
+// behind it. A middleware that answers instead — a redirect to sign-in, a
+// refusal — keeps the span to the end of its reply, and the status and the
+// Location it wrote are recorded on it: the answer to "why did the dashboard
+// bounce this user".
+func Named(name string, m Middleware) Middleware {
+	return func(next http.Handler) http.Handler {
+		// Constructed once: a middleware may hold state (Coalesce does), and
+		// the per-request part is what travels on the context.
+		inner := m(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if s, ok := r.Context().Value(namedKey{}).(*namedSpan); ok {
+				s.pass()
+			}
+			next.ServeHTTP(w, r)
+		}))
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, span := observe.Start(r.Context(), name)
+			span.Set(observe.Kind, "middleware")
+			ns := &namedSpan{span: span}
+			rw := Wrap(w)
+			inner.ServeHTTP(rw, r.WithContext(context.WithValue(ctx, namedKey{}, ns)))
+			if !ns.passed {
+				span.Set("howl.passed", false)
+				span.Set("http.response.status_code", rw.Status)
+				if loc := rw.Header().Get("Location"); loc != "" {
+					span.Set("howl.redirect", loc)
+				} else if loc := rw.Header().Get("X-Howl-Location"); loc != "" {
+					span.Set("howl.redirect", loc)
+				}
+				span.End(nil)
+			}
+		})
+	}
+}
+
+type namedKey struct{}
+
+type namedSpan struct {
+	span   observe.Span
+	passed bool
+}
+
+func (n *namedSpan) pass() {
+	if n.passed {
+		return
+	}
+	n.passed = true
+	n.span.Set("howl.passed", true)
+	n.span.End(nil)
 }

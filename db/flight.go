@@ -38,6 +38,11 @@ func share[V any](f *flight, ctx context.Context, key string, load func(context.
 	f.mu.Lock()
 	if c, ok := f.calls[key]; ok {
 		f.mu.Unlock()
+		// A follower's operation is as slow as the leader's query and did no
+		// query of its own. Without this the span shows a read that took 40 ms
+		// with nothing under it, which reads as a slow database rather than as
+		// the queue that protects it.
+		op(ctx).set("howl.db.coalesced", true)
 		select {
 		case <-c.done:
 		case <-ctx.Done():

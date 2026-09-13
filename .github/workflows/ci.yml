@@ -24,6 +24,9 @@ jobs:
       - name: test
         run: go test -race ./core/... ./db/...
 
+      - name: otel module
+        run: cd otel && go vet ./... && go test -race ./...
+
       - name: vet
         run: go vet ./core/... ./db/...
 
@@ -56,3 +59,15 @@ jobs:
       # app.js in jsdom: the morph, the client router, the build-drift reload.
       # Node is a dependency of this directory only, never of the framework.
       - run: make test-browser
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The toy app's wasm in the runner's own Chromium, through chromedp: the
+      # SPA path with nothing stubbed. Go only — no Node, no browser download.
+      - run: make test-e2e

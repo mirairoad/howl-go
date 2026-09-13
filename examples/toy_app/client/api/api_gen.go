@@ -19,15 +19,15 @@ func New(baseURL string) *Client { return &Client{Transport: api.NewTransport(ba
 
 // Metrics calls GET /api/metrics.
 func (c *Client) Metrics(ctx context.Context) (store.Metrics, error) {
-	return api.Call[store.Metrics](ctx, c.Transport, "GET", "/api/metrics", nil, nil)
+	return api.Call[store.Metrics](ctx, c.Transport, api.GET, "/api/metrics", nil, nil)
 }
 
 // SyncTodos calls POST /api/todos/sync.
 func (c *Client) SyncTodos(ctx context.Context, body []store.Op) (store.Snapshot, error) {
-	return api.Call[store.Snapshot](ctx, c.Transport, "POST", "/api/todos/sync", nil, body)
+	return api.Call[store.Snapshot](ctx, c.Transport, api.POST, "/api/todos/sync", nil, body)
 }
 
 // Todos calls GET /api/todos.
 func (c *Client) Todos(ctx context.Context) (store.Snapshot, error) {
-	return api.Call[store.Snapshot](ctx, c.Transport, "GET", "/api/todos", nil, nil)
+	return api.Call[store.Snapshot](ctx, c.Transport, api.GET, "/api/todos", nil, nil)
 }

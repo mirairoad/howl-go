@@ -66,7 +66,12 @@ var (
 	// lazy match stops inside it and captures a truncated type.
 	defineRe = regexp.MustCompile(`(?m)^var\s+([A-Z]\w*)\s*=\s*api\.Define\(\s*api\.Spec\[(.+)\]\s*\{`)
 	nameRe   = regexp.MustCompile(`Name:\s*"([^"]*)"`)
-	methodRe = regexp.MustCompile(`Method:\s*(?:"([A-Za-z]+)"|http\.Method([A-Za-z]+))`)
+	// Three spellings, because all three compile: api.POST (the named type's
+	// constant, and what the docs now show), "POST" (an untyped constant, which
+	// still assigns), and http.MethodPost. Missing one would be quiet and
+	// expensive — At overrides the Spec with whatever is found here, so an
+	// undetected POST registers as the file name's default and never runs.
+	methodRe = regexp.MustCompile(`Method:\s*(?:"([A-Za-z]+)"|http\.Method([A-Za-z]+)|api\.([A-Z]+))`)
 	pathRe   = regexp.MustCompile(`Path:\s*"([^"]*)"`)
 	importRe = regexp.MustCompile(`(?m)^\s*(?:([A-Za-z_]\w*)\s+)?"([^"]+)"\s*$`)
 )
@@ -200,7 +205,7 @@ func crawl(root, module, prefix string) ([]endpoint, string, error) {
 			}
 		}
 		if m := methodRe.FindSubmatch(src); m != nil {
-			if v := string(m[1]) + string(m[2]); v != "" {
+			if v := string(m[1]) + string(m[2]) + string(m[3]); v != "" {
 				e.Method = strings.ToUpper(v)
 			}
 		}

@@ -31,7 +31,25 @@ client/pages/dashboard/metrics/index.client.templ
 
 The wasm binary imports the same generated route table and resolves the path through the same `router.Lookup` the server uses. A navigation costs **zero bytes** — the server is not contacted at all, and unlike a prefetch cache it works for routes the user has never visited.
 
-The cost is the payload: a Go wasm binary carries the runtime and GC whether you use them or not. Load it lazily, for the routes that need it.
+The cost is the payload: a Go wasm binary carries the runtime and GC whether you use them or not — 2.27 MB gzipped for `examples/toy_app`. It is fetched at idle after the cold page has painted, or when the pointer heads toward a link into a client route, never on the critical path.
+
+## Which routes should be `.client`
+
+The decision is one file name at a time, and it is a suggestion rather than a framework default. Both kinds of route send the same server-rendered HTML on the cold request — a `.client` page is not an empty div waiting for a bundle, and it is indexed like any other. What changes is every navigation after the first.
+
+| | plain route | `.client` route |
+|---|---|---|
+| cold request | full HTML | full HTML — identical |
+| navigation | fragment: one RTT plus the render | **0.08 ms, 0 bytes** |
+| a route never opened before | a request | already local |
+| cost | none | 2.27 MB gzipped, once, lazily |
+
+So the honest answer differs per route inside one application:
+
+- **Behind a login — go full SPA.** A dashboard, an admin, an editor, a back-office table: long sessions, usually a desktop, and the binary amortises over hundreds of navigations. Mark every route under that prefix `.client` and after the first paint the app never contacts the server to change screens — including screens nobody has visited, which a prefetch cache cannot do. `examples/toy_app` does this under `/dashboard`; each file is named `index.client.templ`, there is no directory-wide modifier.
+- **Public pages — leave them server-rendered.** Marketing, blog, docs, pricing: a read-once audience on mobile data, where the cold render is already the whole product.
+
+Nothing enforces this. An app with no `.client` route ships no wasm at all and changes routes in 0.3 ms through prefetching; an app where every route is `.client` is a full SPA that still server-renders the first hit and still static-exports. Mixed usually wins only because the public half of a product and the half people work in all day rarely share a visitor.
 
 ## Runtime state must cross the wire
 

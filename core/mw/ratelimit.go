@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/mirairoad/howl-go/core/observe"
 )
 
 // The rate-limit headers. The IETF draft spells them without the X- and
@@ -162,6 +164,7 @@ func (l RateLimit) Handler(next http.Handler) http.Handler {
 		// "now", and a client that believes it retries immediately and is
 		// refused again, which is the busy-loop this header exists to prevent.
 		h.Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(d.Retry.Seconds())))))
+		observe.Current(r.Context()).Event("ratelimit.refused")
 		refuse.ServeHTTP(w, r)
 	})
 }

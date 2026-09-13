@@ -75,12 +75,13 @@ const CONFIG = (() => {
       pages: c.pages || null,
       bootstrap: c.bootstrap ?? null,
       live: c.live || null,
+      telemetry: c.telemetry || null,
       binary: c.binary || "/static/views.wasm",
       exec: c.exec || "/static/wasm_exec.js",
       build: c.build || null,
     };
   }
-  return { wasm: read("howl-wasm-routes") || [], raw: [], data: null, pages: null, bootstrap: null, live: null,
+  return { wasm: read("howl-wasm-routes") || [], raw: [], data: null, pages: null, bootstrap: null, live: null, telemetry: null,
            binary: "/static/views.wasm", exec: "/static/wasm_exec.js", build: null }; // pre-0.2 shells
 })();
 
@@ -103,6 +104,46 @@ function checkBuild(res) {
 // ships one dead `if` instead of a kilobyte of code it will never run.
 if (CONFIG.live) {
   import(CONFIG.live + ".js").catch((e) => console.warn("howl: dev client unavailable:", e));
+}
+
+// ---------------------------------------------------------------------------
+// Tracing. The browser starts the trace and the server joins it, so a
+// navigation is ONE trace from the click to the render to the query behind it
+// — which is the only way to answer "was that slow here or there".
+//
+// W3C traceparent: version-traceid-spanid-flags. Sixteen random bytes and
+// eight, from crypto.getRandomValues; no library, and nothing to load before
+// the first request can be made. Sampled is always 01 — the decision belongs
+// to the server's sampler, which sees the route and the load.
+// ---------------------------------------------------------------------------
+const hex = (n) => {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+};
+
+// The navigation being served right now. Everything it causes — the fragment,
+// the route's data endpoint, a fetch the page makes from Go — carries this, so
+// they arrive at the server as one trace with the navigation as their parent.
+// Null between navigations: a fetch that belongs to no navigation starts its
+// own trace at the server rather than joining a stale one.
+let trace = null;
+
+function startTrace(path) {
+  trace = { id: hex(16), span: hex(8), path, at: performance.now() };
+  return trace;
+}
+
+// traceparent is the header value, or "" when nothing is being traced. The
+// span id is the navigation's own: the server's request span becomes its
+// child, and the navigation is reported afterwards under the same id.
+const traceparent = () => (trace ? `00-${trace.id}-${trace.span}-01` : "");
+
+// traced adds the header to a fetch's options without disturbing the rest.
+function traced(init = {}) {
+  const parent = traceparent();
+  if (!parent) return init;
+  return { ...init, headers: { ...(init.headers || {}), traceparent: parent } };
 }
 
 const WASM_ROUTES = CONFIG.wasm;
@@ -150,7 +191,7 @@ function fetchData(url) {
   if (!url) return Promise.resolve("{}");
   let p = DATA.get(url);
   if (!p) {
-    p = fetch(url, { credentials: "same-origin" })
+    p = fetch(url, traced({ credentials: "same-origin" }))
       .then((r) => {
         checkBuild(r);
         return r.json();
@@ -290,7 +331,7 @@ function warmStyles(html) {
 // swapped in under /dashboard's URL; a reload then disagreed with the screen.
 function prefetch(url) {
   if (CACHE.has(url) || INFLIGHT.has(url)) return INFLIGHT.get(url);
-  const p = fetch(url, { headers: { "X-Partial": "1" }, credentials: "same-origin" })
+  const p = fetch(url, traced({ headers: { "X-Partial": "1" }, credentials: "same-origin" }))
     .then(async (res) => {
       checkBuild(res);
       const leave = res.headers.get("X-Howl-Location");
@@ -328,15 +369,21 @@ const spaTarget = (a) => {
   return u.pathname + u.search;
 };
 
-// (b) Should we spend a round-trip warming it?
-const shouldPrefetch = (url) => {
-  if (!url || url === location.pathname + location.search) return false;
-  if (isRawRoute(new URL(url, location.origin).pathname)) return false;
-  // Once wasm can render this prefix locally, fetching its HTML is pure waste.
-  // Before that it is a useful bridge, so allow it while wasm is still loading.
-  if (wasmReady && wasmCandidate(new URL(url, location.origin).pathname)) return false;
-  return true;
-};
+// (b) Is this a link intent applies to at all: somewhere else, and ours to
+// swap in rather than the browser's to load?
+const intended = (url) =>
+  Boolean(url) && url !== location.pathname + location.search &&
+  !isRawRoute(new URL(url, location.origin).pathname);
+
+// (c) Should we spend a round-trip on its HTML? Once wasm can render this
+// prefix locally, fetching its HTML is pure waste; before that it is a useful
+// bridge, so allow it while wasm is still loading. Its DATA is never waste —
+// renderLocally awaits that endpoint — which is why warmData sits beside this
+// gate rather than behind it. It used to sit behind it, and in the steady state
+// the first visit to every data-bearing client route paid the RTT hover was
+// meant to hide; test/browser/wasm.test.mjs holds the line now.
+const shouldPrefetch = (url) =>
+  intended(url) && !(wasmReady && wasmCandidate(new URL(url, location.origin).pathname));
 
 // ---------------------------------------------------------------------------
 // Intent detection, modelled on Turbo Drive.
@@ -365,7 +412,7 @@ function scheduleIntent(el, url) {
   hoverTimer = setTimeout(() => {
     hoverTimer = null;
     warmData(url);
-    prefetch(url);
+    if (shouldPrefetch(url)) prefetch(url);
   }, PREFETCH_DELAY);
 }
 
@@ -381,7 +428,7 @@ function intentTarget(e) {
   const a = e.target.closest?.("a[href]");
   if (!a || optedOut(a) || frugal()) return null;
   const url = spaTarget(a);
-  return shouldPrefetch(url) ? { a, url } : null;
+  return intended(url) ? { a, url } : null;
 }
 
 document.addEventListener("pointerenter", (e) => {
@@ -400,7 +447,7 @@ for (const ev of ["focusin", "pointerdown", "touchstart"]) {
     if (t) {
       cancelIntent();
       warmData(t.url);
-      prefetch(t.url);
+      if (shouldPrefetch(t.url)) prefetch(t.url);
     }
   }, { passive: true });
 }
@@ -753,6 +800,7 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
 
   const mine = ++seq;
   const t0 = performance.now();
+  const span = startTrace(canonical(new URL(url, location.origin).pathname));
 
   // Local render: the component runs in the browser. Zero bytes, zero RTT, and
   // unlike the prefetch cache this works for routes never visited before.
@@ -761,8 +809,10 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
     if (seq !== mine) return; // a newer navigation won the race
     if (local) {
       applyFragment(url, local, push, restore, transition, replace);
+      const ms = performance.now() - t0;
       navLog && (navLog.textContent =
-        `wasm render → ${url} · ${(performance.now() - t0).toFixed(1)} ms · 0 bytes · server not contacted`);
+        `wasm render → ${url} · ${ms.toFixed(1)} ms · 0 bytes · server not contacted`);
+      finish(span, "wasm", ms, 0);
       return;
     }
     // Not loaded yet: serve this navigation from the server and start the
@@ -778,9 +828,11 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
   if (hit) {
     applyFragment(url, hit, push, restore, transition, replace);
     const age = performance.now() - hit.at;
+    const ms = performance.now() - t0;
     navLog && (navLog.textContent =
-      `precached nav → ${url} · ${(performance.now() - t0).toFixed(1)} ms · 0 RTT` +
+      `precached nav → ${url} · ${ms.toFixed(1)} ms · 0 RTT` +
       (age > FRESH_MS ? " · revalidating…" : ""));
+    finish(span, "cached", ms, hit.html ? hit.html.length : 0);
     // Stale-while-revalidate: refresh in the background, only re-swap if the
     // user is still on this route and the server actually returned something new.
     if (age > FRESH_MS) {
@@ -829,8 +881,10 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
       return;
     }
     applyFragment(landed, entry, push, restore, transition, replace);
+    const ms = performance.now() - t0;
     navLog && (navLog.textContent =
-      `cold nav → ${landed} · fragment ${entry.html.length} B · ${Math.round(performance.now() - t0)} ms (paid the RTT)`);
+      `cold nav → ${landed} · fragment ${entry.html.length} B · ${Math.round(ms)} ms (paid the RTT)`);
+    finish(span, "fragment", ms, entry.html.length);
   } catch {
     location.href = url; // any failure degrades to a normal page load
   } finally {
@@ -840,6 +894,53 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Reporting. The server has the half of the navigation it served; this is the
+// half it cannot see — how long the swap took, and the navigations that never
+// reached it at all. A wasm render is invisible to the server by construction,
+// so without this the fastest path in the framework is the one with no
+// evidence for it.
+//
+// The rows carry the navigation's own trace and span ids, and the endpoint
+// creates a span with exactly those — so the request the server already
+// recorded, which arrived as this span's child, nests underneath it. No
+// browser SDK: one POST of a small array, coalesced.
+// ---------------------------------------------------------------------------
+const REPORT_AFTER = 5000; // a batch waits this long for company
+let pending = [];
+let reportTimer = null;
+
+function finish(span, mode, ms, bytes) {
+  if (!span) return;
+  trace = null; // nothing after this belongs to the navigation
+  document.dispatchEvent(new CustomEvent("howl:navigated", {
+    detail: { path: span.path, mode, ms, bytes, traceId: span.id, spanId: span.span },
+  }));
+  if (!CONFIG.telemetry) return;
+  pending.push({ path: span.path, mode, ms: Math.round(ms * 100) / 100, bytes, traceId: span.id, spanId: span.span });
+  if (!reportTimer) reportTimer = setTimeout(report, REPORT_AFTER);
+}
+
+function report() {
+  clearTimeout(reportTimer);
+  reportTimer = null;
+  if (!pending.length || !CONFIG.telemetry) return;
+  const body = JSON.stringify({ navigations: pending });
+  pending = [];
+  // sendBeacon survives the document being torn down, which is the case that
+  // matters: the last navigation before someone closes the tab is the one
+  // they were looking at when it went wrong. It is also fire-and-forget, so a
+  // telemetry endpoint that is down cannot slow a page down.
+  if (navigator.sendBeacon && navigator.sendBeacon(CONFIG.telemetry, new Blob([body], { type: "application/json" }))) return;
+  fetch(CONFIG.telemetry, { method: "POST", body, headers: { "Content-Type": "application/json" }, keepalive: true })
+    .catch(() => {});
+}
+
+// A document that is going away reports what it has. pagehide and not unload,
+// for the same reason the dev client uses it: unload makes a document
+// ineligible for the back/forward cache.
+addEventListener("pagehide", report);
 
 // Any same-origin link in the document, not just the header — a sidebar or a
 // breadcrumb lives outside #outlet, so nothing re-renders it on navigation and
@@ -856,6 +957,13 @@ async function navigate(url, { push = true, restore = 0, transition = null, repl
 // router.Under(ctx, prefix), which is what the server uses — the two halves
 // disagreeing about which link is current is a bug you only see mid-navigation.
 // "/" is excluded from the prefix rule, or it would be current everywhere.
+// The rule is router.Under's: a link is active on its own path and on every
+// path below it, so a section link in the header stays lit across the section.
+// `data-active="exact"` is router.Current's: its own path only, which is what a
+// tab bar wants — on /dashboard/metrics the Overview tab at /dashboard is a
+// sibling, not a parent. A link has to use the same rule on both sides: the
+// server paints the first frame, this repaints it at boot, and the toy app's
+// tabs once showed one active tab and then two. test/e2e holds it now.
 function markActive() {
   const here = location.pathname;
   for (const a of document.querySelectorAll("a[href]")) {
@@ -867,7 +975,8 @@ function markActive() {
     } catch {
       continue;
     }
-    const on = path === here || (path !== "/" && here.startsWith(path.replace(/\/$/, "") + "/"));
+    const exact = a.dataset.active === "exact";
+    const on = path === here || (!exact && path !== "/" && here.startsWith(path.replace(/\/$/, "") + "/"));
     a.classList.toggle("active", on);
     if (on) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
@@ -1061,6 +1170,10 @@ globalThis.howl = {
   },
   island: register,
   hydrate,
+  // The current navigation's traceparent, for a fetch made from Go: core/dom
+  // sends it so a page's own request joins the navigation that caused it.
+  // Empty between navigations.
+  traceparent,
   // morph(el, html): reconcile el's children to html. What Element.Render in
   // Go calls; usable from an island for the same reason.
   morph,

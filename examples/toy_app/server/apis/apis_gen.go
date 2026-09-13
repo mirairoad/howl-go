@@ -12,8 +12,8 @@ import (
 // Pass it to api.Register together with the application's api.Config.
 func FsApiRoutes() []api.Route {
 	return []api.Route{
-		api.At("GET", "/api/metrics", Metrics),
-		api.At("GET", "/api/todos", e0.List),
-		api.At("POST", "/api/todos/sync", e0.Sync),
+		api.At(api.GET, "/api/metrics", Metrics),
+		api.At(api.GET, "/api/todos", e0.List),
+		api.At(api.POST, "/api/todos/sync", e0.Sync),
 	}
 }

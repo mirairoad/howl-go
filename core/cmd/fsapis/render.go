@@ -38,7 +38,7 @@ func renderTable(endpoints []endpoint, pkg, dir, apiPkg string) ([]byte, error) 
 		if e.Alias != "" {
 			ref = e.Alias + "." + e.Var
 		}
-		fmt.Fprintf(&b, "\t\tapi.At(%q, %q, %s),\n", e.Method, e.Path, ref)
+		fmt.Fprintf(&b, "\t\tapi.At(%s, %q, %s),\n", methodConst(e.Method), e.Path, ref)
 	}
 	fmt.Fprintf(&b, "\t}\n}\n")
 	return gofmt(b.Bytes())
@@ -127,7 +127,7 @@ func renderClient(endpoints []endpoint, pkg, apiPkg string) ([]byte, error) {
 
 		name := goName(e.Name, true)
 		returns := "(" + result + ", error)"
-		call := fmt.Sprintf("api.Call[%s](ctx, c.Transport, %q, %s, %s, %s)", result, e.Method, pathExpr, queryArg, bodyArg)
+		call := fmt.Sprintf("api.Call[%s](ctx, c.Transport, %s, %s, %s, %s)", result, methodConst(e.Method), pathExpr, queryArg, bodyArg)
 		bodySrc := "\treturn " + call + "\n"
 		if result == "api.None" {
 			returns = "error"
@@ -237,4 +237,17 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// methodConst writes the method as api.POST rather than "POST", so the
+// generated table reads as the vocabulary the package exports and a method
+// that is not one of them stands out as the quoted odd one — which api.Register
+// then panics on, naming it.
+func methodConst(method string) string {
+	switch method {
+	case "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS":
+		return "api." + method
+	default:
+		return fmt.Sprintf("%q", method)
+	}
 }

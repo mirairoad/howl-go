@@ -421,6 +421,9 @@ var (
 	// by hand. Delegate on the root covers rows that do not exist yet.
 	rebindRe       = regexp.MustCompile(`(?m)^\s*for\b[^\n]*\bQueryAll\([^\n]*\{\s*\n(?:[^\n]*\n){0,3}?[^\n]*\.On\("`)
 	importSignalRe = regexp.MustCompile(`"[^"]*howl-go/core/signal"`)
+	// core/observe is the server's: a page, a store or a component compiles
+	// into the wasm build too, where a span has no tracer and no exporter.
+	importObserveRe = regexp.MustCompile(`"[^"]*howl-go/core/observe"`)
 	// A page that restores its store but never reads the embedded snapshot is
 	// hydrating over the network what the server already rendered from.
 	restoreRe  = regexp.MustCompile(`\.Restore\(|\bHydrate\w*\(`)
@@ -490,6 +493,7 @@ func lintReactivity(root string, files []sourceFile) []Diagnostic {
 		}
 		inPages := strings.HasPrefix(f.Rel, "client/pages") || strings.Contains(f.Rel, "/client/pages/")
 		inStore := strings.Contains(f.Rel, "client/store/")
+		inClient := strings.HasPrefix(f.Rel, "client/") || strings.Contains(f.Rel, "/client/")
 		isServer := strings.HasPrefix(f.Rel, "server/") || strings.Contains(f.Rel, "/server/") ||
 			strings.HasSuffix(f.Rel, ".api.go")
 
@@ -548,6 +552,20 @@ func lintReactivity(root string, files []sourceFile) []Diagnostic {
 					File: f.Rel, Line: line, Rule: "page-imports-syscall-js", Level: "error",
 					Message: "a page imports syscall/js; the page package is compiled for the server too, where that does not build",
 					Fix:     "use core/dom, which is real under GOOS=js and no-ops everywhere else",
+				})
+			}
+		}
+
+		// Everything under client/ is linked into views.wasm. A span opened
+		// there runs in a browser with no tracer behind it, and the import
+		// drags the seam — and whatever an application hangs on it — into a
+		// binary that is already 8.3 MB.
+		if inClient {
+			if line, ok := findLine(f.Body, importObserveRe); ok {
+				out = append(out, Diagnostic{
+					File: f.Rel, Line: line, Rule: "client-imports-observe", Level: "error",
+					Message: "client code imports core/observe; it compiles into the wasm build, where a span has nothing to report to",
+					Fix:     "trace on the server — the request, the render, the endpoint and the db op are already spans; a page's cost is the browser's to measure",
 				})
 			}
 		}

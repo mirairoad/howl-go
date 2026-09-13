@@ -89,7 +89,7 @@ no dev-mode code: the dev server configures it through `HOWL_ADDR`,
 Per app: `make -C examples/toy_app slow` adds `LATENCY=240ms` to every request,
 which is roughly Sydney to us-east-1 — the whole point of the wasm renderer.
 `make -C www static` writes every route to `www/dist`. The docs site builds no
-wasm binary: no route there is `.client`, and 1.71 MB gzipped is the wrong
+wasm binary: no route there is `.client`, and 2.27 MB gzipped is the wrong
 trade for a public content site whose navigation prefetch already makes
 instant. `examples/toy_app` is where the browser renderer runs.
 
@@ -270,8 +270,8 @@ the application:
   error page rather than a truncated document when a render fails halfway, and a
   `Content-Length`.
 - **Static files are compressed once and kept**, with an ETag per representation
-  and `304` on revalidation. Gzipping a 6.1 MB wasm binary per request burns a
-  core per download; gzipping it once costs 1.71 MB of memory and nothing per
+  and `304` on revalidation. Gzipping a 8.3 MB wasm binary per request burns a
+  core per download; gzipping it once costs 2.27 MB of memory and nothing per
   request.
 - **`Coalesce` shares one render across identical concurrent requests** and
   refuses to share four things that would be bugs: non-GET, requests with
@@ -335,14 +335,14 @@ the path through `router.Lookup`, exactly as the server does:
 | steady-state render | **0.08 ms** |
 | bytes per navigation | **0** — server not contacted |
 | works for never-visited routes | **yes** (a prefetch cache cannot) |
-| `client/public/views.wasm` | 5.99 MB raw, **1.66 MB gzipped** |
+| `client/public/views.wasm` | 8.3 MB raw, **2.27 MB gzipped** |
 
 This is the thing a JS framework structurally cannot do: one component
 definition, server-rendered for SEO and client-rendered for interaction, no
 duplication and no JS runtime on the server.
 
-**The cost is the payload.** 1.66 MB gzipped versus ~50 KB for an equivalent
-React bundle — roughly 33×. It was 2.90 MB until the client stopped importing
+**The cost is the payload.** 2.27 MB gzipped versus ~50 KB for an equivalent
+React bundle — roughly 45×. It was 2.90 MB until the client stopped importing
 net/http: under GOOS=js that package is also fetch underneath, but it links
 crypto/tls and crypto/x509 to re-implement what the browser already does, and
 measured on an otherwise empty wasm binary that is 0.51 MB gzipped against
@@ -352,7 +352,7 @@ So it is lazy-loaded only for users heading into a route that needs it.
 Untested next step: TinyGo, which usually lands Go/wasm at 200–800 KB; whether
 templ's generated code survives its reflection limits is the open question.
 
-`net/http` does not compress by default — uncompressed this ships 6.1 MB, so
+`net/http` does not compress by default — uncompressed this ships 8.3 MB, so
 `gzipStatic` in `main.go` is not optional at this size.
 
 ### The store runs in the browser too (`/todos`)
@@ -410,4 +410,4 @@ Navigation is solved. The remaining limits are structural:
   if a page ever needs the store, the shared types must move to their own
   package or you get a cycle.
 - Splitting `client/pages` into subpackages will not shrink the wasm — the Go
-  linker already drops unused code; the 6.1 MB is runtime and GC.
+  linker already drops unused code; the 8.3 MB is runtime and GC.

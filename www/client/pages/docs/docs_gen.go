@@ -18,4 +18,5 @@ var Index = []Entry{
 	{Slug: "dev", Title: "The dev server", Blurb: "go run github.com/mirairoad/howl-go/core/cmd/howl dev"},
 	{Slug: "database", Title: "The document store", Blurb: "db is optional and separate from the framework: a document store with an audit envelope, soft delete, optimistic locking and no migration framework. A collec…"},
 	{Slug: "frontend", Title: "Frontend recipes", Blurb: "The browser half of howl-go, as recipes. Every topic has the same five parts: When to use it, the Rules, a complete Example that compiles, what goes Wrong wh…"},
+	{Slug: "observability", Title: "Observability", Blurb: "Traces of every request, page render, endpoint call, guard and document operation, and the metrics that fall out of them, exported over OTLP. Nothing in the …"},
 }

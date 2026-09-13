@@ -402,11 +402,25 @@ func Fetch(ctx context.Context, method, url string, body []byte, header map[stri
 		js.CopyBytesToJS(buffer, body)
 		options["body"] = buffer
 	}
-	if len(header) > 0 {
-		headers := map[string]any{}
-		for name, value := range header {
-			headers[name] = value
+	headers := map[string]any{}
+	for name, value := range header {
+		headers[name] = value
+	}
+	// The navigation that caused this request, if there is one. A page's own
+	// fetch — the generated API client's, a store's sync — then arrives at the
+	// server inside the same trace as the navigation that mounted the page,
+	// rather than as an orphan nobody can attribute. app.js owns the value;
+	// this only passes it on, and sends nothing between navigations.
+	if _, set := headers["traceparent"]; !set {
+		if howl := js.Global().Get("howl"); howl.Truthy() {
+			if fn := howl.Get("traceparent"); fn.Type() == js.TypeFunction {
+				if parent := fn.Invoke().String(); parent != "" {
+					headers["traceparent"] = parent
+				}
+			}
 		}
+	}
+	if len(headers) > 0 {
 		options["headers"] = headers
 	}
 

@@ -30,11 +30,14 @@ templ NavLink(href, label string) {
 }
 
 // Tab is NavLink for the dashboard's inner chrome.
+// A tab is active on its own path only — router.Current, not router.Under —
+// and says so to app.js with data-active="exact", so the client's repaint at
+// boot and after every navigation applies the same rule this markup did.
 templ Tab(href, label string) {
 	if router.Current(ctx) == href {
-		<a href={ templ.SafeURL(href) } class="tab active">{ label }</a>
+		<a href={ templ.SafeURL(href) } class="tab active" data-active="exact" aria-current="page">{ label }</a>
 	} else {
-		<a href={ templ.SafeURL(href) } class="tab">{ label }</a>
+		<a href={ templ.SafeURL(href) } class="tab" data-active="exact">{ label }</a>
 	}
 }
 

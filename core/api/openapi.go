@@ -91,7 +91,7 @@ func Document(info Info, routes []Route) map[string]any {
 		if description != "" {
 			op["description"] = description
 		}
-		item[strings.ToLower(rt.Method)] = op
+		item[strings.ToLower(string(rt.Method))] = op
 	}
 
 	doc := map[string]any{
@@ -163,9 +163,9 @@ func operationID(rt Route) string {
 			b.WriteString(strings.ToUpper(f[:1]))
 			b.WriteString(f[1:])
 		}
-		return strings.ToLower(rt.Method) + b.String()
+		return strings.ToLower(string(rt.Method)) + b.String()
 	}
-	return strings.ToLower(rt.Method) + strings.ReplaceAll(rt.Path, "/", "_")
+	return strings.ToLower(string(rt.Method)) + strings.ReplaceAll(rt.Path, "/", "_")
 }
 
 // tagFor groups endpoints by their first path segment after the prefix, which

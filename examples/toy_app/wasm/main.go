@@ -3,20 +3,20 @@
 // Compiled with GOOS=js GOARCH=wasm. Imports the SAME generated route table and
 // the SAME templ components the server uses, so a navigation renders locally
 // with no HTML over the wire.
+//
+// Only the syscall/js wiring is here. What a route renders to, and from which
+// parts of the payload, is wasm/render — a package without a build tag, so its
+// test can run on the host and hold each .client route against the server.
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"html"
 	"strings"
 	"syscall/js"
 
 	"github.com/mirairoad/howl-go/core/dom"
 	"github.com/mirairoad/howl-go/core/router"
-	"github.com/mirairoad/howl-go/core/state"
 	"github.com/mirairoad/howl-go/examples/toy_app/client/pages"
-	"github.com/mirairoad/howl-go/examples/toy_app/client/store"
+	"github.com/mirairoad/howl-go/examples/toy_app/wasm/render"
 )
 
 var routes = pages.FsClientRoutes()
@@ -53,44 +53,22 @@ func unmount(_ js.Value, args []js.Value) any {
 
 // render(path, renderPayloadJSON) -> html for the page + its layouts, or "" if this
 // route is not client-renderable (then the client falls back to the server).
-func render(_ js.Value, args []js.Value) any {
+func renderRoute(_ js.Value, args []js.Value) any {
 	if len(args) < 2 {
 		return ""
 	}
-	path := canonical(args[0].String())
-
-	rt, params, ok := router.Lookup(routes, path)
-	if !ok || !rt.Client {
-		return ""
-	}
-
 	payload, err := router.DecodeRenderPayload(args[1].String())
 	if err != nil {
 		return "<p class=\"hint\">bad data: " + err.Error() + "</p>"
 	}
-	var m store.Metrics
-	if err := json.Unmarshal(payload.RouteData, &m); err != nil {
-		return "<p class=\"hint\">bad route data: " + err.Error() + "</p>"
+	html, ok, err := render.Page(routes, canonical(args[0].String()), payload)
+	if !ok {
+		return ""
 	}
-
-	ctx := router.WithRoutes(context.Background(), routes)
-	ctx = router.WithCurrent(ctx, path)
-	ctx = router.WithParams(ctx, params)
-	ctx, err = state.Hydrate[store.Meta](ctx, payload.Bootstrap)
 	if err != nil {
-		return "<p class=\"hint\">bad bootstrap state: " + err.Error() + "</p>"
+		return "<p class=\"hint\">" + err.Error() + "</p>"
 	}
-	ctx = store.WithMetrics(ctx, m)
-
-	var sb strings.Builder
-	// Same wire shape as the server's fragment: the page's head rides along in
-	// an inert <template> so the client merges it the one way.
-	title, head := rt.HeadParts(ctx, rt.Label)
-	sb.WriteString("<template data-head><title>" + html.EscapeString(title) + "</title>" + head + "</template>")
-	if err := rt.Component().Render(ctx, &sb); err != nil {
-		return "<p class=\"hint\">render error: " + err.Error() + "</p>"
-	}
-	return sb.String()
+	return html
 }
 
 func canonical(p string) string {
@@ -101,7 +79,7 @@ func canonical(p string) string {
 }
 
 func main() {
-	js.Global().Set("howlRender", js.FuncOf(render))
+	js.Global().Set("howlRender", js.FuncOf(renderRoute))
 	js.Global().Set("howlMount", js.FuncOf(mount))
 	js.Global().Set("howlUnmount", js.FuncOf(unmount))
 

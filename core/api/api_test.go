@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -441,5 +442,59 @@ func TestSpecAndDocsAreServed(t *testing.T) {
 	body, _ := io.ReadAll(page.Body)
 	if !strings.Contains(string(body), "/api/openapi.json") {
 		t.Fatal("the docs page does not point at the spec it was given")
+	}
+}
+
+// Method is a named type so the compiler has something to check. The three
+// spellings that compile all still compile, and a method nothing sends is a
+// panic at registration rather than a route that silently never matches.
+func TestMethodIsTypedAndValidated(t *testing.T) {
+	if api.POST != "POST" || api.DELETE.String() != "DELETE" {
+		t.Fatal("the constants are not their own values")
+	}
+	// An untyped constant still assigns, which is what keeps every existing
+	// spec and every generated table compiling.
+	var fromLiteral api.Method = "PATCH"
+	if fromLiteral != api.PATCH || !fromLiteral.Valid() {
+		t.Error("an untyped constant no longer assigns")
+	}
+	if api.Method("POSt").Valid() || api.Method("").Valid() || api.Method("TRACE").Valid() {
+		t.Error("a method nothing sends was accepted")
+	}
+
+	// Case is forgiven — At upper-cases what it is given, so "post" is POST.
+	// What is not forgiven is a method nothing will send: ServeMux accepts
+	// "PURGE /orders" as a pattern quite happily and then never matches it.
+	if api.At("post", "/api/x", stub(t)).Method != api.POST {
+		t.Error("case is no longer normalised")
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("a method nothing sends registered a route that could never be called")
+		}
+		if !strings.Contains(fmt.Sprint(r), "PURGE") {
+			t.Errorf("the panic does not name the method: %v", r)
+		}
+	}()
+	api.Register(http.NewServeMux(), api.Config{}, api.At("PURGE", "/api/purge", stub(t)))
+}
+
+func stub(t *testing.T) api.Route {
+	t.Helper()
+	return api.Define(api.Spec[api.None, api.None, Created]{
+		Name:    "Stub",
+		Handler: func(*api.Request[api.None, api.None]) (Created, error) { return Created{}, nil },
+	})
+}
+
+// The default is still GET, and it is the typed one.
+func TestMethodDefaultsToGET(t *testing.T) {
+	route := api.Define(api.Spec[api.None, api.None, Created]{
+		Name:    "Defaulted",
+		Handler: func(*api.Request[api.None, api.None]) (Created, error) { return Created{}, nil },
+	})
+	if route.Method != api.GET {
+		t.Errorf("Method = %q, want GET", route.Method)
 	}
 }

@@ -170,6 +170,10 @@ Directory names take modifiers too: `posts/id.dyn/index.templ` → `/posts/{id}`
 **An unknown modifier is a hard error.** A silently ignored typo is a route that quietly
 loses a capability.
 
+Which routes get `.client` is a judgement per route, not a project-wide mode — a
+login-gated dashboard can be a full SPA in the same app that server-renders the marketing
+pages. See *Choosing server or client rendering*.
+
 `index` cannot be `.dyn` — name the file after the parameter instead.
 
 ### Directives
@@ -609,6 +613,14 @@ It fires after the markup is in the DOM and after the page's `Mount`.
 `prefers-reduced-motion` disables transitions outright. Transitions are opt-in — nothing
 animates unless declared.
 
+**Active links.** `app.js` marks every same-origin `<a>` on the page — at boot and after
+each navigation — with `class="active"` and `aria-current="page"` by `router.Under`'s rule:
+its own path and everything below it. A link that should light only on its own path
+(a tab bar, where `/dashboard` is a sibling of `/dashboard/metrics`, not its parent) carries
+`data-active="exact"`, which is `router.Current`'s rule. Render the server side with the
+matching function, because the client repaints the first frame at boot: a tab rendered
+with `router.Current` and no attribute shows one active tab, then two.
+
 ---
 
 ## Making a page interactive
@@ -620,7 +632,7 @@ the state *is*, not by how interactive the page feels:
 |---|---|---|
 | nothing — a form that posts and re-renders | plain `<form method="post">`, an endpoint, a redirect | 0 |
 | local to one widget, and JS-shaped (a dropdown, a filter, a sort) | an **island**: `data-island="name"` + `howl.island(name, setup)` in your own JS | a few lines of vanilla |
-| domain state the server also owns, mutated by the user, rendered by real components | a **`.client` page + a store + signals** | the wasm binary, 1.71 MB gzipped, lazy-loaded |
+| domain state the server also owns, mutated by the user, rendered by real components | a **`.client` page + a store + signals** | the wasm binary, 2.27 MB gzipped, lazy-loaded |
 
 Do not reach for the third one because a value changes on screen. Reach for it
 when the *same rules* have to run on the server and in the browser, and you do
@@ -811,6 +823,64 @@ a listener bound with `On` to a node the morph replaced is gone, which is what
 
 ---
 
+## Choosing server or client rendering
+
+Nothing in the framework picks for you, and nothing about it is global: the
+decision is one file name at a time. `index.templ` is a server-rendered route;
+`index.client.templ` is the same component, also compiled into `views.wasm`, so
+navigations to it render in the browser. Layouts, markup, `Mount`, the route
+table and the endpoints are identical either way — changing your mind about a
+route is a rename and a re-run of `fsroutes`.
+
+Both kinds are server-rendered on the cold request. A `.client` route is not an
+empty div waiting for a bundle: the first response is the same full HTML
+document, with the same `<title>`, that a plain route sends, so it is indexable
+and it paints before any wasm exists. `views.wasm` is fetched at idle after that
+paint, or when the pointer moves toward a link into a client route — never on
+the critical path. What a `.client` route changes is every navigation *after*
+the first one.
+
+| | plain route | `.client` route |
+|---|---|---|
+| cold request | full HTML | full HTML — identical |
+| navigation | fragment: one RTT plus the server's render | **0.08 ms, 0 bytes** — the server is not contacted |
+| a route the visitor has never opened | a request; prefetching only helps where the guess was right | already local |
+| cost | none | **2.27 MB gzipped**, once per visit, lazily |
+
+A route's `//howl:data` endpoint is still fetched when it has one, once, and
+cached — the zero is the markup, which is the part that grows.
+
+So the only question is whether that 2.27 MB is worth it *to the visitors of
+that route*, and the honest answer differs per route inside one app:
+
+- **Worth it — go full SPA.** A dashboard, an admin, an editor, a back-office
+  table: anything behind a login, where the session is long, the device is
+  usually a desktop and the payload amortises over hundreds of navigations.
+  Marking every route under that prefix `.client` gives you a real SPA — after
+  the first paint the app never contacts the server to change screens, including
+  for screens nobody has visited yet, which is the thing a prefetch cache
+  structurally cannot do. `examples/toy_app` does exactly this under
+  `/dashboard`. There is no directory modifier for it: each file is named
+  `index.client.templ`, one per route you want in the wasm build.
+- **Not worth it.** A marketing page, a blog post, a docs page, a pricing page:
+  a first-visit-and-often-leave audience on mobile data, where the cold render is
+  already the whole product and the binary buys a second navigation many of them
+  will never make.
+
+This is a suggestion, not something the tooling enforces. An app with no
+`.client` route ships no wasm at all — an ordinary server-rendered site with
+prefetching, which measures 0.3 ms route changes and is a perfectly good answer.
+An app that marks every route `.client` is a full SPA that still server-renders
+the first hit and still static-exports. The mixed shape is only the one that
+usually wins, because the public half of a product and the half people work in
+all day rarely have the same visitor.
+
+`howl.config.wasm` is derived from the route table rather than configured, so
+the browser downloads the binary only for the routes that asked for it — and
+the two sections below are the rules those routes then live under.
+
+---
+
 ## Client render safety
 
 A `.client.templ` route is compiled into two different Go binaries. The server
@@ -891,7 +961,18 @@ installing the same application state for all of them. `render` returns `""` for
 that is not `.client`, and the client falls back to the server. Its output must start with the same `<template data-head><title>…</title>…</template>`
 prefix the server sends — one wire shape, one merge path.
 
-Cost: ~6.1 MB raw / 1.71 MB gzipped — `examples/toy_app`, at the
+Keep the `syscall/js` wiring and nothing else in `wasm/main.go`. How the context is rebuilt
+from the payload — which type `RouteData` decodes to, which `With…` installs it — belongs in
+a package **without** the build tag (`examples/toy_app/wasm/render`), because that is the
+one decision `go test` on the host otherwise cannot reach, and its failure is silent: a
+route whose data is not installed there renders correctly on the cold request and empty
+after the first local navigation, since the accessors return the zero value on a miss.
+`wasm/render/render_test.go` renders every `.client` route from `Config.Data` and from the
+browser's payload and requires both to be identical, and different from an empty payload.
+`test/e2e` then runs the real binary in Chromium and holds `howlRender`'s bytes against the
+server's `X-Partial` response.
+
+Cost: ~8.3 MB raw / 2.27 MB gzipped — `examples/toy_app`, at the
 `gzip.BestCompression` level `core/app/static.go` serves at. For scale, React
 19's production client runtime is 99.2 kB gzipped and Vue 3.5's is 40.0 kB, both
 before any application code. Lazy-loaded only for routes in `howl.config.wasm`.
@@ -934,6 +1015,12 @@ var Purge = api.Define(api.Spec[api.None, api.None, Purged]{
 Rules:
 
 - **One `api.Define` per file.** The file name is the URL; it can only describe one.
+- The method comes from the file name. To set it in the spec instead, use the typed constants:
+  `Method: api.POST` — `api.GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`.
+  `Method` is a named string type, so `Method: "POST"` still compiles, and case is normalised.
+  A method outside that set **panics at `Register`**: `ServeMux` accepts `PURGE /orders` as a
+  pattern quite happily and then never matches it, and a route that silently never runs is the
+  kind of bug that outlives a deploy. `TRACE` and `CONNECT` are deliberately not in the set.
 - `api.None` for no query, no body, or no response (a `None` response answers 204).
 - Query decoding uses `query:"name"` tags. Body is JSON, and unknown fields are rejected.
 - A query field tagged `path:"id"` is filled from the `{id}` placeholder and typed like a query
@@ -1087,6 +1174,207 @@ Test against `db/memdb`, which is the same contract over a map. Both backends ru
 `db/conformance`. Scaffold a new one with `howl_scaffold` (`kind: "collection"`,
 `name: "users"`, `fields: ["email:string"]`) — nothing generates from `server/store/`,
 so the location is convention, not machinery.
+
+## Observability (`otel`)
+
+Traces of every request, render, endpoint call, guard and document operation, and the
+metrics that fall out of them, over OTLP. The SDK lives in the **`otel/` nested module**
+(its own `go.mod`, like `db/pg` and `desktop`); `core/` knows only `core/observe`, a
+zero-dependency seam of three methods (`Set`, `Event`, `End`) that the framework calls at the
+places a request already passes through. An application that never imports `otel/` pays a
+nil check per operation and carries no SDK.
+
+```go
+shutdown, err := otel.Setup(ctx, otel.WithServiceName("pack"))   // first thing in main
+defer shutdown(ctx)
+
+a := app.New(app.Config{
+	Use: []mw.Middleware{
+		otel.HTTP(),                                // first: the request span everything else nests in
+		mw.RequestID,
+		mw.LogWith(mw.LogOptions{Callers: true, Skip: mw.SkipNoise}),
+		mw.Named("guard.session", guards.Session),  // a guard, as itself in the trace
+	},
+})
+api.Register(mux, api.Config{OnError: otel.RecordError}, apis.FsApiRoutes()...)
+slog.SetDefault(slog.New(otel.SlogHandler(slog.Default().Handler())))  // trace_id, span_id on every log line
+log.Fatal(a.Listen(otel.Routes(mux)))       // names the requests the framework does not route itself
+```
+
+**Every method, not only GET.** Page routes are registered `GET` (a page is a document), but
+endpoints are whatever their file name or `Method: api.POST` says, and every one is traced the
+same, span and metric alike. `mw.Cache` only ever sees GET because that is
+all it caches; `mw.RateLimit`, the guards and every `db` write (`create`, `patch`, `delete`,
+`patch_where`, `delete_where`, `restore`) are method-blind.
+
+The one thing that needs `otel.Routes`: a handler put on the mux **by hand** — a form post to
+`server/actions`, a fragment endpoint answering `<li>`, a webhook. Neither `App.render` nor
+the endpoint pipeline runs for it, so nothing knows its route and the span is a bare `POST`
+with no `http.route` — one unnamed series for every write path in the application.
+`otel.Routes(mux)` reads the pattern the mux matched and names it `POST /api/todos`. It has to
+wrap the mux **directly**: `ServeMux` sets `Request.Pattern` in place on the request it was
+handed, so a middleware that clones the request (`mw.RequestID` does) hides it from anything
+further out. `a.Listen` applies `Use` around the handler you pass, which is the right side of
+that line.
+
+`Setup` reads the standard environment and needs nothing else:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT="http://10.19.96.7:4318"
+OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
+OTEL_RESOURCE_ATTRIBUTES="service.instance.id=prod,deployment.environment=prod"
+OTEL_SERVICE_NAME="pack"
+```
+
+`OTEL_TRACES_SAMPLER`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_EXPORTER_OTLP_HEADERS` and the
+rest are the SDK's to honour. `OTEL_TRACES_EXPORTER=none` / `OTEL_METRICS_EXPORTER=none`
+turns a signal off. **The module speaks `http/protobuf` only** (the collector's `:4318`) and
+refuses any other `OTEL_EXPORTER_OTLP_PROTOCOL` at `Setup` — exporting nothing while the
+process believes it is exporting is the one failure an observability library must not have.
+The gRPC exporter and its dependency tree are what the module exists not to carry.
+
+**What arrives**, already, with no code in the application:
+
+```
+GET /dashboard/{id}                    request — otelhttp's, named by the route once the mux has matched
+├─ guard.session                       a middleware in mw.Named, to the point it handed over; howl.redirect if it did not
+├─ howl.render /dashboard/{id}         the page + layouts; howl.mode=document|fragment|raw, howl.client, howl.bytes
+│  └─ db.get users                     the whole operation: cache, decoding, the wait
+│     └─ sql.find_one users            and the backend call inside it
+└─ api Metrics                         an endpoint; howl.endpoint, and howl.api.stage=decode|validate|authorize|handler on failure
+   └─ db.find orders
+      └─ sql.find_many orders
+```
+
+**Every `db.Service` call is a span**, and the backend call is a span inside it — the gap
+between the two is validating, key building, JSON and waiting, which is where a "slow
+database" usually turns out not to be the database. Reads (`get`, `get_many`, `find`, `one`,
+`count`), writes (`create`, `patch`, `delete`, `restore`, `patch_where`, `delete_where`) and
+maintenance (`report`, `drop_field`, `columns`, `drop_column`) alike. What they carry:
+
+| attribute | on |
+|---|---|
+| `db.system.name`, `db.collection.name`, `db.operation.name` | every db span |
+| `howl.db.rows` | how many documents it answered with |
+| `howl.cache.hits` / `howl.cache.misses` | counted per operation, not one event per lookup — `get_many` of fifty ids is one span with two numbers |
+| `howl.db.session` | inside a transaction, where the cache is bypassed in both directions |
+| `howl.db.attempts` | a patch's optimistic-lock attempts; 3 is `ErrConflict` about to happen |
+| `howl.db.coalesced` | this read waited on another caller's identical query and made none of its own |
+| `howl.db.bulk` | `native` (one statement) or `fallback` (one per row, on a backend with no `BulkWriter`) |
+
+**The query is recorded, redacted.** `db.query.text` carries the filter and `howl.db.set` what
+an update wrote — the two things that answer "which documents did that touch, and what did it
+do to them". The shape is always there; the values are filtered by `db.Options.Trace`:
+
+| mode | values |
+|---|---|
+| `observe.Safe` (default) | numbers, booleans, null, and strings that are identifiers — UUID, ULID, hex digest, digits. Everything else is `"?"` |
+| `observe.Full` | every value, except sensitive field names and email addresses |
+| `observe.Off` | nothing: not the values, not the field names |
+
+Two rules hold in **every** mode, including `Full`. A field whose name is a credential or a
+contact detail — `password`, `api_key`, `email`, `phone`, `dob`, `card` — has its whole
+subtree redacted. Matched by word, and a word break is punctuation *or* a case change, so
+`user_email`, `userEmail` and `UserEmail` are all caught while `keyword` and `monkey` are
+not. And **anything that looks
+like an email address is never recorded**, wherever it appears: under an innocent field name,
+nested in an `$or`, in an array, in key position. `core/observe`'s tests assert that in both
+modes, at every depth.
+
+```
+{"limit":20,"sort":{"created":-1},"where":{"$and":[{"email":{"$eq":"?"}},
+ {"org_id":{"$eq":"0193a5c2-5f4e-7b3a-9c1d-2e6f8a0b4c7d"}}],"meta.deleted_at":null}}
+```
+
+The id is the one value kept by name — `howl.db.id` — because it is how the document is found
+again. An RFC 3339 **date-time** counts as an identifier too, so a range query reads
+`{"meta.created_at":{"$lt":"2026-01-02T03:04:05Z"}}` rather than `{"$lt":"?"}` — the
+difference between knowing a bulk delete swept by date and knowing what it deleted. A bare
+**date** does not: `1985-03-12` is how a birthday is written, and the `dob`/`birth`/`born`
+names are denied in every spelling for the case where one is stored as a `time.Time`. Sort and
+projection fields are recorded as **keys** (`{"created":-1}`), since a key is schema and a
+string value is data. An `in` clause over 500 ids renders 8 and `"+492 more"`. Output is
+capped at 1 KiB and depth at 6.
+
+Endpoints do the same for what the caller sent — `howl.api.query` and `howl.api.body`, under
+`api.Config.Trace`, recorded *before* `Validate` runs because a call refused for being wrong
+is the one whose arguments you want.
+
+**None of it is built unless a tracer is installed.** Measured on `db.Find` against the
+in-memory backend: untraced is byte-identical to `Trace: observe.Off` (16.1 µs, 50 allocs);
+with a tracer it is 27.2 µs, of which rendering the filter is 2.3 µs and 22 allocations. The
+document id and the row count are attributes, never metric labels.
+
+Events on the request span: `cache.hit` / `cache.miss` (`mw.Cache`, `//howl:cache`, `Spec.Cache`
+and a document read's cache alike) and `ratelimit.refused`. `X-Trace-Id` goes out on every
+traced response. A `//howl:cache` hit has **no** render span — the absence is the information.
+
+| metric | by |
+|---|---|
+| `http.server.request.duration` | otelhttp; `http.route` once known |
+| `howl.render.duration` | `howl.route`, `howl.mode` |
+| `howl.api.duration`, `howl.api.errors` | `howl.endpoint` (+ `howl.api.stage` on errors) |
+| `db.client.operation.duration` | `db.system.name`, `db.collection.name`, `db.operation.name` |
+| `howl.db.storage.duration` | the same three — the backend's share of the above |
+| `howl.cache` | `howl.kind` (`http`\|`db`), `result` (`hit`\|`miss`), `db.collection.name` |
+| `howl.ratelimit.refused` | — |
+
+`otel.WatchCache(users, orders)` adds the two cache outcomes no span can show, read from each
+service's own counters at collection time: `howl.db.cache.bypassed` (the shared version was
+unreadable — a broken `Versioner`, which otherwise looks exactly like a cold cache) and
+`howl.db.cache.too_large` (results returned but never stored, over `Cache.MaxEntryBytes`).
+
+Durations are seconds. The metrics are derived **from the spans** at `End` — one set of
+hooks, and a trace and a metric cannot disagree about what happened.
+
+### The browser's half
+
+A navigation starts its trace in the browser, so a click and the query behind it are **one
+trace**. `app.js` mints a W3C `traceparent` per navigation — 16 random bytes and 8, from
+`crypto.getRandomValues`, no SDK — and sends it on the fragment fetch, the route's
+`//howl:data` endpoint, and any fetch the page makes from Go (`core/dom` reads
+`howl.traceparent()`; the generated API client inherits it). The server's propagator joins it,
+so the request span is already the navigation's child before the navigation is reported.
+
+What the server cannot see is the other half: how long the swap took, and the navigations
+that never reached it at all. Those are reported:
+
+```go
+mux.Handle("POST /api/telemetry/navigations", otel.Navigations())
+a := app.New(app.Config{Telemetry: "/api/telemetry/navigations", …})
+log.Fatal(a.Listen(otel.Routes(mux)))
+```
+
+`Config.Telemetry` is published in the `howl-client` JSON, and **nothing reports unless it is
+set** — the same shape as the dev client's `live`. `app.js` batches rows for 5 s and flushes
+on `pagehide` with `sendBeacon`, falling back to a `keepalive` POST. `otel.Navigations` creates
+each span with the **browser's own span id**, so the request the server already recorded nests
+underneath it:
+
+```
+howl.navigate /dashboard/metrics    220 ms   howl.mode=fragment  howl.bytes=1834
+└─ GET /dashboard/metrics            18 ms
+   └─ howl.render /dashboard/metrics  3 ms
+```
+
+A `howl.mode=wasm` row has no child by construction — the server was never contacted — and
+that row is the only evidence the framework's fastest path ran at all. Every navigation also
+dispatches `howl:navigated` with `{path, mode, ms, bytes, traceId, spanId}`, so an application
+can send the same numbers somewhere else instead.
+
+**Your own spans**: `otel.Start(ctx, "import.csv")` returns `(ctx, span)`; `span.Set`,
+`span.Event`, `span.End(err)`. It is `observe.Start` re-exported so the application imports
+one package; `otel.Tracer(name)` / `otel.Meter(name)` hand back the SDK's for anything the
+three methods cannot say. **Logs**: `otel.SlogHandler` puts `trace_id` and `span_id` on every
+record logged with a request context; exporting the records themselves over OTLP is the
+application's decision, not the module's.
+
+**Rules.** `otel.HTTP()` goes first in `Use`, and the mux goes in `otel.Routes`. Do not open spans for what is already traced —
+a request, a render, an endpoint, a db op. A guard is `mw.Named("guard.<name>", guard)`, not a
+hand-opened span. **Nothing under `client/` may import `core/observe`**: a page compiles into
+the wasm build too, where a span has no exporter — `howl check` reports it.
+
+---
 
 ## Native window (`desktop`)
 

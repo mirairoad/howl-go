@@ -93,7 +93,7 @@ Signals are the heaviest of the three ways to make something change on screen, a
 |---|---|---|
 | nothing — a form that posts and re-renders | `<form method="post">` and an endpoint | 0 |
 | local to one widget, JS-shaped (dropdown, filter, sort) | an island | a few lines of vanilla |
-| domain state the server also owns, mutated by the user | a `.client` page + a store + signals | the wasm binary, 1.71 MB gzipped |
+| domain state the server also owns, mutated by the user | a `.client` page + a store + signals | the wasm binary, 2.27 MB gzipped |
 
 The third one earns its cost when the *same rules* have to run on both sides, and you would otherwise write them twice.
 
