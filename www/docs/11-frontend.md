@@ -19,7 +19,8 @@ Three facts everything below follows from. There is no component tree: a templ c
 7. Two writes in one handler go in `signal.Batch`.
 8. Fetch in a goroutine, never in the callback. A goroutine writes signals and registers nothing.
 9. No `syscall/js` in a page. `core/dom` only.
-10. Run `howl check` after editing.
+10. Anything opened for the life of a document — an `EventSource`, a long poll, a websocket — is closed on `pagehide` and reopened on `pageshow` when `event.persisted`. A browser gives an origin **six** connections over HTTP/1.1 and a document that has been navigated away from can keep its sockets, so one opened per document is one *per document that tab has loaded*: the sixth takes the last socket, and after that nothing reaches the server at all — not a fragment, not an image, not `views.wasm`. Every click does nothing and the tab reads as frozen. Whole document loads are ordinary (a guard's `app.Redirect`, a form post answered with a redirect, every `data-no-spa` link), so six arrive within a minute of clicking. `pagehide` and not `unload`: `unload` is what makes a document ineligible for the back/forward cache. This was howl's own dev client, fixed 2026-09-13.
+11. Run `howl check` after editing.
 
 **Example** — the shape of every interactive page:
 
@@ -53,6 +54,7 @@ func Mount() {
 **Rules**
 
 - The file is `client/pages/<dir>/index.templ` (server-rendered fragment on navigation, `Mount` runs after) or `index.client.templ` (also rendered by the wasm build). Both get `Mount`; both are plain `func`, not `templ`.
+- Which of the two is a suggestion, decided per route and reversible by renaming the file. `.client` is worth it where the 2.27 MB gzipped wasm binary amortises — a dashboard, an admin, an editor, anything behind a login, which then behaves as a full SPA: 0.08 ms and 0 bytes per navigation, including to routes the user has never opened. It is not worth it on a public page a visitor reads once on mobile data. Either way the cold request is the same server-rendered HTML, so `.client` costs no indexability. Mixing both in one app is normal; `howl_conventions section:"Choosing server or client rendering"` has the table.
 - `Mount` runs in a scope. Register everything in it, synchronously.
 - `Unmount` is optional. Write one only to cancel a goroutine or timer that `Mount` started — and guard it: `Unmount` runs for the outgoing route whether or not its `Mount` ever ran (the user can leave before the wasm loads), so `close(stop)` needs `if stop != nil`.
 - Read state through the signal, not through the store: `store.Todos.Get()` subscribes, `store.Client().List()` does not.
@@ -377,6 +379,7 @@ signal.Effect(func() {
 - Programmatic: `dom.Navigate("/path")`, `dom.Navigate("/", dom.Replace())`. `dom.Prefetch` warms one.
 - After a write on the current page, the store already repainted; there is nothing to navigate to. If the page is server-rendered only, `howl.navigate(url, {fresh: true})` from JS re-fetches past the prefetch cache.
 - Anything outside `#outlet` survives navigation. Anything inside is replaced, and its page's scope is disposed.
+- Active links are the client's: `.active` + `aria-current` by `router.Under`'s rule (the path and everything below), or by `router.Current`'s with `data-active="exact"` — a tab bar. Use the same rule on the server side of that link, or the first paint changes under the user.
 - A deploy while the tab is open: the next navigation after the server's build id changes is a full load. Nothing to do.
 
 **Wrong** — `location.href = ...` from Go (loses the SPA, the scope, the prefetch cache); keeping page state in a package var and expecting it to reset per visit (it does not; reset it in `Mount` or keep it in the store).

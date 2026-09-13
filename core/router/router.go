@@ -353,6 +353,10 @@ type Client struct {
 	// Components must read the decoded value from ctx, never from process
 	// globals whose server and wasm builds can disagree.
 	Bootstrap any `json:"bootstrap,omitempty"`
+	// Telemetry is where app.js posts what the server cannot see: how long a
+	// navigation took in the browser, and the ones it rendered locally without
+	// asking. Empty means the reporting code never runs. See otel.Navigations.
+	Telemetry string `json:"telemetry,omitempty"`
 	// Live is the dev server's reload endpoint, set only when `howl dev` is in
 	// front. Empty in production, where the client then loads no dev code at
 	// all — not even the check for it.

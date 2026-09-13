@@ -656,6 +656,35 @@ var Live = signal.Of(0)
 	}
 }
 
+// core/observe is the server's seam. Under client/ it compiles into the wasm
+// build, where a span has nothing behind it; on the server it is the point.
+func TestClientImportingObserveIsAnError(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/store/metrics.go": `package store
+
+import "github.com/mirairoad/howl-go/core/observe"
+
+func Load() { observe.Start(nil, "load") }
+`,
+		"server/apis/metrics.api.go": `package apis
+
+import "github.com/mirairoad/howl-go/core/observe"
+
+func load() { observe.Start(nil, "load") }
+`,
+	})
+	found := rules(runCheck(root, false))
+	if d, ok := found["client-imports-observe"]; !ok || d.File != "client/store/metrics.go" {
+		t.Fatalf("a client import of core/observe was accepted, or reported on the wrong file: %+v", d)
+	}
+	for _, d := range runCheck(root, false).Diagnostics {
+		if d.Rule == "client-imports-observe" && d.File != "client/store/metrics.go" {
+			t.Fatalf("the server's import was reported: %+v", d)
+		}
+	}
+}
+
 // The store is imported by pages, and pages compile for wasm. database/sql in
 // here surfaces as a link error naming a package the author never wrote down.
 func TestStoreMustCompileForWasm(t *testing.T) {

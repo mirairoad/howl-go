@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"time"
 )
 
 // Report is the diff between the Go struct and what is actually stored: which
@@ -62,10 +61,11 @@ const reportSample = 200
 // Report diffs the struct against the stored documents. Backends that can
 // count JSON keys in one query answer exactly; the rest sample 200 active
 // documents, and the report says which happened.
-func (s *Service[T, PT]) Report(ctx context.Context) (Report, error) {
+func (s *Service[T, PT]) Report(ctx context.Context) (report Report, err error) {
+	ctx, o2 := s.begin(ctx, "report", nil)
+	defer func() { s.end(o2, err, "report") }()
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "report", "collection", s.name)
 
 	counts, total, exact, err := s.keyCounts(ctx)
 	if err != nil {
@@ -77,7 +77,7 @@ func (s *Service[T, PT]) Report(ctx context.Context) (Report, error) {
 		return Report{}, err
 	}
 
-	report := Report{Total: total, Exact: exact}
+	report = Report{Total: total, Exact: exact}
 	for field := range s.declared {
 		if slices.Contains(envelopeFields, field) {
 			continue
@@ -104,10 +104,14 @@ func (s *Service[T, PT]) Report(ctx context.Context) (Report, error) {
 
 func (s *Service[T, PT]) keyCounts(ctx context.Context) (map[string]int64, int64, bool, error) {
 	if counter, ok := s.backend.(KeyCounter); ok {
+		ctx, done := s.storage(ctx, "key_counts")
 		counts, total, err := counter.KeyCounts(ctx, OpOptions{})
+		done(err)
 		return counts, total, true, err
 	}
-	rows, err := s.backend.FindMany(ctx, active(nil), FindOptions{Limit: reportSample})
+	sctx, done := s.storage(ctx, "find_many")
+	rows, err := s.backend.FindMany(sctx, active(nil), FindOptions{Limit: reportSample})
+	done(err)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -166,21 +170,25 @@ func (s *Service[T, PT]) Backfill(ctx context.Context, field string) (int64, err
 //
 // This is the one write that skips validation, versioning and audit: it is
 // storage maintenance, not an edit.
-func (s *Service[T, PT]) DropField(ctx context.Context, field string) (int64, error) {
+func (s *Service[T, PT]) DropField(ctx context.Context, field string) (n int64, err error) {
 	if slices.Contains(envelopeFields, field) {
 		return 0, fmt.Errorf("db: %s: %q is part of the envelope and cannot be dropped", s.name, field)
 	}
 	if s.declared[field] {
 		return 0, fmt.Errorf("db: %s: %q is still declared on the document struct — remove the Go field first", s.name, field)
 	}
+	ctx, o2 := s.begin(ctx, "drop_field", nil, "field", field)
+	defer func() { s.end(o2, err, "drop_field", "field", field) }()
 	ctx, cancel := s.deadline(ctx, bulkTimeoutMult)
 	defer cancel()
-	defer s.trace(time.Now(), "drop_field", "field", field)
 
-	n, err := s.backend.UnsetField(ctx, field, OpOptions{})
+	sctx, done := s.storage(ctx, "unset_field")
+	n, err = s.backend.UnsetField(sctx, field, OpOptions{})
+	done(err)
 	if err != nil {
 		return 0, err
 	}
+	o2.count(n)
 	s.invalidate(ctx, nil)
 	return n, nil
 }
@@ -188,11 +196,13 @@ func (s *Service[T, PT]) DropField(ctx context.Context, field string) (int64, er
 // Columns lists the promoted columns physically present in storage, each
 // flagged as still declared or an orphan. Backends with no column concept
 // answer [ErrUnsupported].
-func (s *Service[T, PT]) Columns(ctx context.Context) ([]Column, error) {
+func (s *Service[T, PT]) Columns(ctx context.Context) (cols []Column, err error) {
 	admin, ok := s.backend.(SchemaAdmin)
 	if !ok {
 		return nil, ErrUnsupported
 	}
+	ctx, o2 := s.begin(ctx, "columns", nil)
+	defer func() { s.end(o2, err, "columns") }()
 	return admin.Columns(ctx)
 }
 
@@ -202,11 +212,14 @@ func (s *Service[T, PT]) Columns(ctx context.Context) ([]Column, error) {
 //
 // purgeData also removes the matching top-level JSON key from every document.
 // Without it the documents keep the data and only the index goes.
-func (s *Service[T, PT]) DropColumn(ctx context.Context, column string, purgeData bool) error {
+func (s *Service[T, PT]) DropColumn(ctx context.Context, column string, purgeData bool) (err error) {
 	admin, ok := s.backend.(SchemaAdmin)
 	if !ok {
 		return ErrUnsupported
 	}
+	ctx, o2 := s.begin(ctx, "drop_column", nil, "column", column, "purge", purgeData)
+	defer func() { s.end(o2, err, "drop_column", "column", column, "purge", purgeData) }()
+	o2.set("howl.db.column", column)
 	ctx, cancel := s.deadline(ctx, bulkTimeoutMult)
 	defer cancel()
 	if err := admin.DropColumn(ctx, column, purgeData); err != nil {

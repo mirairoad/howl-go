@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/mirairoad/howl-go/core/observe"
 )
 
 // Options configure a [Service]. Only Collection is required.
@@ -31,6 +33,15 @@ type Options struct {
 	// Debug logs every operation with its duration. Off in production: it is
 	// one record per query.
 	Debug bool
+	// Trace decides how much of a query reaches its span: the filter, the
+	// fields an update set, the id. The zero value records the shape and the
+	// identifiers and redacts everything else, which is what makes a trace
+	// able to answer "which documents did that delete touch" without turning
+	// into a copy of the data.
+	//
+	// Nothing is rendered unless a tracer is installed, so this costs an
+	// untraced process nothing at all.
+	Trace observe.Mode
 }
 
 // The default operation deadline, and the multiplier applied to it for the
@@ -60,6 +71,7 @@ type Service[T any, PT Document[T]] struct {
 	debug    bool
 	declared map[string]bool
 
+	mode      observe.Mode // how much of a query reaches its span
 	cache     CacheAdapter
 	ttl       time.Duration
 	maxEntry  int
@@ -83,6 +95,7 @@ func NewService[T any, PT Document[T]](backend Backend, o Options) (*Service[T, 
 		timeout:  cmp.Or(o.Timeout, defaultTimeout),
 		log:      cmp.Or(o.Log, slog.Default()),
 		debug:    o.Debug,
+		mode:     o.Trace,
 		declared: declaredFields(reflect.TypeFor[T]()),
 	}
 
@@ -121,22 +134,27 @@ func (s *Service[T, PT]) Backend() Backend { return s.backend }
 
 // Get returns the document with this id, or [ErrNotFound]. A soft-deleted
 // document is not found unless [Deleted] is passed.
-func (s *Service[T, PT]) Get(ctx context.Context, id string, options ...Option) (T, error) {
+func (s *Service[T, PT]) Get(ctx context.Context, id string, options ...Option) (doc T, err error) {
 	var zero T
 	if id == "" {
 		return zero, ErrNotFound
 	}
 	o := applyOptions(options)
+	ctx, o2 := s.begin(ctx, "get", o.session, "id", id)
+	defer func() { s.end(o2, err, "get", "id", id) }()
+	s.document(ctx, o2, id)
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "get", "id", id)
 
 	where := M{IDPath: id}
 	if !o.deleted {
 		where = active(where)
 	}
 	read := func(ctx context.Context) (json.RawMessage, error) {
-		return s.backend.FindOne(ctx, where, OpOptions{Session: o.session})
+		ctx, done := s.storage(ctx, "find_one")
+		raw, err := s.backend.FindOne(ctx, where, OpOptions{Session: o.session})
+		done(err)
+		return raw, err
 	}
 
 	key := ""
@@ -170,15 +188,19 @@ func (s *Service[T, PT]) Get(ctx context.Context, id string, options ...Option) 
 // GetMany returns the documents with these ids, keyed by id. Ids that do not
 // exist are absent from the map rather than an error — the caller asked about
 // a set, and a set can come back smaller.
-func (s *Service[T, PT]) GetMany(ctx context.Context, ids []string, options ...Option) (map[string]T, error) {
-	out := make(map[string]T, len(ids))
+func (s *Service[T, PT]) GetMany(ctx context.Context, ids []string, options ...Option) (out map[string]T, err error) {
+	out = make(map[string]T, len(ids))
 	if len(ids) == 0 {
 		return out, nil
 	}
 	o := applyOptions(options)
+	ctx, o2 := s.begin(ctx, "get_many", o.session, "ids", len(ids))
+	defer func() { s.end(o2, err, "get_many", "ids", len(ids)) }()
+	if s.recording(ctx) {
+		s.query(ctx, o2, M{IDPath: M{OpIn: anySlice(ids)}})
+	}
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "get_many", "ids", len(ids))
 
 	// The version is read once for the whole batch. s.key per id reads it per
 	// id, which is one network round trip per id the moment the versioner is
@@ -212,7 +234,9 @@ func (s *Service[T, PT]) GetMany(ctx context.Context, ids []string, options ...O
 	if !o.deleted {
 		where = active(where)
 	}
-	rows, err := s.backend.FindMany(ctx, where, FindOptions{OpOptions: OpOptions{Session: o.session}})
+	sctx, done := s.storage(ctx, "find_many")
+	rows, err := s.backend.FindMany(sctx, where, FindOptions{OpOptions: OpOptions{Session: o.session}})
+	done(err)
 	if err != nil {
 		return nil, err
 	}
@@ -227,19 +251,26 @@ func (s *Service[T, PT]) GetMany(ctx context.Context, ids []string, options ...O
 			s.store(ctx, space+"get:"+id, raw)
 		}
 	}
+	o2.count(int64(len(out)))
 	return out, nil
 }
 
 // Find returns every document matching the query. The zero Query returns
 // every active document, which on a large collection is a mistake worth
 // making deliberately — pass a Limit.
-func (s *Service[T, PT]) Find(ctx context.Context, q Query) ([]T, error) {
+func (s *Service[T, PT]) Find(ctx context.Context, q Query) (docs []T, err error) {
+	ctx, o2 := s.begin(ctx, "find", q.Session)
+	defer func() { s.end(o2, err, "find") }()
+	if s.recording(ctx) {
+		s.query(ctx, o2, q.trace())
+	}
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "find", "collection", s.name)
 
 	read := func(ctx context.Context) ([]json.RawMessage, error) {
+		ctx, done := s.storage(ctx, "find_many")
 		rows, err := s.backend.FindMany(ctx, q.filter(), q.findOptions())
+		done(err)
 		if err != nil {
 			return nil, err
 		}
@@ -257,6 +288,7 @@ func (s *Service[T, PT]) Find(ctx context.Context, q Query) ([]T, error) {
 	}
 	if key == "" {
 		rows, err := read(ctx)
+		o2.count(int64(len(rows)))
 		if err != nil {
 			return nil, err
 		}
@@ -265,6 +297,7 @@ func (s *Service[T, PT]) Find(ctx context.Context, q Query) ([]T, error) {
 	if blob, hit := s.hit(ctx, key); hit {
 		var rows []json.RawMessage
 		if json.Unmarshal(blob, &rows) == nil {
+			o2.count(int64(len(rows)))
 			return decodeAll[T, PT](rows)
 		}
 		// An entry that will not decode is worse than no entry: it would be
@@ -278,6 +311,7 @@ func (s *Service[T, PT]) Find(ctx context.Context, q Query) ([]T, error) {
 		if err != nil {
 			return nil, err
 		}
+		o2.count(int64(len(rows)))
 		// The result set is cached under a key that includes the projection,
 		// but a projected document is never written to its by-id key: half a
 		// document must not be served to a later Get.
@@ -294,7 +328,17 @@ func (s *Service[T, PT]) Find(ctx context.Context, q Query) ([]T, error) {
 
 // One returns the first document matching the query, or [ErrNotFound]. It is
 // where a domain lookup lands: One(ctx, db.Query{Where: db.Eq("email", e)}).
-func (s *Service[T, PT]) One(ctx context.Context, q Query) (T, error) {
+func (s *Service[T, PT]) One(ctx context.Context, q Query) (doc T, err error) {
+	// Its own span, with the Find it delegates to nested inside: without one,
+	// a One shows up in a trace as a find with a limit of 1 and the caller
+	// cannot tell which of the two it wrote — and "not found" is One's answer,
+	// not Find's.
+	ctx, o2 := s.begin(ctx, "one", q.Session)
+	defer func() { s.end(o2, err, "one") }()
+	if s.recording(ctx) {
+		s.query(ctx, o2, q.trace())
+	}
+
 	var zero T
 	q.Limit = 1
 	docs, err := s.Find(ctx, q)
@@ -304,6 +348,7 @@ func (s *Service[T, PT]) One(ctx context.Context, q Query) (T, error) {
 	if len(docs) == 0 {
 		return zero, ErrNotFound
 	}
+	o2.count(1)
 	return docs[0], nil
 }
 
@@ -314,13 +359,20 @@ func (s *Service[T, PT]) One(ctx context.Context, q Query) (T, error) {
 // returns a number, and a total next to a cached first page that is not itself
 // cached is a query per request for the one value on the page that changes
 // least.
-func (s *Service[T, PT]) Count(ctx context.Context, q Query) (int64, error) {
+func (s *Service[T, PT]) Count(ctx context.Context, q Query) (n int64, err error) {
+	ctx, o2 := s.begin(ctx, "count", q.Session)
+	defer func() { s.end(o2, err, "count") }()
+	if s.recording(ctx) {
+		s.query(ctx, o2, q.trace())
+	}
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "count", "collection", s.name)
 
 	read := func(ctx context.Context) (int64, error) {
-		return s.backend.Count(ctx, q.filter(), q.opOptions())
+		ctx, done := s.storage(ctx, "count")
+		n, err := s.backend.Count(ctx, q.filter(), q.opOptions())
+		done(err)
+		return n, err
 	}
 
 	key := ""
@@ -331,10 +383,13 @@ func (s *Service[T, PT]) Count(ctx context.Context, q Query) (int64, error) {
 		key = s.key(ctx, "count", queryDigest(Query{Where: q.Where, Deleted: q.Deleted}))
 	}
 	if key == "" {
-		return read(ctx)
+		n, err := read(ctx)
+		o2.count(n)
+		return n, err
 	}
 	if raw, hit := s.hit(ctx, key); hit {
 		if n, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+			o2.count(n)
 			return n, nil
 		}
 		// As in Find: an entry that will not parse would fail every read until
@@ -348,6 +403,7 @@ func (s *Service[T, PT]) Count(ctx context.Context, q Query) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
+		o2.count(n)
 		s.store(ctx, key, strconv.AppendInt(nil, n, 10))
 		return n, nil
 	})
@@ -359,11 +415,12 @@ func (s *Service[T, PT]) Count(ctx context.Context, q Query) (int64, error) {
 
 // Create stamps the envelope, applies [Defaulter], validates, and inserts.
 // The returned document is the stored one, id and all.
-func (s *Service[T, PT]) Create(ctx context.Context, doc T, options ...Option) (T, error) {
+func (s *Service[T, PT]) Create(ctx context.Context, doc T, options ...Option) (created T, err error) {
 	o := applyOptions(options)
+	ctx, o2 := s.begin(ctx, "create", o.session)
+	defer func() { s.end(o2, err, "create") }()
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "create", "collection", s.name)
 
 	p := PT(&doc)
 	now := time.Now().UnixMilli()
@@ -383,7 +440,11 @@ func (s *Service[T, PT]) Create(ctx context.Context, doc T, options ...Option) (
 	if err != nil {
 		return doc, fmt.Errorf("db: %s: encoding document: %w", s.name, err)
 	}
-	if err := s.backend.Insert(ctx, p.envelope().ID, raw, OpOptions{Session: o.session}); err != nil {
+	s.document(ctx, o2, p.envelope().ID)
+	sctx, done := s.storage(ctx, "insert")
+	err = s.backend.Insert(sctx, p.envelope().ID, raw, OpOptions{Session: o.session})
+	done(err)
+	if err != nil {
 		return doc, err
 	}
 	s.invalidate(ctx, o.session)
@@ -427,14 +488,16 @@ func (s *Service[T, PT]) PatchFields(ctx context.Context, id string, values Set,
 	})
 }
 
-func (s *Service[T, PT]) patch(ctx context.Context, id string, o opts, produce func(T, json.RawMessage) (T, error)) (T, error) {
+func (s *Service[T, PT]) patch(ctx context.Context, id string, o opts, produce func(T, json.RawMessage) (T, error)) (doc T, err error) {
 	var zero T
 	if id == "" {
 		return zero, ErrNotFound
 	}
+	ctx, o2 := s.begin(ctx, "patch", o.session, "id", id)
+	defer func() { s.end(o2, err, "patch", "id", id) }()
+	s.document(ctx, o2, id)
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "patch", "id", id)
 
 	where := M{IDPath: id}
 	if !o.deleted {
@@ -442,7 +505,12 @@ func (s *Service[T, PT]) patch(ctx context.Context, id string, o opts, produce f
 	}
 
 	for attempt := range patchAttempts {
-		raw, err := s.backend.FindOne(ctx, where, OpOptions{Session: o.session})
+		// The attempt is set as it goes, not at the end: a patch that is still
+		// retrying when the deadline fires leaves the count behind it.
+		o2.set("howl.db.attempts", attempt+1)
+		sctx, done := s.storage(ctx, "find_one")
+		raw, err := s.backend.FindOne(sctx, where, OpOptions{Session: o.session})
+		done(err)
 		if err != nil {
 			return zero, err
 		}
@@ -476,11 +544,16 @@ func (s *Service[T, PT]) patch(ctx context.Context, id string, o opts, produce f
 			return zero, err
 		}
 
-		stored, err := s.backend.UpdatePaths(ctx, id, set, UpdateOptions{
+		// The paths the diff produced, not the caller's intent: a patch that
+		// changed nothing writes nothing, and the span says which it was.
+		s.changed(ctx, o2, set)
+		wctx, wdone := s.storage(ctx, "update_paths")
+		stored, err := s.backend.UpdatePaths(wctx, id, set, UpdateOptions{
 			OpOptions:       OpOptions{Session: o.session},
 			ExpectedVersion: envelope.Version,
 			Unset:           unset,
 		})
+		wdone(err)
 		if errors.Is(err, ErrNotFound) {
 			// Either the row went away or its version moved under us. Both
 			// arrive as "no row matched"; the next attempt re-reads and finds
@@ -506,17 +579,23 @@ func (s *Service[T, PT]) patch(ctx context.Context, id string, o opts, produce f
 //
 // Deleting an already-deleted document is [ErrNotFound] — the same answer the
 // reads give, so a caller does not have to know the difference.
-func (s *Service[T, PT]) Delete(ctx context.Context, id string, options ...Option) error {
+func (s *Service[T, PT]) Delete(ctx context.Context, id string, options ...Option) (err error) {
 	if id == "" {
 		return ErrNotFound
 	}
 	o := applyOptions(options)
+	ctx, o2 := s.begin(ctx, "delete", o.session, "id", id, "hard", o.hard)
+	defer func() { s.end(o2, err, "delete", "id", id, "hard", o.hard) }()
+	s.document(ctx, o2, id)
+	o2.set("howl.db.hard", o.hard)
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "delete", "id", id, "hard", o.hard)
 
 	if o.hard {
-		if _, err := s.backend.DeleteOne(ctx, id, OpOptions{Session: o.session}); err != nil {
+		sctx, done := s.storage(ctx, "delete_one")
+		_, err := s.backend.DeleteOne(sctx, id, OpOptions{Session: o.session})
+		done(err)
+		if err != nil {
 			return err
 		}
 		s.invalidate(ctx, o.session)
@@ -525,14 +604,19 @@ func (s *Service[T, PT]) Delete(ctx context.Context, id string, options ...Optio
 
 	// Read first so a second delete answers ErrNotFound instead of restamping
 	// a document that is already gone.
-	if _, err := s.backend.FindOne(ctx, active(M{IDPath: id}), OpOptions{Session: o.session}); err != nil {
+	sctx, done := s.storage(ctx, "find_one")
+	_, err = s.backend.FindOne(sctx, active(M{IDPath: id}), OpOptions{Session: o.session})
+	done(err)
+	if err != nil {
 		return err
 	}
 	now := time.Now().UnixMilli()
-	_, err := s.backend.UpdatePaths(ctx, id, map[string]any{
+	sctx, done = s.storage(ctx, "update_paths")
+	_, err = s.backend.UpdatePaths(sctx, id, map[string]any{
 		DeletedAtPath: now,
 		DeletedByPath: o.actor,
 	}, UpdateOptions{OpOptions: OpOptions{Session: o.session}, NoBump: true})
+	done(err)
 	if err != nil {
 		return err
 	}
@@ -542,17 +626,21 @@ func (s *Service[T, PT]) Delete(ctx context.Context, id string, options ...Optio
 
 // Restore clears a soft delete. A document that is not deleted comes back
 // unchanged, without a write.
-func (s *Service[T, PT]) Restore(ctx context.Context, id string, options ...Option) (T, error) {
+func (s *Service[T, PT]) Restore(ctx context.Context, id string, options ...Option) (doc T, err error) {
 	var zero T
 	if id == "" {
 		return zero, ErrNotFound
 	}
 	o := applyOptions(options)
+	ctx, o2 := s.begin(ctx, "restore", o.session, "id", id)
+	defer func() { s.end(o2, err, "restore", "id", id) }()
+	s.document(ctx, o2, id)
 	ctx, cancel := s.deadline(ctx, 1)
 	defer cancel()
-	defer s.trace(time.Now(), "restore", "id", id)
 
-	raw, err := s.backend.FindOne(ctx, M{IDPath: id}, OpOptions{Session: o.session})
+	sctx, done := s.storage(ctx, "find_one")
+	raw, err := s.backend.FindOne(sctx, M{IDPath: id}, OpOptions{Session: o.session})
+	done(err)
 	if err != nil {
 		return zero, err
 	}
@@ -567,12 +655,14 @@ func (s *Service[T, PT]) Restore(ctx context.Context, id string, options ...Opti
 	// Null rather than removed: the envelope's shape is part of the contract,
 	// and the generated column that indexes it reads a JSON null as SQL NULL
 	// either way.
-	stored, err := s.backend.UpdatePaths(ctx, id, map[string]any{
+	sctx, done = s.storage(ctx, "update_paths")
+	stored, err := s.backend.UpdatePaths(sctx, id, map[string]any{
 		DeletedAtPath: nil,
 		DeletedByPath: nil,
 		UpdatedAtPath: time.Now().UnixMilli(),
 		UpdatedByPath: o.actor,
 	}, UpdateOptions{OpOptions: OpOptions{Session: o.session}})
+	done(err)
 	if err != nil {
 		return zero, err
 	}
@@ -594,7 +684,7 @@ func (s *Service[T, PT]) Restore(ctx context.Context, id string, options ...Opti
 //
 // An empty filter is refused. "Every document in the collection" is a
 // decision, and it should not be reachable by forgetting an argument.
-func (s *Service[T, PT]) PatchWhere(ctx context.Context, where M, values Set, options ...Option) (int64, error) {
+func (s *Service[T, PT]) PatchWhere(ctx context.Context, where M, values Set, options ...Option) (n int64, err error) {
 	if len(where) == 0 {
 		return 0, fmt.Errorf("db: %s: PatchWhere refuses an empty filter", s.name)
 	}
@@ -602,9 +692,12 @@ func (s *Service[T, PT]) PatchWhere(ctx context.Context, where M, values Set, op
 		return 0, nil
 	}
 	o := applyOptions(options)
+	ctx, o2 := s.begin(ctx, "patch_where", o.session)
+	defer func() { s.end(o2, err, "patch_where") }()
+	s.query(ctx, o2, where)
+	s.changed(ctx, o2, values)
 	ctx, cancel := s.deadline(ctx, bulkTimeoutMult)
 	defer cancel()
-	defer s.trace(time.Now(), "patch_where", "collection", s.name)
 
 	paths := make(map[string]any, len(values)+2)
 	for path, value := range values {
@@ -616,10 +709,11 @@ func (s *Service[T, PT]) PatchWhere(ctx context.Context, where M, values Set, op
 	paths[UpdatedAtPath] = time.Now().UnixMilli()
 	paths[UpdatedByPath] = o.actor
 
-	n, err := s.bulk(ctx, active(where), paths, UpdateOptions{OpOptions: OpOptions{Session: o.session}})
+	n, err = s.bulk(ctx, active(where), paths, UpdateOptions{OpOptions: OpOptions{Session: o.session}})
 	if err != nil {
 		return 0, err
 	}
+	o2.count(n)
 	s.invalidate(ctx, o.session)
 	return n, nil
 }
@@ -627,22 +721,25 @@ func (s *Service[T, PT]) PatchWhere(ctx context.Context, where M, values Set, op
 // DeleteWhere soft-deletes every active document matching where, and returns
 // how many. An empty filter is refused; [Hard] is not supported here, because
 // a bulk hard delete should be a statement you wrote yourself.
-func (s *Service[T, PT]) DeleteWhere(ctx context.Context, where M, options ...Option) (int64, error) {
+func (s *Service[T, PT]) DeleteWhere(ctx context.Context, where M, options ...Option) (n int64, err error) {
 	if len(where) == 0 {
 		return 0, fmt.Errorf("db: %s: DeleteWhere refuses an empty filter", s.name)
 	}
 	o := applyOptions(options)
+	ctx, o2 := s.begin(ctx, "delete_where", o.session)
+	defer func() { s.end(o2, err, "delete_where") }()
+	s.query(ctx, o2, where)
 	ctx, cancel := s.deadline(ctx, bulkTimeoutMult)
 	defer cancel()
-	defer s.trace(time.Now(), "delete_where", "collection", s.name)
 
-	n, err := s.bulk(ctx, active(where), map[string]any{
+	n, err = s.bulk(ctx, active(where), map[string]any{
 		DeletedAtPath: time.Now().UnixMilli(),
 		DeletedByPath: o.actor,
 	}, UpdateOptions{OpOptions: OpOptions{Session: o.session}, NoBump: true})
 	if err != nil {
 		return 0, err
 	}
+	o2.count(n)
 	s.invalidate(ctx, o.session)
 	return n, nil
 }
@@ -653,27 +750,44 @@ func (s *Service[T, PT]) DeleteWhere(ctx context.Context, where M, options ...Op
 // fanning out is how a bulk over ten thousand rows becomes an outage
 // somewhere else.
 func (s *Service[T, PT]) bulk(ctx context.Context, where M, paths map[string]any, o UpdateOptions) (int64, error) {
+	// Which of the two ran is the difference between one statement and one
+	// per row, so it goes on the span: a set-wide write that is slow on a
+	// backend without a BulkWriter is slow for a reason nothing else shows.
 	if writer, ok := s.backend.(BulkWriter); ok {
-		return writer.UpdatePathsWhere(ctx, where, paths, o)
+		op(ctx).set("howl.db.bulk", "native")
+		sctx, done := s.storage(ctx, "update_paths_where")
+		n, err := writer.UpdatePathsWhere(sctx, where, paths, o)
+		done(err)
+		return n, err
 	}
-	rows, err := s.backend.FindMany(ctx, where, FindOptions{OpOptions: o.OpOptions})
+	op(ctx).set("howl.db.bulk", "fallback")
+	sctx, done := s.storage(ctx, "find_many")
+	rows, err := s.backend.FindMany(sctx, where, FindOptions{OpOptions: o.OpOptions})
+	done(err)
 	if err != nil {
 		return 0, err
 	}
 	var n int64
+	// One storage span for the whole walk, not one per row: a thousand
+	// documents is a thousand statements, and a span each would bury the
+	// trace it is meant to explain. The count says how many there were.
+	sctx, done = s.storage(ctx, "update_paths")
 	for _, raw := range rows {
 		doc, err := decode[T, PT](raw)
 		if err != nil {
+			done(err)
 			return n, err
 		}
-		if _, err := s.backend.UpdatePaths(ctx, PT(&doc).envelope().ID, paths, o); err != nil {
+		if _, err := s.backend.UpdatePaths(sctx, PT(&doc).envelope().ID, paths, o); err != nil {
 			if errors.Is(err, ErrNotFound) {
 				continue // deleted between the read and the write
 			}
+			done(err)
 			return n, err
 		}
 		n++
 	}
+	done(nil)
 	return n, nil
 }
 
@@ -712,6 +826,128 @@ func decodeAll[T any, PT Document[T]](rows []json.RawMessage) ([]T, error) {
 
 func (s *Service[T, PT]) deadline(ctx context.Context, mult int) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, s.timeout*time.Duration(mult))
+}
+
+// opSpan is one operation, from the caller's point of view: the whole call,
+// cache and decoding included. What it collects that a bare span cannot is the
+// per-call counts — cache lookups and documents — which have to be tallied as
+// the operation runs and set once at the end, because GetMany of fifty ids
+// does fifty lookups and fifty span events is not a readable trace.
+type opSpan struct {
+	span         observe.Span
+	start        time.Time
+	hits, misses int
+	rows         int64
+	hasRows      bool
+}
+
+type opKey struct{}
+
+// op returns the operation the context is inside, or nil at the top level —
+// which is where a direct call from a test or a script starts.
+func op(ctx context.Context) *opSpan {
+	o, _ := ctx.Value(opKey{}).(*opSpan)
+	return o
+}
+
+func (o *opSpan) set(key string, value any) {
+	if o != nil {
+		o.span.Set(key, value)
+	}
+}
+
+// count records how many documents the operation answered with. It is an
+// attribute, never a metric label: "8" and "8000" are the interesting
+// difference, and neither belongs in a time series name.
+func (o *opSpan) count(n int64) {
+	if o != nil {
+		o.rows, o.hasRows = n, true
+	}
+}
+
+// query records what the operation was asked to find, and set records what it
+// changed — the filter that chose the documents and the fields written to
+// them. Both go through the service's Mode: field names and operators always,
+// values only when they cannot be personal data. Neither is built at all
+// unless something is listening.
+func (s *Service[T, PT]) query(ctx context.Context, o *opSpan, v any) {
+	if s.recording(ctx) {
+		o.set("db.query.text", observe.Render(v, s.mode))
+	}
+}
+
+// recording is asked before anything is built for a span. A Query has to be
+// flattened into a map before it can be rendered, and doing that for a process
+// with no tracer is an allocation per read that nothing ever reads.
+func (s *Service[T, PT]) recording(ctx context.Context) bool {
+	return s.mode != observe.Off && observe.Enabled(ctx)
+}
+
+func (s *Service[T, PT]) changed(ctx context.Context, o *opSpan, v any) {
+	if s.recording(ctx) {
+		o.set("howl.db.set", observe.Render(v, s.mode))
+	}
+}
+
+// document records which document the operation was about. An id is the one
+// value worth keeping by name: it is how the row is found again, in the
+// database and in the next trace. A caller whose ids are email addresses gets
+// "?" instead, by the same rule as everything else.
+func (s *Service[T, PT]) document(ctx context.Context, o *opSpan, id string) {
+	if s.recording(ctx) {
+		o.set("howl.db.id", observe.Text(id, s.mode))
+	}
+}
+
+// begin opens the span for one operation. The span carries the collection, the
+// backend and the operation, so a trace shows the database as itself rather
+// than as a gap under the handler; the debug log stays as the collector-less
+// view of the same thing.
+func (s *Service[T, PT]) begin(ctx context.Context, name string, session any, args ...any) (context.Context, *opSpan) {
+	ctx, span := observe.Start(ctx, "db."+name+" "+s.name)
+	span.Set(observe.Kind, "db")
+	span.Set("db.system.name", s.backend.Prefix())
+	span.Set("db.collection.name", s.name)
+	span.Set("db.operation.name", name)
+	// Inside a transaction the cache is not consulted in either direction, so
+	// a hit rate that looks wrong for a collection written transactionally is
+	// this, not a broken cache.
+	if session != nil {
+		span.Set("howl.db.session", true)
+	}
+	o := &opSpan{span: span, start: time.Now()}
+	return context.WithValue(ctx, opKey{}, o), o
+}
+
+// end closes the operation, publishing the counts it gathered. The cache
+// figures are attributes rather than events for the same reason they are
+// counted at all: one operation, one line in the trace, however many lookups
+// it took.
+func (s *Service[T, PT]) end(o *opSpan, err error, name string, args ...any) {
+	if o.hits > 0 {
+		o.span.Set("howl.cache.hits", o.hits)
+	}
+	if o.misses > 0 {
+		o.span.Set("howl.cache.misses", o.misses)
+	}
+	if o.hasRows {
+		o.span.Set("howl.db.rows", o.rows)
+	}
+	o.span.End(err)
+	s.trace(o.start, name, args...)
+}
+
+// storage wraps one call into the backend, so the operation's own cost —
+// validating, decoding, building keys, waiting on another caller's query —
+// is the difference between this span and its parent. Without it a slow
+// unmarshal and a slow database look identical.
+func (s *Service[T, PT]) storage(ctx context.Context, name string) (context.Context, func(error)) {
+	ctx, span := observe.Start(ctx, s.backend.Prefix()+"."+name+" "+s.name)
+	span.Set(observe.Kind, "db.storage")
+	span.Set("db.system.name", s.backend.Prefix())
+	span.Set("db.collection.name", s.name)
+	span.Set("db.operation.name", name)
+	return ctx, span.End
 }
 
 func (s *Service[T, PT]) trace(start time.Time, op string, args ...any) {
@@ -775,10 +1011,17 @@ func (s *Service[T, PT]) keyspace(ctx context.Context) (string, bool) {
 // response header to say so the way mw.Cache does.
 func (s *Service[T, PT]) hit(ctx context.Context, key string) ([]byte, bool) {
 	raw, ok := s.cache.Get(ctx, key)
+	o := op(ctx)
 	if ok {
 		s.stats.hits.Add(1)
+		if o != nil {
+			o.hits++
+		}
 	} else {
 		s.stats.misses.Add(1)
+		if o != nil {
+			o.misses++
+		}
 	}
 	return raw, ok
 }

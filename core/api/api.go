@@ -31,9 +31,15 @@
 // cookie, and an endpoint that cannot set one sends the application off to
 // write a second, untyped handler for the one call that needed it.
 //
-// It is also JSON-only. An endpoint speaking protobuf, serving a file, or
-// streaming is an ordinary http.Handler on the mux; wrapping those in a typed
-// envelope would buy nothing.
+// It is JSON by default and not JSON-only. A handler that returns api.Text,
+// api.HTML, api.XML, api.Bytes, api.Redirect, api.Stream or api.SSE writes
+// that instead of the envelope — howl (TS)'s ctx.text, ctx.html, ctx.sse and
+// ctx.stream, as response types rather than context methods, so the OpenAPI
+// document and the generated client see them. That matters more than it looks:
+// robots.txt, sitemap.xml and a web app manifest are endpoints at fixed URLs
+// (Spec.Path), and without a way to answer text/plain they have to be written
+// as loose http.Handlers outside the tree, where nothing checks that they have
+// a test or that the table describes them. See responses.go.
 //
 // # Two halves, one of which runs in a browser
 //
@@ -62,14 +68,19 @@ import (
 
 	"github.com/mirairoad/howl-go/core/cache"
 	"github.com/mirairoad/howl-go/core/mw"
+	"github.com/mirairoad/howl-go/core/observe"
 )
 
 // Spec is one endpoint's contract.
 type Spec[Q, B, R any] struct {
 	// Name is for humans: logs, generated client method names, OpenAPI.
 	Name string
-	// Method defaults to GET.
-	Method string
+	// Method defaults to GET. It is a named type rather than a string so that
+	// the compiler has something to check: an endpoint is registered under
+	// "METHOD /path", and a typo in the method is a valid pattern for a method
+	// no client will ever send — the route is simply never called, with
+	// nothing anywhere saying why.
+	Method Method
 	// Path overrides the path derived from the file's location. Use it for the
 	// shapes a directory cannot express, like /healthz.
 	Path string
@@ -215,7 +226,7 @@ func (r *Request[Q, B]) Context() context.Context { return r.HTTP.Context() }
 // endpoints of different shapes — the same trick router.Route uses for pages.
 type Route struct {
 	Name        string
-	Method      string
+	Method      Method
 	Path        string
 	Roles       []string
 	Description string
@@ -253,6 +264,16 @@ type Config struct {
 	OnError func(r *http.Request, err error)
 	// Log defaults to slog.Default().
 	Log *slog.Logger
+	// Trace decides how much of a call's query and body reach its span. The
+	// zero value records the shape — the field names the caller sent, how many
+	// elements a list had — with the values redacted unless they are
+	// identifiers, which is what lets a trace answer "what did this request
+	// ask for" without keeping a copy of what it said.
+	//
+	// A password is unrecordable whatever this is set to, by field name; an
+	// email address is unrecordable by value, wherever it appears. Nothing is
+	// rendered at all unless a tracer is installed.
+	Trace observe.Mode
 	// Prefix is prepended to every derived path. Default "/api".
 	Prefix string
 	// Cache stores the responses of endpoints that declare Spec.Cache. Nil is
@@ -291,13 +312,21 @@ type Config struct {
 // Define erases the type parameters and produces the registerable Route.
 func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 	if s.Method == "" {
-		s.Method = http.MethodGet
+		s.Method = GET
 	}
 	if s.Handler == nil {
 		panic("api: " + s.Name + " has no Handler")
 	}
 	if s.Cache.TTL < 0 {
 		panic("api: " + s.Name + " has a negative Cache.TTL")
+	}
+	// mw.Cache stores a response by buffering it whole, which for a stream
+	// means holding it open until it ends and then serving that recording to
+	// everybody. Caught here rather than discovered as a hung request.
+	if s.Cache.TTL > 0 {
+		if t := reflectType[R](); t == reflect.TypeOf(Stream{}) || t == reflect.TypeOf(SSE{}) {
+			panic("api: " + s.Name + " caches a stream — the body is written as it is produced, so there is nothing to store")
+		}
 	}
 	// A Requests with no Window is the mistake worth catching here: it reads
 	// like a limit, and silently is not one.
@@ -309,7 +338,7 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 	}
 	return Route{
 		Name:        s.Name,
-		Method:      strings.ToUpper(s.Method),
+		Method:      Method(strings.ToUpper(string(s.Method))),
 		Path:        s.Path,
 		Roles:       s.Roles,
 		Description: s.Description,
@@ -320,41 +349,65 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 		schema:      shapes{query: reflectType[Q](), body: reflectType[B](), response: reflectType[R]()},
 		handle: func(cfg Config, pattern string) http.Handler {
 			var run http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// One span per call, named as the OpenAPI document names the
+				// endpoint, so a trace and the docs agree. A failure records
+				// the stage: decode and validate are the caller's mistake,
+				// handler is ours — the difference between a 4xx storm that
+				// is an integration bug on their side and one that is not.
+				ctx, span := observe.Start(r.Context(), "api "+s.Name)
+				span.Set(observe.Kind, "api")
+				span.Set("howl.endpoint", s.Name)
+				r = r.WithContext(ctx)
+				stop := func(stage string, err error) {
+					span.Set("howl.api.stage", stage)
+					span.End(err)
+					fail(cfg, w, r, err)
+				}
 				req := &Request[Q, B]{HTTP: r, w: w}
 				if err := decodeQuery(r, &req.Query); err != nil {
-					fail(cfg, w, r, err)
+					stop("decode", err)
 					return
 				}
 				if err := decodeBody(r, &req.Body); err != nil {
-					fail(cfg, w, r, err)
+					stop("decode", err)
 					return
 				}
+				// Recorded before Validate rather than after: a call that was
+				// refused for being wrong is the one whose arguments you want.
+				record(ctx, span, cfg.Trace, req.Query, req.Body)
 				// A Validate that returns a plain error still answers 400: it
 				// ran before the handler, so by definition the request was
 				// wrong, and a domain type should not have to import this
 				// package just to say so.
 				if err := validate(req.Query); err != nil {
-					fail(cfg, w, r, badRequest(err))
+					stop("validate", badRequest(err))
 					return
 				}
 				if err := validate(req.Body); err != nil {
-					fail(cfg, w, r, badRequest(err))
+					stop("validate", badRequest(err))
 					return
 				}
 				out, err := s.Handler(req)
 				if err != nil {
-					fail(cfg, w, r, err)
+					stop("handler", err)
 					return
 				}
-				write(w, out)
+				span.End(nil)
+				write(w, r, out)
 			})
 			if s.Cache.TTL > 0 {
 				run = mw.Cache{Store: cfg.Cache, TTL: s.Cache.TTL, Vary: s.Cache.Vary, Key: cfg.cacheKey}.Handler(run)
 			}
 			guarded := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// The request span learns its route here, before anything can
+				// refuse the call, so a 403 and a cache hit are filed under the
+				// endpoint too and not under a bare method. The route is the
+				// path alone: the tracer prefixes the method itself.
+				observe.Current(r.Context()).Set("http.route", pattern[strings.IndexByte(pattern, ' ')+1:])
 				// Before the cache, always: an entry filled by an admin must
 				// not become the way a caller without the role reads it.
 				if err := authorize(cfg, r, s.Roles); err != nil {
+					observe.Current(r.Context()).Set("howl.api.stage", "authorize")
 					fail(cfg, w, r, err)
 					return
 				}
@@ -395,9 +448,9 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 // in logs/index.post.api.go never reached the table, both /api/logs endpoints
 // registered as GET, and ServeMux panicked at startup with two identical
 // patterns.
-func At(method, path string, r Route) Route {
+func At(method Method, path string, r Route) Route {
 	if method != "" {
-		r.Method = strings.ToUpper(method)
+		r.Method = Method(strings.ToUpper(string(method)))
 	}
 	if path != "" {
 		r.Path = path
@@ -431,6 +484,13 @@ func Register(mux *http.ServeMux, cfg Config, routes ...Route) {
 		if rt.Path == "" {
 			panic("api: " + rt.Name + " has no path (generated tables call api.At)")
 		}
+		// A method ServeMux accepts but nothing sends registers a route that
+		// is never called: "POSt /orders" is a valid pattern, and the endpoint
+		// behind it simply never runs. Better a panic at startup than a
+		// silence that outlives the deploy.
+		if !rt.Method.Valid() {
+			panic(fmt.Sprintf("api: %q declares method %q; one of %v", rt.Name, rt.Method, Methods()))
+		}
 		// A cached POST would answer the second submission of a form with the
 		// first one's result, and never run it.
 		if rt.Cache.TTL > 0 && rt.Method != http.MethodGet {
@@ -439,7 +499,8 @@ func Register(mux *http.ServeMux, cfg Config, routes ...Route) {
 		if err := checkPathFields(rt); err != nil {
 			panic("api: " + rt.Name + ": " + err.Error())
 		}
-		mux.Handle(rt.Method+" "+rt.Path, rt.handle(cfg, rt.Method+" "+rt.Path))
+		pattern := string(rt.Method) + " " + rt.Path
+		mux.Handle(pattern, rt.handle(cfg, pattern))
 	}
 }
 
@@ -497,7 +558,13 @@ func authorize(cfg Config, r *http.Request, roles []string) error {
 // Responses
 // ---------------------------------------------------------------------------
 
-func write(w http.ResponseWriter, out any) {
+func write(w http.ResponseWriter, r *http.Request, out any) {
+	// A response that writes itself: not JSON, so none of what follows applies
+	// — including the Content-Type this function would otherwise overwrite.
+	if responder, ok := out.(Responder); ok {
+		responder.Respond(w, r)
+		return
+	}
 	code := http.StatusOK
 	if s, ok := out.(Status); ok && s.Status() != 0 {
 		code = s.Status()
@@ -551,4 +618,23 @@ func fail(cfg Config, w http.ResponseWriter, r *http.Request, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(body) //nolint:errcheck
+}
+
+// record puts the call's arguments on its span, filtered by the configured
+// mode. None is not rendered: an endpoint that takes no query would otherwise
+// carry an empty object on every span, which is noise on a busy service.
+// A query type is tagged for the URL rather than for JSON, so its rendered
+// text carries Go field names where the body's carries wire names. That is a
+// wart, and the alternative — a second reflection pass to re-derive names the
+// caller never sees in a trace anyway — is not worth the code.
+func record[Q, B any](ctx context.Context, span observe.Span, mode observe.Mode, query Q, body B) {
+	if mode == observe.Off || !observe.Enabled(ctx) {
+		return
+	}
+	if _, none := any(query).(None); !none {
+		span.Set("howl.api.query", observe.Render(query, mode))
+	}
+	if _, none := any(body).(None); !none {
+		span.Set("howl.api.body", observe.Render(body, mode))
+	}
 }

@@ -206,7 +206,7 @@ Three signals decide, cheapest first: `Sec-Fetch-Site`, then `Origin`, then `Ref
 
 `/static/` is served by `app.Static`, which adds the three things `http.FileServer` leaves to you: an ETag, a `Cache-Control`, and a compressed copy.
 
-Compression happens **once per file** and is kept. That is the difference that matters here: a 6.1 MB wasm binary gzipped per request burns a core per download; gzipped once it costs 1.71 MB of memory and nothing per request.
+Compression happens **once per file** and is kept. That is the difference that matters here: a 8.3 MB wasm binary gzipped per request burns a core per download; gzipped once it costs 2.27 MB of memory and nothing per request.
 
 | config | effect |
 |---|---|
@@ -279,7 +279,38 @@ Handler: func(r *api.Request[api.None, SignIn]) (Session, error) {
 },
 ```
 
-`r.Header()` is the response's header map and `r.SetCookie` adds to it — howl (TS)'s `ctx.headers` and `ctx.cookies.set`. Both go out with error responses too, because clearing a session cookie on a `401` is a real case. `Content-Type` stays the framework's.
+`r.Header()` is the response's header map and `r.SetCookie` adds to it — howl (TS)'s `ctx.headers` and `ctx.cookies.set`. Both go out with error responses too, because clearing a session cookie on a `401` is a real case. `Content-Type` is the framework's, unless the response type owns it — see below.
+
+### Answering with something that is not JSON
+
+howl (TS) had `ctx.text`, `ctx.html`, `ctx.xml`, `ctx.redirect`, `ctx.stream` and `ctx.sse`. Here they are the endpoint's response type rather than methods on a context, because `R` is what the OpenAPI document and the generated client are built from — a body written straight to the writer would be invisible to both.
+
+```go
+// server/apis/public/crawler/robots.api.go  ->  GET /robots.txt
+var Robots = api.Define(api.Spec[api.None, api.None, api.Raw]{
+	Name: "Robots",
+	Path: "/robots.txt",                 // the directory cannot express this one
+	Handler: func(r *api.Request[api.None, api.None]) (api.Raw, error) {
+		return api.Text("User-agent: *\nDisallow: /\n"), nil
+	},
+})
+```
+
+| return | `R` | what goes out |
+|---|---|---|
+| `api.Text(s)` | `api.Raw` | `text/plain; charset=utf-8` |
+| `api.HTML(s)` | `api.Raw` | `text/html; charset=utf-8` |
+| `api.XML(s)` | `api.Raw` | `application/xml; charset=utf-8` |
+| `api.Bytes(ct, b)` | `api.Raw` | `ct` verbatim; empty is `application/octet-stream` |
+| `api.Redirect{To: p}` | `api.Redirect` | a `Location`, `302` unless `Code` says otherwise |
+| `api.Stream{Write: f}` | `api.Stream` | whatever `f` writes, flushed per write |
+| `api.SSE{Events: seq}` | `api.SSE` | `text/event-stream`, one frame per yield |
+
+`.WithStatus(code)` picks a `Raw`'s status. Headers and cookies the handler set still go out; `Content-Type` is the one header the response type owns. **An error is still the JSON envelope**, correlation id included: answering `text/plain` on success is not opting out of how failure is reported. `Cache` on a `Stream` or an `SSE` panics at `Define` — storing a stream means holding it open until it ends and then serving the recording. Anything else: implement `api.Responder`.
+
+`api.Redirect` collapses a leading `//` in a site-relative target, so `?next=//evil.com/login` becomes the harmless path `/evil.com/login` rather than another origin's sign-in form. howl (TS)'s `ctx.redirect` does the same.
+
+This is what lets a document at a fixed URL be an endpoint instead of a loose handler on the mux. `robots.txt`, `sitemap.xml`, `.well-known/security.txt`, `manifest.json`, `/healthz` — a `Path:` override and a `Raw`, and they are in the route table, in the OpenAPI document, and covered by whatever the project checks over its endpoint tree.
 
 A query field tagged `path:"id"` is the typed form of `r.Param("id")`, like howl (TS)'s `params` schema: `/orders/abc` answers `400` naming `id` before the handler runs, and a tag that names no placeholder in the path panics at `Register` instead of staying zero forever.
 
@@ -421,6 +452,8 @@ One value per type. Two things with the same underlying type that mean different
 
 ## Server-sent events
 
+Two doors to one wire format, which lives in `core/sse`. From an endpoint it is the `api.SSE` response type above. From a plain handler — a dev server's reload channel, anything not in the endpoint tree — it is `app.SSE`:
+
 ```go
 mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 	s, err := app.SSE(w, r)
@@ -441,4 +474,4 @@ mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 })
 ```
 
-Multi-line payloads are split across `data:` lines, as the wire format requires — a raw newline would end the event early. The browser reconnects on its own, so a failed `Send` is a `return`, not an error to report.
+Multi-line payloads are split across `data:` lines, as the wire format requires — a raw newline would end the event early. The browser reconnects on its own, so a failed `Send` is a `return`, not an error to report. `s.SendEvent(app.Event{…})` is the long form, for an event id or a `retry:` hint.

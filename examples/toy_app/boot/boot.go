@@ -24,10 +24,12 @@ import (
 
 var db = store.New()
 
-// data is the application's contribution to every render's context. Pages take
+// Data is the application's contribution to every render's context. Pages take
 // no arguments — the generated table needs one uniform signature — so this is
-// how they receive everything.
-func data(ctx context.Context, path string) context.Context {
+// how they receive everything. Exported for wasm/render's test, which renders
+// each .client route from this context and from the browser's payload and
+// requires the two to agree.
+func Data(ctx context.Context, path string) context.Context {
 	ctx = store.WithMetrics(ctx, apistore.Metrics())
 	ctx = store.WithTodos(ctx, db.Snapshot())
 	return store.WithMeta(ctx, store.Meta{
@@ -49,7 +51,7 @@ func New() (*app.App, http.Handler) {
 		Shell:    pages.App,
 		NotFound: pages.NotFound,
 		Public:   client.Public(),
-		Data:     data,
+		Data:     Data,
 		// The browser fetches this once before its first local render and
 		// hands it to the wasm renderer. Omit it and no fetch happens.
 		ClientData: "/api/metrics",

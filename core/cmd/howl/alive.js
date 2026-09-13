@@ -2,7 +2,51 @@
 // core/runtime/app.js only when the shell says the dev server is in front —
 // so a production build ships none of this, not even the check for it.
 
-const source = new EventSource("/_howl/alive");
+// One stream, opened now and given back the moment this document stops being
+// the one on screen. See disconnect() below for why that matters more than it
+// looks: a stream left open is a socket the origin never gets back.
+let source = null;
+
+function connect() {
+  if (source) return;
+  source = new EventSource("/_howl/alive");
+  source.addEventListener("alive", onAlive);
+  source.addEventListener("css", onStyles);
+  source.addEventListener("build-error", (e) => overlay(e.data));
+  source.addEventListener("build-ok", () => overlay(null));
+}
+
+// A document that is leaving hands its connection back.
+//
+// Without this the dev client is a connection leak, one per document, and the
+// application dies at the sixth. A browser allows six connections per origin
+// over HTTP/1.1, and a document that has been navigated away from keeps its
+// sockets while it sits in the back/forward cache — so six full document loads
+// in one tab hold all six. From then on nothing can reach the server at all:
+// not a fragment, not an image, not the wasm binary. Every click does nothing,
+// and the tab reads as frozen. Measured on Chrome 153 against a howl app: six
+// document loads, then six requests queued and never sent, clearing only when
+// the old documents were finally discarded 30-60 seconds later.
+//
+// Full document loads are ordinary, which is what makes six easy to reach in a
+// minute of clicking: a guard's app.Redirect, a form post answered with a
+// redirect, and any link carrying data-no-spa are each one.
+//
+// pagehide rather than unload: it fires both when the document is discarded and
+// when it enters the back/forward cache, and unload is what makes a document
+// ineligible for that cache in the first place.
+function disconnect() {
+  source?.close();
+  source = null;
+}
+
+connect();
+addEventListener("pagehide", disconnect);
+// Back from the back/forward cache: reconnect, and the revision check below
+// turns a rebuild that happened while this document was away into a reload.
+addEventListener("pageshow", (e) => {
+  if (e.persisted) connect();
+});
 
 // One message both greets a new connection and reloads an existing one: the
 // server sends a monotonic revision on connect and again on every rebuild.
@@ -16,7 +60,7 @@ const source = new EventSource("/_howl/alive");
 // Reloading is also the honest answer to a rebuilt binary: Go cannot hot-swap a
 // linked one, so new markup, new head and new behaviour all arrive together.
 let revision = null;
-source.addEventListener("alive", (e) => {
+function onAlive(e) {
   const next = Number(e.data);
   if (!Number.isFinite(next)) return;
   if (revision === null) {
@@ -24,13 +68,13 @@ source.addEventListener("alive", (e) => {
     return;
   }
   if (next > revision) location.reload();
-});
+}
 
 // A stylesheet edit needs no reload, and reloading for one would throw away
 // scroll position, focus, and every open dropdown. Swap the element instead,
 // and only remove the old one once the new one has painted — otherwise the
 // page flashes unstyled between the two.
-source.addEventListener("css", () => {
+function onStyles() {
   for (const link of document.querySelectorAll('link[rel="stylesheet"]')) {
     const url = new URL(link.href, location.href);
     url.searchParams.set("howl", String(Date.now()));
@@ -39,10 +83,7 @@ source.addEventListener("css", () => {
     next.addEventListener("load", () => link.remove(), { once: true });
     link.after(next);
   }
-});
-
-source.addEventListener("build-error", (e) => overlay(e.data));
-source.addEventListener("build-ok", () => overlay(null));
+}
 
 // EventSource reconnects on its own, and the revision check above turns that
 // reconnection into a reload whenever anything changed while it was away — so

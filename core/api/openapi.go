@@ -91,7 +91,7 @@ func Document(info Info, routes []Route) map[string]any {
 		if description != "" {
 			op["description"] = description
 		}
-		item[strings.ToLower(rt.Method)] = op
+		item[strings.ToLower(string(rt.Method))] = op
 	}
 
 	doc := map[string]any{
@@ -140,11 +140,18 @@ func OpenAPI(info Info, routes ...Route) http.HandlerFunc {
 // megabyte of JavaScript to describe why it does not ship megabytes of
 // JavaScript.
 func Docs(specURL string) http.HandlerFunc {
-	page := strings.ReplaceAll(docsHTML, "{{spec}}", specURL)
+	page := DocsHTML(specURL)
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(page)) //nolint:errcheck
 	}
+}
+
+// DocsHTML is the reader's page, for an application that serves it as an
+// endpoint (api.HTML) rather than a handler on the mux — where it can be gated
+// by Roles and appear in the route table like everything else it describes.
+func DocsHTML(specURL string) string {
+	return strings.ReplaceAll(docsHTML, "{{spec}}", specURL)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,9 +163,9 @@ func operationID(rt Route) string {
 			b.WriteString(strings.ToUpper(f[:1]))
 			b.WriteString(f[1:])
 		}
-		return strings.ToLower(rt.Method) + b.String()
+		return strings.ToLower(string(rt.Method)) + b.String()
 	}
-	return strings.ToLower(rt.Method) + strings.ReplaceAll(rt.Path, "/", "_")
+	return strings.ToLower(string(rt.Method)) + strings.ReplaceAll(rt.Path, "/", "_")
 }
 
 // tagFor groups endpoints by their first path segment after the prefix, which
@@ -257,9 +264,21 @@ func requestBody(rt Route, schemas map[string]any) any {
 func responses(rt Route, schemas map[string]any) map[string]any {
 	t := rt.schema.response
 	var out map[string]any
-	if t == nil || isNone(t) {
+	switch {
+	case t == nil || isNone(t):
 		out = map[string]any{"204": map[string]any{"description": "No content"}}
-	} else {
+	case t == reflect.TypeOf(Redirect{}):
+		// The code is a field, so 302 here is the default rather than a
+		// promise. Saying "a redirect" is still more use than saying "200".
+		out = map[string]any{"302": map[string]any{"description": "Redirect"}}
+	case isResponder(t):
+		// The media type is a value the handler chooses — api.Text and
+		// api.Bytes take it as an argument — so reflect cannot see it and
+		// there is nothing here to describe but the status. Inventing a
+		// content type would be a document that disagrees with the endpoint,
+		// which is the one thing generating this from the table avoids.
+		out = map[string]any{"200": map[string]any{"description": "OK"}}
+	default:
 		out = map[string]any{
 			"200": map[string]any{
 				"description": "OK",
@@ -397,6 +416,13 @@ func objectSchema(t reflect.Type, schemas map[string]any) map[string]any {
 }
 
 func isNone(t reflect.Type) bool { return t == reflect.TypeOf(None{}) }
+
+// responderType is the interface a response type implements when it writes
+// itself — api.Raw and the rest. Built once: reflect.TypeOf on an interface
+// pointer is not free, and this runs per endpoint per document.
+var responderType = reflect.TypeOf((*Responder)(nil)).Elem()
+
+func isResponder(t reflect.Type) bool { return t != nil && t.Implements(responderType) }
 
 // docsHTML is a reader for the document: endpoints grouped by tag, each one
 // expandable into its parameters, body and response schema. No dependency —

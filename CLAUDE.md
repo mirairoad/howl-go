@@ -23,6 +23,10 @@ are `www/docs/*.md`, which also build the documentation site.
    `func(http.Handler) http.Handler`; handlers are `http.Handler`; use `r.Cookie`,
    `r.URL.Query()`, `json.NewEncoder(w)`.
 
+Tracing is already there: `core/observe` is the seam, `otel/` (its own `go.mod`) is the SDK.
+Do not open spans for a request, a render, an endpoint or a db op; never import
+`core/observe` under `client/`.
+
 Two commands worth knowing before you edit: `go run ./core/cmd/howl check` enforces the
 rules above, and the `.mcp.json` in this repo exposes them (plus the live route and
 endpoint tables) as MCP tools.
@@ -36,7 +40,9 @@ make run-toy    # example app         -> :9000
 make dev-toy    # watched: rebuild + restart + reload on save
 go test ./core/...
 go run ./core/cmd/howl check     # the conventions, enforced
-make test-browser                # app.js in jsdom: the morph, the router, build drift. Needs Node; opt-in
+make test-browser                # app.js in jsdom: the morph, the router, the SPA path with a stubbed renderer. Needs Node; opt-in
+make test-e2e                    # the real views.wasm in headless Chromium via chromedp (test/e2e, its own go.mod)
+make test-otel                   # the otel nested module: traces and metrics over the framework's core/observe seam
 ```
 
 In an application, the dev loop is `go run github.com/mirairoad/howl-go/core/cmd/howl dev`

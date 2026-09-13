@@ -1572,6 +1572,59 @@ something shared.
 There is no framework-wide default rate. A number nobody chose, applied to every
 endpoint, is either too low for the dashboard's polling or too high to matter.
 
+### An endpoint that could not answer robots.txt
+
+The same shape of gap, found the same way. §13 wrote down "it is also JSON-only.
+An endpoint speaking protobuf, serving a file, or streaming is an ordinary
+`http.Handler` on the mux" — which sounds like a boundary and is really a hole,
+because the documents at fixed URLs are not exotic. `robots.txt`, `sitemap.xml`,
+`.well-known/security.txt` and `manifest.json` are on every site, and hushkey
+has all four as ordinary `defineApi` files under `apis/public/`, returning
+`new Response(txt, {headers: {'Content-Type': 'text/plain'}})`.
+
+`Spec.Path` could already put an endpoint at `/robots.txt` — it is in the
+`fsapis` package comment, next to `/healthz`. What could not happen was the
+body: `write` set `Content-Type: application/json` on every response, and
+`Request.Header()`'s own doc said so. A crawler handed `application/json`
+ignores the file.
+
+So factory wrote them as three loose packages — `server/crawler`, `server/meta`,
+`server/admin` — each with a comment explaining that the framework left it no
+choice, and each outside the tree its own `factory check` enforces tests and
+README entries over. The framework's boundary had pushed four documents out of
+the one place that checks anything.
+
+The fix is howl (TS)'s `ctx.text` / `ctx.html` / `ctx.sse` / `ctx.stream` /
+`ctx.redirect`, as **response types** rather than context methods. That is
+forced by the shape here and is the better half of the trade: `Spec`'s `R` is
+what the OpenAPI document and the generated client are built from, so
+`Spec[…, api.Raw]` puts "this endpoint answers bytes, not JSON" in the one place
+both of them read. A handler writing to a `ResponseWriter` instead would be
+invisible to both, and would also be able to write half a response and then
+return an error with nowhere to go — the thing §13 kept the writer away for.
+
+`api.Responder` is one method, `Respond(w, r)`, and the four implementations are
+`Raw`, `Redirect`, `Stream` and `SSE`. Three things fell out of writing them:
+
+- **An error is still the JSON envelope.** Answering `text/plain` on success is
+  not opting out of the correlation id. `write` dispatches to `Respond`; `fail`
+  is untouched.
+- **`Cache` on a stream panics at `Define`.** `mw.Cache` stores a response by
+  buffering it whole, which for a stream means holding it open until it ends and
+  then serving the recording to everyone. A startup panic beats a hung request.
+- **The SSE writer already existed**, in `app.SSE`, for the dev server's reload
+  channel. Two copies of a format whose failure mode is *half an event
+  delivered* is not a duplication worth keeping, so it moved to `core/sse` —
+  `Event`/`Frame` in one file, `Open`/`Stream` in another. `core/app` aliases
+  both. `core/api` cannot: its shared half is compiled into wasm and
+  `core/sse`'s stream half names `net/http`, which is 2.05 MB gzipped there. So
+  `api.Event` is declared again, field for field, and `respond.go` converts with
+  `sse.Event(e)` — a conversion the compiler rejects the moment the two stop
+  matching, which is the guarantee the alias would have given.
+
+What stays an ordinary handler: protobuf, and serving a directory of files.
+Those have no fixed URL a route table wants to know about.
+
 ## The document cache, audited
 
 `db.Cache` had the shape right — an LRU behind a `cache.Store`, version-prefixed
@@ -1650,6 +1703,185 @@ on, so a TTL shorter than the gap between reads, or a write on every request,
 looked exactly like a cache doing its job. `CacheStats()` is four counters —
 hits, misses, bypassed, too-large — each one a decision the cache makes and
 nothing else could reveal.
+
+## Observability: one seam, one module
+
+The question was where the OpenTelemetry SDK could live in a framework whose
+`go.mod` has one dependency on purpose. The answer was already in the repo,
+used three times: a nested module. `otel/` has its own `go.mod` and the SDK;
+`core/` has `core/observe`, three methods and no imports, called at the places
+a request already passes through — `App.render`, the endpoint pipeline,
+`mw.Cache`, `mw.RateLimit`, every `db.Service` operation. The no-op default is
+what a program that never imports `otel/` runs.
+
+Most of the integration needed no seam at all, which is the payoff of refusing
+a framework handler type: `otelhttp.NewHandler` is `func(http.Handler)
+http.Handler`, which is `mw.Middleware`, so the request span is the ecosystem's
+own instrumentation dropped into `Use`. What did need the seam is the part the
+ecosystem cannot see — where the route becomes known (after the mux, inside the
+render), where an endpoint fails (decode, validate, authorize or the handler),
+and what a document read cost.
+
+Two choices worth writing down. **Metrics come from the spans.** A span the
+framework opens says what it is in `howl.kind`; the tracer records the
+histogram for that kind when the span ends. One set of hooks, and a trace and a
+metric cannot disagree. **The module speaks `http/protobuf` only.** The
+contrib `autoexport` package would honour every `OTEL_*_EXPORTER` variable, and
+pulls in gRPC, the Prometheus bridge and three stdout exporters to do it. A
+deployment asking for `grpc` gets an error at `Setup` instead of a process that
+believes it is exporting — the one failure an observability library must not
+have.
+
+One gap the first cut had, found by asking whether anything but GET was
+covered. Endpoints were fine — a `POST` endpoint is a `Route` like any other —
+but a handler registered on the mux by hand had no route to be named after,
+because neither `App.render` nor the endpoint pipeline runs for it. In a
+server-first application that is *the write path*: every form post traced as a
+bare `POST`, all of them one series. `otel.Routes` wraps the mux and reads
+`Request.Pattern` after it has matched. It works only directly around the mux:
+`ServeMux` sets that field in place on the request it was handed, so any
+middleware that clones — `mw.RequestID` — hides it from everything outside.
+Verified both ways in `otel/otel_test.go`.
+
+The same question turned up the 404 render setting `http.route` to the empty
+string, which renamed the request span to a bare method. The catch-all is
+reached by any method and any path; it is now named `howl.render 404` and
+leaves `http.route` to the mux pattern that matched.
+
+### What a document operation reports
+
+The first cut span was the operation, its collection and its duration, which
+answers "was it the database" and nothing after that. Eight things were
+missing, and each of them was a question somebody would ask at 3am.
+
+The backend call is now a span inside the operation, so the difference between
+the two is the service's own cost — validating, building keys, unmarshalling,
+waiting. A patch records how many attempts its optimistic lock took, and
+reaching three is `ErrConflict` about to happen. `One` has its own span above
+the `Find` it delegates to, because "not found" is `One`'s answer. A read that
+waited on another caller's identical query is marked `howl.db.coalesced`:
+before that it was a 40 ms span with nothing under it, which reads as a slow
+database rather than as the queue protecting it. A set-wide write says whether
+the backend did it in one statement or the service walked the rows. An
+operation inside a transaction says so, because that is why its cache did
+nothing.
+
+Two of the eight were about shape rather than coverage. Cache lookups were one
+span event each, so `GetMany` of fifty ids produced fifty events; they are
+counted on the operation and set once as `howl.cache.hits` / `howl.cache.misses`,
+which the tracer turns into the counter at `End` — one operation, one line in
+the trace, and the metric still counts documents. And `CacheStats`'s other two
+counters, `Bypassed` and `TooLarge`, are outcomes with no operation to hang
+them on: `otel.WatchCache` reads them at collection time. A rising `Bypassed`
+is a broken `Versioner` and looks exactly like a cold cache from anywhere else.
+
+The rule held throughout for metrics: counts and ids are attributes, never
+labels — a time series per document id is how a metrics backend dies.
+
+### Recording the query without recording the people
+
+The first cut refused to record the filter at all, on the grounds that a
+`Where` clause is user data. That is true and it is also useless: a
+`DeleteWhere` that hit forty thousand rows is unreadable without knowing what
+it matched, and the id — the one value that finds the document again — was
+being thrown away with the names and the search terms.
+
+So the filter is recorded, through a redactor with one structural idea: the
+shape is schema and the values are data. Field names, operators and the size of
+an `in` clause are always kept; values are kept only when they cannot be
+personal — numbers, booleans, null, and strings that are identifiers (UUID,
+ULID, hex digest, digits). A name renders as `"?"`, an id renders as itself.
+
+Two rules hold in every mode, including the `Full` one meant for a development
+machine. A sensitive field name — `password`, `api_key`, `email`, `phone`,
+`dob`, `card` — redacts its whole subtree, matched by word so that `keyword`
+and `monkey` are ordinary. And anything shaped like an email address is
+unrecordable wherever it appears: under an innocent field name, nested in an
+`$or`, inside an array, in key position. That one is a value-level rule rather
+than a field-level one precisely because it has to survive a schema nobody
+looked at. The test asserts it at every depth in both modes.
+
+Two smaller decisions fell out. Sort and projection fields go in key position
+(`{"created":-1}`) rather than as strings, because a key is schema and a string
+is data — written as `["-created"]` the redactor would have turned them into
+`["?"]`. And an RFC 3339 date-time is an identifier while a bare date is not:
+`1985-03-12` is how a date of birth is written, `2026-01-02T03:04:05Z` is not
+how anybody writes one by hand, and a range query that reads `{"$lt":"?"}` does
+not answer the question anyone opens it to ask. A DOB stored as a `time.Time`
+marshals to the second form, so the field name is what stops that one.
+
+Which is where the deny list turned out to be half a list. It split field names
+on punctuation only, so `user_email` was sensitive and `userEmail` was
+ordinary — and camelCase is how a JSON document usually spells it. That was a
+live leak in Safe, not only in Full: `phoneNumber` holding `61400000000` is a
+string of digits, digits are how an id looks, and the field name was the only
+thing that could have stopped it. Words now break on case changes as well as
+punctuation, acronyms included (`APIKey` → `api`, `key`).
+
+Cost: nothing is rendered unless a tracer is installed, and the guard is
+checked before the value is even assembled — `db.Find` untraced is
+byte-identical to `Trace: observe.Off`, 16.1 µs and 50 allocations on the
+in-memory backend. With a tracer it is 27.2 µs, of which the render is 2.3 µs
+and 22 allocations; the JSON string escaping is done by hand for the ASCII case
+because `json.Marshal` per value was two allocations each on a filter that may
+have dozens.
+
+### The browser's half of a trace, without a browser SDK
+
+`@opentelemetry/sdk-trace-web` is a Node build step and about 40 kB of runtime
+for what, in `app.js`, is three fetch call sites and one event. So the browser
+mints the trace itself — sixteen random bytes and eight from
+`crypto.getRandomValues` — puts it in a `traceparent` header, and the server's
+propagator joins it. That part is free.
+
+Reporting the other half is where the design decision was. A navigation the
+browser rendered itself never contacts the server: the framework's fastest path
+is the one with no evidence for it. So `app.js` batches rows and beacons them to
+an endpoint the otel module serves.
+
+The trick is that the endpoint creates the navigation span with the **browser's**
+span id rather than a generated one. Without it the request the server already
+recorded — which arrived parented to that id — would hang off a span that never
+exists, and a trace would hold both halves of a navigation showing neither
+inside the other. The SDK does not let a caller set a span id, but it does take
+an `IDGenerator`, and a generator reads the context: one that answers with the
+id on the context and delegates otherwise gives exact parentage with no fork and
+no reflection. It is consulted for every span in the process; only the rows from
+the beacon carry the key.
+
+Two smaller things. The timings are placed by their duration ending now, because
+the browser's clock is not ours and a span starting in the future is worse than
+one a batch interval late. And nothing reports unless `Config.Telemetry` is set
+— published in the `howl-client` JSON, the same shape the dev client's `live`
+endpoint uses, so a production build without it runs none of the code.
+
+### Method is a type
+
+`Spec.Method` was a `string`. `ServeMux` accepts `PURGE /orders` as a pattern
+quite happily and then never matches it, so a method the framework does not know
+was a route that silently never ran — the same failure class as the
+`logs/index.post.api.go` bug above, which is how this one was recognised.
+
+It is now a named string type with seven constants and a `Valid` check that
+panics at `Register`. Named rather than an integer enum because an untyped
+constant still assigns: every existing `Method: "POST"` and every generated
+`api.At("POST", …)` compiled unchanged, which is what made it a ten-minute
+change rather than a migration. It lives in its own file with no build
+constraint and the constants written as literals rather than `http.MethodGet`:
+the generated client speaks the same vocabulary and compiles for wasm, where
+importing `net/http` would cost 2.05 MB gzipped. The generator now emits
+`api.At(api.POST, …)`, and `fsapis` learned to recognise `Method: api.POST` —
+missing that spelling would have been quiet, since `At` overrides the spec with
+whatever the generator found.
+
+The seam's cost with the no-op tracer installed (the default), measured on
+`core/app`'s benchmarks before and after: `BenchmarkPageSimple` 1697 → 1885
+ns/op and 31 → 34 allocs/op — **+190 ns and three allocations per render**, all
+three from boxing an attribute value into `any` (the route string, the byte
+count, the span name's concatenation). That is 11% of a 1.7 µs synthetic
+render of one paragraph, 1% of `BenchmarkPageComplex` (22.0 → 22.3 µs) and
+under 1% of the 90 µs loopback request. Worth knowing where it is; not worth
+an `Enabled()` branch in every call site yet.
 
 ## 17. Open questions
 

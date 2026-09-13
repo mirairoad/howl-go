@@ -71,7 +71,7 @@ type response struct {
 //
 // query and body may be nil. A None response type means the endpoint answers
 // 204 and there is nothing to decode.
-func Call[R any](ctx context.Context, t *Transport, method, path string, query, body any) (R, error) {
+func Call[R any](ctx context.Context, t *Transport, method Method, path string, query, body any) (R, error) {
 	var out R
 	if t == nil {
 		return out, fmt.Errorf("api: nil transport")
@@ -121,7 +121,7 @@ func Call[R any](ctx context.Context, t *Transport, method, path string, query, 
 		}
 	}
 
-	res, err := do(ctx, t, method, target, payload)
+	res, err := do(ctx, t, string(method), target, payload)
 	if err != nil {
 		return out, err
 	}
@@ -132,6 +132,17 @@ func Call[R any](ctx context.Context, t *Transport, method, path string, query, 
 		return out, nil
 	}
 	if _, none := any(out).(None); none {
+		return out, nil
+	}
+	// A response the framework did not encode. json.Unmarshal on text/plain
+	// fails with a decode error that describes nothing, so the four types that
+	// write themselves are handled before it: Raw hands the bytes back, and a
+	// redirect or a stream has nothing a typed client can return.
+	switch typed := any(&out).(type) {
+	case *Raw:
+		typed.Body, typed.Code = res.Body, res.Status
+		return out, nil
+	case *Redirect, *Stream, *SSE:
 		return out, nil
 	}
 	if err := json.Unmarshal(res.Body, &out); err != nil {

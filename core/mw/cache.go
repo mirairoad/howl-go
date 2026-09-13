@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mirairoad/howl-go/core/cache"
+	"github.com/mirairoad/howl-go/core/observe"
 )
 
 // HeaderCache says what the cache did with a request: "hit" when the response
@@ -102,9 +103,11 @@ func (c Cache) Handler(next http.Handler) http.Handler {
 		key := storeKey(name, r, c.Vary)
 
 		if raw, ok := store.Get(r.Context(), key); ok && replayStored(w, raw) {
+			observe.Current(r.Context()).Event("cache.hit")
 			return
 		}
 
+		observe.Current(r.Context()).Event("cache.miss")
 		w.Header().Set(HeaderCache, "miss")
 		rec := &capture{ResponseWriter: w, before: w.Header().Clone(), max: maxBody}
 		next.ServeHTTP(rec, r)
