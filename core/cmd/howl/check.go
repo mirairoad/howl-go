@@ -1419,6 +1419,81 @@ func lintCollections(root string, files []sourceFile) []Diagnostic {
 
 // stripHTMLComments blanks out <!-- … --> while keeping the line count, so a
 // diagnostic's line number still points at the right place.
+// codeOnly blanks every Go comment and the *contents* of every string and rune
+// literal, keeping the delimiters and the newlines so that a line number taken
+// from the result still matches the file.
+//
+// It exists for the same reason stripHTMLComments does, and for a bug of
+// exactly the same shape: a rule that looks for `Authorize:` to decide whether
+// the application wired its permission layer was satisfied by a *comment*
+// saying "Permit is api.Config.Permit:" — so the rule went quiet and reported
+// nothing, forever, in the one repository it was written for. A check that can
+// be switched off by prose is worse than no check, because somebody is relying
+// on it.
+//
+// Literals are blanked as well as tracked, and for the same reason: a string
+// saying "Permit:" is prose about the wiring, not the wiring. Tracking them is
+// necessary anyway, because a `//` inside one is not a comment and blanking
+// from there would swallow the rest of the line — including real code.
+//
+// The delimiters survive, so a rule that looks for a quoted value at all — as
+// the Roles one does — still sees one.
+func codeOnly(body []byte) []byte {
+	out := make([]byte, len(body))
+	copy(out, body)
+	blank := func(from, to int) {
+		for i := from; i < to && i < len(out); i++ {
+			if out[i] != '\n' {
+				out[i] = ' '
+			}
+		}
+	}
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '"', '\'', '`':
+			quote := body[i]
+			start := i + 1
+			i++
+			for i < len(body) && body[i] != quote {
+				// A backslash escapes the next byte, but never inside a raw
+				// string, where a backslash is a backslash.
+				if quote != '`' && body[i] == '\\' {
+					i++
+				}
+				if quote != '`' && body[i] == '\n' {
+					break // an unterminated literal; do not run to the end of the file
+				}
+				i++
+			}
+			blank(start, i)
+		case '/':
+			if i+1 >= len(body) {
+				continue
+			}
+			switch body[i+1] {
+			case '/':
+				end := i
+				for end < len(body) && body[end] != '\n' {
+					end++
+				}
+				blank(i, end)
+				i = end
+			case '*':
+				end := i + 2
+				for end+1 < len(body) && !(body[end] == '*' && body[end+1] == '/') {
+					end++
+				}
+				if end+1 < len(body) {
+					end += 2
+				}
+				blank(i, end)
+				i = end - 1
+			}
+		}
+	}
+	return out
+}
+
 func stripHTMLComments(body string) string {
 	var b strings.Builder
 	for {
@@ -1447,11 +1522,15 @@ func lintEndpoints(root string, files []sourceFile) []Diagnostic {
 	declaresPermissions, wiresPermit := "", false
 
 	for _, f := range files {
+		// Comments blanked before any of these four are asked, because every one
+		// of them is a question about what the code *does*. Prose describing the
+		// wiring is not the wiring, and prose describing a gate is not a gate.
+		code := codeOnly(f.Body)
 		if !strings.HasSuffix(f.Rel, ".api.go") {
-			if authorizeRe.Match(f.Body) {
+			if authorizeRe.Match(code) {
 				wiresAuthorize = true
 			}
-			if permitRe.Match(f.Body) {
+			if permitRe.Match(code) {
 				wiresPermit = true
 			}
 		}
@@ -1465,10 +1544,10 @@ func lintEndpoints(root string, files []sourceFile) []Diagnostic {
 				Fix:     "read r.Query.Field — and add the field to the query type if it is missing",
 			})
 		}
-		if rolesRe.Match(f.Body) && declaresRoles == "" {
+		if rolesRe.Match(code) && declaresRoles == "" {
 			declaresRoles = f.Rel
 		}
-		if permissionsRe.Match(f.Body) && declaresPermissions == "" {
+		if permissionsRe.Match(code) && declaresPermissions == "" {
 			declaresPermissions = f.Rel
 		}
 		if n := len(defineRe.FindAll(f.Body, -1)); n > 1 {

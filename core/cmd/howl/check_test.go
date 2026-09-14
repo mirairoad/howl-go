@@ -1169,3 +1169,91 @@ func load(ctx context.Context, s *db.Service[User, *User], ids []string) []User 
 		t.Fatal("an N+1 was accepted")
 	}
 }
+
+// The regression this stripper was written for, found by running the check
+// against the repository the rule was written for: a comment saying
+// "Permit is api.Config.Permit:" satisfied the wiring test, so the rule went
+// quiet and reported nothing. A check that can be switched off by prose is
+// worse than no check, because somebody is relying on it.
+func TestProseIsNotWiring(t *testing.T) {
+	endpoint := `package apis
+
+import "github.com/mirairoad/howl-go/core/api"
+
+var Purge = api.Define(api.Spec[api.None, api.None, api.None]{
+	Name:        "Purge",
+	Roles:       []string{"admin"},
+	Permissions: []api.Permission{store.SettingsPurge},
+	Handler:     func(r *api.Request[api.None, api.None]) (api.None, error) { return api.None{}, nil },
+})
+`
+	// Both halves described and neither wired, in every shape prose takes.
+	root := project(t, map[string]string{
+		"server/apis/purge.post.api.go": endpoint,
+		"service.go": `package app
+
+// Permit is api.Config.Permit: an endpoint declares permissions, this decides.
+/* Authorize: the application's own layer. */
+const doc = "Permit: and Authorize: in a string are not wiring either"
+`,
+	})
+	found := rules(runCheck(root, false))
+	if _, ok := found["permissions-unwired"]; !ok {
+		t.Error("a comment mentioning Permit: was read as wiring")
+	}
+	if _, ok := found["roles-unwired"]; !ok {
+		t.Error("a comment mentioning Authorize: was read as wiring")
+	}
+}
+
+// And the other direction: a commented-out declaration is not a declaration, so
+// it must not send somebody off to wire a layer nothing asks for.
+func TestACommentedOutGateIsNotAGate(t *testing.T) {
+	root := project(t, map[string]string{"server/apis/open.api.go": `package apis
+
+import "github.com/mirairoad/howl-go/core/api"
+
+var Open = api.Define(api.Spec[api.None, api.None, api.None]{
+	Name: "Open",
+	// Roles:       []string{"admin"},
+	// Permissions: []api.Permission{store.SettingsPurge},
+	Handler: func(r *api.Request[api.None, api.None]) (api.None, error) { return api.None{}, nil },
+})
+`})
+	found := rules(runCheck(root, false))
+	if _, ok := found["roles-unwired"]; ok {
+		t.Error("a commented-out Roles line was read as a gate")
+	}
+	if _, ok := found["permissions-unwired"]; ok {
+		t.Error("a commented-out Permissions line was read as a gate")
+	}
+}
+
+// A // inside a string literal is not a comment, and blanking from there would
+// swallow the rest of the line — including the wiring that follows it.
+func TestAStringIsNotAComment(t *testing.T) {
+	root := project(t, map[string]string{
+		"server/apis/purge.post.api.go": `package apis
+
+import "github.com/mirairoad/howl-go/core/api"
+
+var Purge = api.Define(api.Spec[api.None, api.None, api.None]{
+	Name:  "Purge",
+	Roles: []string{"admin"},
+	Handler: func(r *api.Request[api.None, api.None]) (api.None, error) { return api.None{}, nil },
+})
+`,
+		"main.go": `package main
+
+const home = "https://example.com/docs" // the trailing comment
+var raw = ` + "`a raw string with // in it`" + `
+
+func main() {
+	api.Register(mux, api.Config{Authorize: bearer(token)}, apis.FsApiRoutes()...)
+}
+`,
+	})
+	if _, ok := rules(runCheck(root, false))["roles-unwired"]; ok {
+		t.Fatal("wiring after a string containing // was not seen")
+	}
+}
