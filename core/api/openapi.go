@@ -72,15 +72,20 @@ func Document(info Info, routes []Route) map[string]any {
 			op["requestBody"] = body
 		}
 		description := rt.Description
-		if len(rt.Roles) > 0 {
-			// The scheme is nominal: howl-go does not know how an application
-			// authenticates, only that this endpoint asked for roles. Saying
-			// which ones is more useful than pretending to know the mechanism.
-			op["security"] = []any{map[string]any{"roles": rt.Roles}}
+		// The scheme is nominal: howl-go does not know how an application
+		// authenticates, only that this endpoint asked for roles or for
+		// permissions. Saying which ones is more useful than pretending to know
+		// the mechanism.
+		//
+		// An endpoint declaring both requires both, and the document says so
+		// the same way the gate enforces it: two entries in one security
+		// requirement, which is OpenAPI's AND.
+		if security := securityFor(rt); security != nil {
+			op["security"] = []any{security}
 			if description != "" {
 				description += "\n\n"
 			}
-			description += "Requires: " + strings.Join(rt.Roles, ", ")
+			description += "Requires: " + strings.Join(requirementsOf(rt), ", ")
 		}
 		if rt.Cache.TTL > 0 {
 			if description != "" {
@@ -107,10 +112,8 @@ func Document(info Info, routes []Route) map[string]any {
 	if len(schemas) > 0 {
 		components["schemas"] = schemas
 	}
-	if usesRoles(routes) {
-		components["securitySchemes"] = map[string]any{
-			"roles": map[string]any{"type": "apiKey", "in": "header", "name": "Authorization"},
-		}
+	if schemes := securitySchemes(routes); len(schemes) > 0 {
+		components["securitySchemes"] = schemes
 	}
 	if len(components) > 0 {
 		doc["components"] = components
@@ -181,13 +184,45 @@ func tagFor(path string) string {
 	return ""
 }
 
-func usesRoles(routes []Route) bool {
-	for _, rt := range routes {
-		if len(rt.Roles) > 0 {
-			return true
-		}
+// securityFor is the endpoint's requirement, or nil for one that asks nothing.
+// Roles and permissions in one map is OpenAPI's AND, which is what declaring
+// both means.
+func securityFor(rt Route) map[string]any {
+	if len(rt.Roles) == 0 && len(rt.Permissions) == 0 {
+		return nil
 	}
-	return false
+	out := map[string]any{}
+	if len(rt.Roles) > 0 {
+		out["roles"] = rt.Roles
+	}
+	if len(rt.Permissions) > 0 {
+		out["permissions"] = PermissionNames(rt.Permissions)
+	}
+	return out
+}
+
+// requirementsOf is the same thing for the sentence in the description, which
+// is what most readers of a document actually read.
+func requirementsOf(rt Route) []string {
+	out := make([]string, 0, len(rt.Roles)+len(rt.Permissions))
+	out = append(out, rt.Roles...)
+	return append(out, PermissionNames(rt.Permissions)...)
+}
+
+func securitySchemes(routes []Route) map[string]any {
+	var roles, permissions bool
+	for _, rt := range routes {
+		roles = roles || len(rt.Roles) > 0
+		permissions = permissions || len(rt.Permissions) > 0
+	}
+	out := map[string]any{}
+	if roles {
+		out["roles"] = map[string]any{"type": "apiKey", "in": "header", "name": "Authorization"}
+	}
+	if permissions {
+		out["permissions"] = map[string]any{"type": "apiKey", "in": "header", "name": "Authorization"}
+	}
+	return out
 }
 
 // parameters covers both halves of the input that is not a body: the
@@ -301,7 +336,7 @@ func responses(rt Route, schemas map[string]any) map[string]any {
 			"content": map[string]any{"application/json": map[string]any{"schema": errorSchema}}}
 	}
 	out["400"] = failure("Invalid input")
-	if len(rt.Roles) > 0 {
+	if len(rt.Roles) > 0 || len(rt.Permissions) > 0 {
 		out["401"] = failure("Unauthorized")
 		// Authorize answers 403 for a caller who is signed in without the
 		// role, which is the more common of the two for a real client.

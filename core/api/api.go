@@ -18,11 +18,12 @@
 //
 // # What this package deliberately does not do
 //
-// It does not know what a role is. An endpoint declares strings; the
-// application supplies Config.Authorize and decides what they mean. Permissions
-// belong to the application — they need its user model, its session, its
-// database — and a framework that guesses at them is a framework you have to
-// fight. Same for logging and correlation ids: they arrive through core/mw if
+// It does not know what a role is, or what a permission is. An endpoint
+// declares roles as strings and permissions as values of its own, the
+// application supplies Config.Authorize and Config.Permit, and it decides what
+// both mean. They belong to the application — they need its user model, its
+// session, its database — and a framework that guesses at them is a framework
+// you have to fight. Same for logging and correlation ids: they arrive through core/mw if
 // you want them.
 //
 // It does not write the response body for you to break: a handler returns a
@@ -86,6 +87,26 @@ type Spec[Q, B, R any] struct {
 	Path string
 	// Roles is passed verbatim to Config.Authorize. Empty means public.
 	Roles []string
+	// Permissions is what the caller must be allowed to *do*, as opposed to
+	// what Roles says they must *be*. Passed to Config.Permit; empty asks
+	// nothing.
+	//
+	// Its own field rather than more strings in Roles, because the two are
+	// different questions and an application that answers them from the same
+	// list ends up with a gate whose name lies. They are also answered
+	// differently in practice: a rank is usually already known from the
+	// credential, and what somebody may do usually is not.
+	//
+	// Typed, and that is the point of it. Permission is an interface, so an
+	// endpoint declares a value the application defined — a name the compiler
+	// has seen — and a permission that does not exist cannot be written down
+	// here at all. A []string could hold a typo, and a typo in a gate is a door
+	// locked for everybody that reads exactly like a door that works.
+	//
+	// An endpoint declaring both Roles and Permissions requires both. Either
+	// alone would make the other decorative, and a gate with a decorative half
+	// is worse than a gate with one half.
+	Permissions []Permission
 	// Description is for the reader of the OpenAPI document: what the endpoint
 	// does, in a sentence. Name is the label; this is the explanation.
 	Description string
@@ -229,6 +250,7 @@ type Route struct {
 	Method      Method
 	Path        string
 	Roles       []string
+	Permissions []Permission
 	Description string
 	Errors      []int
 	Cache       Cache
@@ -259,6 +281,19 @@ type Config struct {
 	// mistake that would otherwise serve private data to everyone, so it
 	// panics at registration rather than at 3am.
 	Authorize func(r *http.Request, roles []string) error
+	// Permit is the other half of the same layer: Authorize answers "is this
+	// caller one of these", Permit answers "may this caller do these things".
+	// It receives the names of the permissions the endpoint declared, in order.
+	// Return nil to allow, or an *api.Error to reject with a chosen status.
+	//
+	// Separate from Authorize rather than a second argument to it, so that an
+	// application which gates only on roles never has to think about this, and
+	// one which gates on both can answer each where it is answered best — a
+	// rank from the credential, a permission from the account.
+	//
+	// A route that declares permissions with no Permit configured panics at
+	// registration, for the same reason the Authorize version does.
+	Permit func(r *http.Request, permissions []string) error
 	// OnError observes every failed request. The response is already decided;
 	// this is for logging and metrics.
 	OnError func(r *http.Request, err error)
@@ -341,6 +376,7 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 		Method:      Method(strings.ToUpper(string(s.Method))),
 		Path:        s.Path,
 		Roles:       s.Roles,
+		Permissions: s.Permissions,
 		Description: s.Description,
 		Errors:      s.Errors,
 		Cache:       s.Cache,
@@ -408,6 +444,15 @@ func Define[Q, B, R any](s Spec[Q, B, R]) Route {
 				// not become the way a caller without the role reads it.
 				if err := authorize(cfg, r, s.Roles); err != nil {
 					observe.Current(r.Context()).Set("howl.api.stage", "authorize")
+					fail(cfg, w, r, err)
+					return
+				}
+				// After the roles and before the cache, for both of the reasons
+				// the roles are: an entry filled by somebody allowed must never
+				// become the way somebody not allowed reads it, and an endpoint
+				// declaring both is asking for both.
+				if err := permit(cfg, r, s.Permissions); err != nil {
+					observe.Current(r.Context()).Set("howl.api.stage", "permit")
 					fail(cfg, w, r, err)
 					return
 				}
@@ -481,6 +526,9 @@ func Register(mux *http.ServeMux, cfg Config, routes ...Route) {
 		if len(rt.Roles) > 0 && cfg.Authorize == nil {
 			panic(fmt.Sprintf("api: %q declares roles %v but Config.Authorize is nil — every caller would be let through", rt.Name, rt.Roles))
 		}
+		if len(rt.Permissions) > 0 && cfg.Permit == nil {
+			panic(fmt.Sprintf("api: %q declares permissions %v but Config.Permit is nil — every caller would be let through", rt.Name, PermissionNames(rt.Permissions)))
+		}
 		if rt.Path == "" {
 			panic("api: " + rt.Name + " has no path (generated tables call api.At)")
 		}
@@ -544,6 +592,52 @@ func (cfg Config) limitKey(pattern string, by func(*http.Request) string) func(*
 	}
 }
 
+// Permission is one thing an endpoint requires the caller to be allowed to do.
+//
+// An interface with one method, and everything about this design is in that
+// choice. This package cannot know an application's permissions — they are as
+// particular to it as its tables are — but it can insist that an endpoint name
+// one the application actually declared, because naming one means naming a Go
+// value the compiler has already seen.
+//
+// So the application writes its vocabulary once, as identifiers:
+//
+//	var (
+//	    DocumentsRead  = perm("documents", "read")
+//	    DocumentsWrite = perm("documents", "write")
+//	)
+//
+// and an endpoint declares one of them:
+//
+//	Permissions: []api.Permission{store.DocumentsWrite},
+//
+// A misspelt permission is now a compile error rather than a gate that refuses
+// everybody — which is the failure this is worth a type for, because it has no
+// symptom until the person the endpoint was opened for tries to use it.
+//
+// The application's type does not import this package to satisfy this: Go
+// interfaces are structural, so any type with a Permission() string method
+// fits. That matters here — a permission vocabulary is usually declared in a
+// package shared with the client, which should not be dragging a server
+// framework into a browser build.
+type Permission interface {
+	// Permission is the name Config.Permit receives.
+	Permission() string
+}
+
+// PermissionNames is what Config.Permit is handed: the declared permissions, in
+// order, as their names.
+func PermissionNames(permissions []Permission) []string {
+	if len(permissions) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(permissions))
+	for _, p := range permissions {
+		out = append(out, p.Permission())
+	}
+	return out
+}
+
 // Routes is sugar for building a table by hand, in tests or a small app.
 func Routes(rs ...Route) []Route { return rs }
 
@@ -552,6 +646,13 @@ func authorize(cfg Config, r *http.Request, roles []string) error {
 		return nil
 	}
 	return cfg.Authorize(r, roles)
+}
+
+func permit(cfg Config, r *http.Request, permissions []Permission) error {
+	if len(permissions) == 0 || cfg.Permit == nil {
+		return nil
+	}
+	return cfg.Permit(r, PermissionNames(permissions))
 }
 
 // ---------------------------------------------------------------------------
