@@ -997,6 +997,7 @@ type Purged struct {
 var Purge = api.Define(api.Spec[api.None, api.None, Purged]{
 	Name:  "Purge",
 	Roles: []string{"admin"},          // strings; the application decides what they mean
+	// Permissions: []api.Permission{store.SettingsPurge},  // typed; see below
 	Handler: func(r *api.Request[api.None, api.None]) (Purged, error) {
 		removed, err := store.Get().Purge()
 		return Purged{Removed: removed}, err
@@ -1015,6 +1016,29 @@ var Purge = api.Define(api.Spec[api.None, api.None, Purged]{
 Rules:
 
 - **One `api.Define` per file.** The file name is the URL; it can only describe one.
+- **`Roles` says what a caller must *be*; `Permissions` says what they must be
+  allowed to *do*.** Two fields, because they are two questions and a list that
+  answers both is a gate whose name lies. `Roles` is `[]string` and goes to
+  `Config.Authorize`; `Permissions` is `[]api.Permission` and goes to
+  `Config.Permit`. An endpoint declaring both requires both.
+
+  `api.Permission` is an interface with one method, `Permission() string`, and
+  that is the point of it: an endpoint names a value the application declared,
+  so a misspelt permission is a compile error rather than a gate that refuses
+  everybody. The application's type does not import `core/api` to satisfy it —
+  Go interfaces are structural — so a vocabulary shared with the browser stays
+  free of the server framework.
+
+  ```go
+  // the application, once:
+  type permission string
+  func (p permission) Permission() string { return string(p) }
+  const DocumentsWrite permission = "documents.write"
+
+  // the endpoint:
+  Permissions: []api.Permission{store.DocumentsWrite},
+  ```
+
 - The method comes from the file name. To set it in the spec instead, use the typed constants:
   `Method: api.POST` — `api.GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`.
   `Method` is a named string type, so `Method: "POST"` still compiles, and case is normalised.
