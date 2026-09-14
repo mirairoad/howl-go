@@ -616,6 +616,11 @@ type endpointInfo struct {
 	Description string   `json:"description,omitempty"`
 	File        string   `json:"file,omitempty"`
 	Roles       []string `json:"roles,omitempty"`
+	// Permissions is the other half of the gate, as written —
+	// store.DataRequestsRead, not a name. An endpoint gated on one and reported
+	// without it reads as an endpoint with no gate at all, which is the worst
+	// thing this tool could say about a private route.
+	Permissions []string `json:"permissions,omitempty"`
 	Cache       string   `json:"cache,omitempty"`
 	Limit       string   `json:"limit,omitempty"`
 	Query       string   `json:"query,omitempty"`
@@ -635,6 +640,9 @@ var (
 	specLimitRe = regexp.MustCompile(`Limit:\s*api\.Limit\{([^}]*)\}`)
 	spaceRe     = regexp.MustCompile(`\s+`)
 	roleValueRe = regexp.MustCompile(`"([^"]*)"`)
+	// Permissions holds values rather than strings, so the identifiers are read
+	// out whole: there is nothing quoted to match.
+	specPermsRe = regexp.MustCompile(`Permissions:\s*\[\]api\.Permission\{([^}]*)\}`)
 )
 
 func readEndpoints(root string) any {
@@ -675,6 +683,13 @@ func readEndpoints(root string) any {
 		if r := rolesRe.Find(f.Body); r != nil {
 			for _, role := range roleValueRe.FindAllStringSubmatch(string(r), -1) {
 				info.Roles = append(info.Roles, role[1])
+			}
+		}
+		if p := specPermsRe.FindSubmatch(f.Body); p != nil {
+			for _, name := range strings.Split(string(p[1]), ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					info.Permissions = append(info.Permissions, name)
+				}
 			}
 		}
 		byVar[string(m[1])] = info

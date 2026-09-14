@@ -219,3 +219,50 @@ func FsApiRoutes() []api.Route {
 		t.Errorf("cache = %q, roles = %v", e.Cache, e.Roles)
 	}
 }
+
+// The other vertical, read the same way. An endpoint gated on a permission and
+// reported without it reads as an endpoint with no gate at all, which is the
+// worst thing this tool could say about a private route.
+func TestEndpointsReportPermissions(t *testing.T) {
+	root := t.TempDir()
+	api := `package apis
+
+var Purge = api.Define(api.Spec[api.None, api.None, api.None]{
+	Name:        "Purge",
+	Permissions: []api.Permission{store.SettingsPurge, store.SettingsRead},
+	Handler:     func(r *api.Request[api.None, api.None]) (api.None, error) { return api.None{}, nil },
+})
+`
+	gen := `package apis
+
+func FsApiRoutes() []api.Route {
+	return []api.Route{
+		api.At("POST", "/api/purge", Purge),
+	}
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "purge.post.api.go"), []byte(api), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "apis_gen.go"), []byte(gen), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := json.Marshal(readEndpoints(root))
+	var got struct{ Endpoints []endpointInfo }
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Endpoints) != 1 {
+		t.Fatalf("read %d endpoints, want 1: %s", len(got.Endpoints), raw)
+	}
+	e := got.Endpoints[0]
+	// As written, because that is what somebody has to type to declare the same
+	// gate: these are identifiers the application owns, not names.
+	if len(e.Permissions) != 2 || e.Permissions[0] != "store.SettingsPurge" || e.Permissions[1] != "store.SettingsRead" {
+		t.Errorf("permissions = %v", e.Permissions)
+	}
+	if len(e.Roles) != 0 {
+		t.Errorf("roles = %v, want none", e.Roles)
+	}
+}

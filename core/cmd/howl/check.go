@@ -298,12 +298,16 @@ func importLine(body []byte, imp string) int {
 // ---------------------------------------------------------------------------
 
 var (
-	importAppRe        = regexp.MustCompile(`"[^"]*howl-go/core/app"`)
-	importDBRe         = regexp.MustCompile(`"[^"]*howl-go/db(/[\w/]+)?"`)
-	templMountRe       = regexp.MustCompile(`(?m)^templ\s+(Mount|Unmount)\s*\(`)
-	rawQueryRe         = regexp.MustCompile(`r\.HTTP\.(URL\.Query\(\)|FormValue|PostFormValue)`)
-	rolesRe            = regexp.MustCompile(`Roles:\s*\[\]string\{[^}]*"`)
-	authorizeRe        = regexp.MustCompile(`Authorize:\s*`)
+	importAppRe  = regexp.MustCompile(`"[^"]*howl-go/core/app"`)
+	importDBRe   = regexp.MustCompile(`"[^"]*howl-go/db(/[\w/]+)?"`)
+	templMountRe = regexp.MustCompile(`(?m)^templ\s+(Mount|Unmount)\s*\(`)
+	rawQueryRe   = regexp.MustCompile(`r\.HTTP\.(URL\.Query\(\)|FormValue|PostFormValue)`)
+	rolesRe      = regexp.MustCompile(`Roles:\s*\[\]string\{[^}]*"`)
+	authorizeRe  = regexp.MustCompile(`Authorize:\s*`)
+	// The other vertical. Permissions is []api.Permission, so there is nothing
+	// quoted to look for — a non-empty literal is the whole match.
+	permissionsRe      = regexp.MustCompile(`Permissions:\s*\[\]api\.Permission\{[^}\s]`)
+	permitRe           = regexp.MustCompile(`Permit:\s*`)
 	structFieldRe      = regexp.MustCompile(`(?m)^\s+([A-Z]\w*)\s+[\[\]\*\w\.]+(\s+` + "`" + `[^` + "`" + `]*` + "`" + `)?\s*$`)
 	generatedRe        = regexp.MustCompile(`^// Code generated`)
 	runtimeStateCallRe = regexp.MustCompile(`\b(os\.(Getenv|LookupEnv|Environ)|time\.Now|runtime\.Version)\s*\(`)
@@ -1440,10 +1444,16 @@ func stripHTMLComments(body string) string {
 func lintEndpoints(root string, files []sourceFile) []Diagnostic {
 	var out []Diagnostic
 	declaresRoles, wiresAuthorize := "", false
+	declaresPermissions, wiresPermit := "", false
 
 	for _, f := range files {
-		if authorizeRe.Match(f.Body) && !strings.HasSuffix(f.Rel, ".api.go") {
-			wiresAuthorize = true
+		if !strings.HasSuffix(f.Rel, ".api.go") {
+			if authorizeRe.Match(f.Body) {
+				wiresAuthorize = true
+			}
+			if permitRe.Match(f.Body) {
+				wiresPermit = true
+			}
 		}
 		if !strings.HasSuffix(f.Rel, ".api.go") {
 			continue
@@ -1457,6 +1467,9 @@ func lintEndpoints(root string, files []sourceFile) []Diagnostic {
 		}
 		if rolesRe.Match(f.Body) && declaresRoles == "" {
 			declaresRoles = f.Rel
+		}
+		if permissionsRe.Match(f.Body) && declaresPermissions == "" {
+			declaresPermissions = f.Rel
 		}
 		if n := len(defineRe.FindAll(f.Body, -1)); n > 1 {
 			out = append(out, Diagnostic{
@@ -1473,6 +1486,16 @@ func lintEndpoints(root string, files []sourceFile) []Diagnostic {
 			File: declaresRoles, Rule: "roles-unwired", Level: "error",
 			Message: "an endpoint declares Roles but nothing in this module sets api.Config.Authorize; every caller would be let through",
 			Fix:     "pass api.Config{Authorize: …} to api.Register — roles are the application's to interpret",
+		})
+	}
+	// The same mistake on the other vertical. api.Register panics for this at
+	// startup rather than serving it, which is the right failure — but a panic
+	// on deploy is a worse place to find out than a check before the commit.
+	if declaresPermissions != "" && !wiresPermit {
+		out = append(out, Diagnostic{
+			File: declaresPermissions, Rule: "permissions-unwired", Level: "error",
+			Message: "an endpoint declares Permissions but nothing in this module sets api.Config.Permit; api.Register will panic at startup",
+			Fix:     "pass api.Config{Permit: …} to api.Register — what a permission means is the application's to decide, as a role is",
 		})
 	}
 	return out

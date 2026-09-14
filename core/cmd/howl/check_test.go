@@ -172,6 +172,63 @@ func main() {
 	}
 }
 
+// The same mistake on the other vertical. api.Register panics for this at
+// startup rather than serving it, which is the right failure — and a panic on
+// deploy is still a worse place to find out than a check before the commit.
+func TestPermissionsWithoutPermit(t *testing.T) {
+	endpoint := `package apis
+
+import "github.com/mirairoad/howl-go/core/api"
+
+var Purge = api.Define(api.Spec[api.None, api.None, api.None]{
+	Name:        "Purge",
+	Permissions: []api.Permission{store.SettingsPurge},
+	Handler:     func(r *api.Request[api.None, api.None]) (api.None, error) { return api.None{}, nil },
+})
+`
+	root := project(t, map[string]string{"server/apis/purge.post.api.go": endpoint})
+	if _, ok := rules(runCheck(root, false))["permissions-unwired"]; !ok {
+		t.Fatal("permissions with no Permit anywhere in the module was accepted")
+	}
+	// And not reported as the other rule: an endpoint gated on permissions and
+	// naming no roles needs no Authorize, and saying it does would send somebody
+	// to wire the wrong half.
+	if _, ok := rules(runCheck(root, false))["roles-unwired"]; ok {
+		t.Fatal("an endpoint declaring only Permissions was reported as roles-unwired")
+	}
+
+	wired := project(t, map[string]string{
+		"server/apis/purge.post.api.go": endpoint,
+		"main.go": `package main
+
+func main() {
+	api.Register(mux, api.Config{Permit: grants(store)}, apis.FsApiRoutes()...)
+}
+`,
+	})
+	if _, ok := rules(runCheck(wired, false))["permissions-unwired"]; ok {
+		t.Fatal("permissions reported as unwired even though Permit is configured")
+	}
+}
+
+// An empty literal is not a gate, and reporting it as one would send somebody
+// to wire a Permit that nothing asks for.
+func TestEmptyPermissionsIsNotAGate(t *testing.T) {
+	root := project(t, map[string]string{"server/apis/open.api.go": `package apis
+
+import "github.com/mirairoad/howl-go/core/api"
+
+var Open = api.Define(api.Spec[api.None, api.None, api.None]{
+	Name:        "Open",
+	Permissions: []api.Permission{},
+	Handler:     func(r *api.Request[api.None, api.None]) (api.None, error) { return api.None{}, nil },
+})
+`})
+	if _, ok := rules(runCheck(root, false))["permissions-unwired"]; ok {
+		t.Fatal("an empty Permissions literal was read as a gate")
+	}
+}
+
 // Declaring a typed query and then reading the raw one is legal Go that defeats
 // the entire layer, so it is a warning rather than a silent difference in
 // behaviour between what the endpoint documents and what it does.
