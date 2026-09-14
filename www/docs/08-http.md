@@ -281,6 +281,48 @@ Handler: func(r *api.Request[api.None, SignIn]) (Session, error) {
 
 `r.Header()` is the response's header map and `r.SetCookie` adds to it — howl (TS)'s `ctx.headers` and `ctx.cookies.set`. Both go out with error responses too, because clearing a session cookie on a `401` is a real case. `Content-Type` is the framework's, unless the response type owns it — see below.
 
+### Who may call it: two questions, two fields
+
+```go
+Roles:       []string{"ADMIN"},                          // -> Config.Authorize   what the caller must be
+Permissions: []api.Permission{store.DataRequestsRead},   // -> Config.Permit      what they must be allowed to do
+```
+
+howl-go knows what neither of them means. An endpoint declares them, the
+application supplies `Config.Authorize` and `Config.Permit`, and it decides —
+they need a user model, a session and a database, and a framework that guesses
+at those is one you have to fight.
+
+They are two fields because they are two questions, and an application that
+answers both from one list ends up with a gate whose name lies. **An endpoint
+declaring both requires both**: either alone would make the other decorative,
+and a gate with a decorative half is worse than a gate with one half, because
+somebody reading it believes in a check that is not happening.
+
+`api.Permission` is an interface with one method, `Permission() string`, and
+that is where the type safety is. This package cannot know your permissions, but
+it can insist you name one you declared — a Go value the compiler has seen — so
+a misspelt permission is a compile error rather than a gate that refuses
+everybody. That failure is worth a type: it has no symptom until the person the
+endpoint was opened for tries to use it.
+
+```go
+// your vocabulary, once
+type permission string
+
+func (p permission) Permission() string { return string(p) }
+
+var DataRequestsRead = permission("data_requests.read")
+```
+
+Nothing there imports `core/api`: Go interfaces are structural, so a permission
+vocabulary can live in the package you share with the browser without dragging a
+server framework into a wasm build.
+
+A route declaring roles with no `Authorize`, or permissions with no `Permit`,
+panics at `Register` rather than serving everybody — and `howl check` reports
+both (`roles-unwired`, `permissions-unwired`) before the program runs at all.
+
 ### Answering with something that is not JSON
 
 howl (TS) had `ctx.text`, `ctx.html`, `ctx.xml`, `ctx.redirect`, `ctx.stream` and `ctx.sse`. Here they are the endpoint's response type rather than methods on a context, because `R` is what the OpenAPI document and the generated client are built from — a body written straight to the writer would be invisible to both.
