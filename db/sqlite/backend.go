@@ -501,8 +501,15 @@ func (b *Backend) KeyCounts(ctx context.Context, o db.OpOptions) (map[string]int
 	deleted := b.promoted[db.DeletedAtPath].name
 	conn := b.exec(o)
 
+	// json_each is aliased and its key qualified, because "key" is a perfectly
+	// ordinary field name for a document to have — and a collection that
+	// promotes one (an index, a unique constraint) grows a column called key
+	// beside json_each's own. SQLite then refuses the whole statement as
+	// ambiguous, and the collection that most needs a schema report is the one
+	// that silently stops having one. The pg backend aliases the same way for
+	// the same reason.
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
-		`SELECT key, COUNT(*) FROM %s, json_each(doc) WHERE %q IS NULL GROUP BY key`,
+		`SELECT keys.key, COUNT(*) FROM %s, json_each(doc) AS keys WHERE %q IS NULL GROUP BY keys.key`,
 		b.quoted(), deleted))
 	if err != nil {
 		return nil, 0, fmt.Errorf("sqlite: %s: key counts: %w", b.table, err)

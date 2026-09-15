@@ -239,3 +239,59 @@ func service(t *testing.T, conn *sql.DB, cache db.Cache, promote ...sqlite.Promo
 	}
 	return s.Service
 }
+
+// keyed is a collection whose documents have a field called "key" — a cache, a
+// settings table, a key/value store of any kind — and which promotes it,
+// because that is what a unique constraint over it needs.
+type keyed struct {
+	db.Doc
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	Note  string `json:"note"`
+}
+
+// The schema report over a collection that has a column called key.
+//
+// The grouped query behind an exact report joins the table to json_each(doc),
+// and json_each's own first column is called key. A promoted column of the same
+// name made "key" ambiguous, SQLite refused the whole statement, and the report
+// came back as an error — so the one collection with a key/value shape, which
+// is the one whose documents are least uniform, was the one nothing could
+// report drift for. Found in an application's startup log, not by a test.
+func TestReportSurvivesAPromotedKeyColumn(t *testing.T) {
+	ctx := context.Background()
+	conn := open(t)
+	name := fmt.Sprintf("keyed_%d", table.Add(1))
+
+	s, err := sqlite.New[keyed](ctx, conn, sqlite.Options{
+		Collection: name,
+		Unique:     []string{"key"},
+	})
+	if err != nil {
+		t.Fatalf("construction: %v", err)
+	}
+	if _, err := s.Create(ctx, keyed{Key: "a", Value: "1", Note: "written with every field"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// A second document without the note, so the report has something to find
+	// and cannot pass by being empty.
+	if _, err := s.Create(ctx, keyed{Key: "b", Value: "2"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	report, err := s.Report(ctx)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if !report.Exact {
+		t.Error("the report is sampled, so the grouped query did not run")
+	}
+	if report.Total != 2 {
+		t.Errorf("report covers %d documents, want 2", report.Total)
+	}
+	// Both documents carry every declared field — an empty string is a value,
+	// not an absence — so there is nothing missing and nothing orphaned.
+	if len(report.Missing) != 0 || len(report.Orphans) != 0 {
+		t.Errorf("report = %+v, want nothing missing and nothing orphaned", report)
+	}
+}
