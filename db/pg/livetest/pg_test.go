@@ -193,3 +193,60 @@ func service(t *testing.T, conn *sql.DB, cache db.Cache, promote ...pg.Promote) 
 	}
 	return s.Service
 }
+
+// keyed is a collection whose documents have a field called "key" — a cache, a
+// settings table, a key/value store of any kind — and which promotes it,
+// because that is what a unique constraint over it needs.
+type keyed struct {
+	db.Doc
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	Note  string `json:"note"`
+}
+
+// The schema report over a collection that has a column called key.
+//
+// The grouped query behind an exact report joins the table to
+// jsonb_object_keys(doc), and `AS key` names both the table and the column for
+// a function returning a base type — so a promoted column of the same name put
+// two "key"s in scope and Postgres refused the statement as ambiguous. The
+// report then came back as an error for the one collection whose documents are
+// least uniform, which is the one most worth reporting on.
+//
+// The same bug, the same shape and the same fix as SQLite's: found there first,
+// in an application's startup log rather than by a test.
+func TestReportSurvivesAPromotedKeyColumn(t *testing.T) {
+	ctx := context.Background()
+	conn := open(t)
+	name := fmt.Sprintf("keyed_%d", table.Add(1))
+
+	s, err := pg.New[keyed](ctx, conn, pg.Options{
+		Collection: name,
+		Unique:     []string{"key"},
+	})
+	if err != nil {
+		t.Fatalf("construction: %v", err)
+	}
+	if _, err := s.Create(ctx, keyed{Key: "a", Value: "1", Note: "written with every field"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// A second document without the note, so the report has something to find
+	// and cannot pass by being empty.
+	if _, err := s.Create(ctx, keyed{Key: "b", Value: "2"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	report, err := s.Report(ctx)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if !report.Exact {
+		t.Error("the report is sampled, so the grouped query did not run")
+	}
+	if report.Total != 2 {
+		t.Errorf("report covers %d documents, want 2", report.Total)
+	}
+	if len(report.Missing) != 0 || len(report.Orphans) != 0 {
+		t.Errorf("report = %+v, want nothing missing and nothing orphaned", report)
+	}
+}

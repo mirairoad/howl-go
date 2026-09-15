@@ -445,8 +445,13 @@ func (b *Backend) KeyCounts(ctx context.Context, o db.OpOptions) (map[string]int
 	deleted := b.promoted[db.DeletedAtPath].name
 	conn := b.exec(o)
 
+	// Aliased as keys(key) and qualified, because `AS key` names both the table
+	// and the column for a function returning a base type — so a collection that
+	// promotes a field called key (a cache, a settings table) had two of them in
+	// scope and Postgres refused the statement as ambiguous. The sqlite backend
+	// aliases the same way for the same reason.
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
-		`SELECT key, COUNT(*) FROM %s, LATERAL jsonb_object_keys(doc) AS key WHERE %q IS NULL GROUP BY key`,
+		`SELECT keys.key, COUNT(*) FROM %s, LATERAL jsonb_object_keys(doc) AS keys(key) WHERE %q IS NULL GROUP BY keys.key`,
 		b.quoted(), deleted))
 	if err != nil {
 		return nil, 0, fmt.Errorf("pg: %s: key counts: %w", b.table, err)
