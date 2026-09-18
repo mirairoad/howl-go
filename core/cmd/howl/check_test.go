@@ -759,6 +759,32 @@ var db *sql.DB
 	}
 }
 
+// Its tests are not the store. go build never compiles a _test.go file, so one
+// that reads a stylesheet off disk with os takes nothing into the wasm build —
+// and the same import in the store itself still does.
+func TestStoreTestsMayUseTheServer(t *testing.T) {
+	root := project(t, map[string]string{
+		"client/pages/app.templ": goodShell,
+		"client/store/theme.go":  "package store\n\ntype Theme string\n",
+		"client/store/theme_test.go": `package store
+
+import (
+	"os"
+	"testing"
+)
+
+func TestPalette(t *testing.T) {
+	if _, err := os.ReadFile("../styles/global.css"); err != nil {
+		t.Skip()
+	}
+}
+`,
+	})
+	if d, ok := rules(runCheck(root, false))["store-not-portable"]; ok {
+		t.Fatalf("a store test was reported for importing os: %+v", d)
+	}
+}
+
 func TestClientTemplateCannotReadProcessRuntime(t *testing.T) {
 	root := project(t, map[string]string{
 		"go.mod":                 "module example.com/app\n\ngo 1.25\n",
@@ -1167,6 +1193,53 @@ func load(ctx context.Context, s *db.Service[User, *User], ids []string) []User 
 	})
 	if _, ok := rules(runCheck(root, false))["query-in-loop"]; !ok {
 		t.Fatal("an N+1 was accepted")
+	}
+}
+
+// Some loops are one statement per item and cannot be anything else: a hard
+// delete DeleteWhere refuses to do in bulk, a patch whose value differs per row.
+// A mark with its reason is how that is said — and the reason is required,
+// because a bare mark is only a way to switch the rule off.
+func TestQueryInLoopMarks(t *testing.T) {
+	src := func(mark string) string {
+		return `package apis
+
+import (
+	"context"
+
+	"github.com/mirairoad/howl-go/db"
+)
+
+func erase(ctx context.Context, s *db.Service[User, *User], ids []string) error {
+	for _, id := range ids {
+` + mark + `
+	}
+	return nil
+}
+`
+	}
+	for _, c := range []struct {
+		name, mark string
+		reported   bool
+	}{
+		{"a reason on the line above", "\t\t//howl:query-in-loop DeleteWhere only soft-deletes, and an erasure has to be hard\n\t\tif err := s.Delete(ctx, id, db.Hard()); err != nil {\n\t\t\treturn err\n\t\t}", false},
+		{"a reason at the end of the line", "\t\tif err := s.Delete(ctx, id, db.Hard()); err != nil { //howl:query-in-loop an erasure has to be hard\n\t\t\treturn err\n\t\t}", false},
+		{"no reason", "\t\t//howl:query-in-loop\n\t\tif err := s.Delete(ctx, id, db.Hard()); err != nil {\n\t\t\treturn err\n\t\t}", true},
+		{"a mark two lines away", "\t\t//howl:query-in-loop it is fine\n\n\t\tif err := s.Delete(ctx, id, db.Hard()); err != nil {\n\t\t\treturn err\n\t\t}", true},
+		{"a string that spells the mark", "\t\t_ = \"//howl:query-in-loop a string, not a comment\"; if err := s.Delete(ctx, id, db.Hard()); err != nil {\n\t\t\treturn err\n\t\t}", true},
+	} {
+		root := project(t, map[string]string{
+			"go.mod":                   "module example.com/app\n\ngo 1.25\n",
+			"client/pages/app.templ":   goodShell,
+			"server/apis/erase.api.go": src(c.mark),
+		})
+		d, reported := rules(runCheck(root, false))["query-in-loop"]
+		if reported != c.reported {
+			t.Errorf("%s: reported = %v, want %v (%+v)", c.name, reported, c.reported, d)
+		}
+		if c.name == "no reason" && !strings.Contains(d.Message, "no reason") {
+			t.Errorf("a mark without a reason is reported as a plain N+1, which does not say what is missing: %q", d.Message)
+		}
 	}
 }
 
