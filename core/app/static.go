@@ -22,7 +22,8 @@ import (
 // you: an ETag, a Cache-Control, and a compressed copy.
 //
 // Compression happens once per file and is kept, which is the difference that
-// matters at this scale. A 8.3 MB wasm binary gzipped on every request burns a
+// matters at this scale — once per process, not per Static: every App in a test
+// binary serves the same embedded files (compressions). A 8.3 MB wasm binary gzipped on every request burns a
 // core per download; gzipped once it costs 2.27 MB of memory and nothing per
 // request. That is also why this holds files in memory: the FS is normally an
 // embed.FS, so the bytes are in the binary already.
@@ -267,10 +268,10 @@ func (s *Static) load(name string) (*entry, error) {
 		e.stamp = stamp{mod: info.ModTime(), size: info.Size()}
 	}
 	if compressible(e.ctype) && len(raw) >= 512 {
-		var buf bytes.Buffer
-		zw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-		if _, err := zw.Write(raw); err == nil && zw.Close() == nil && buf.Len() < len(raw) {
-			e.gz = buf.Bytes()
+		if s.Reload {
+			e.gz = compress(raw)
+		} else {
+			e.gz = compressOnce(sum, raw)
 		}
 	}
 
@@ -281,6 +282,56 @@ func (s *Static) load(name string) (*entry, error) {
 	s.cache[name] = e
 	s.mu.Unlock()
 	return e, nil
+}
+
+// compressions is the gzip of every file a Static in this process has
+// compressed, by the SHA-256 of its bytes — the sum load already takes for the
+// ETag — and shared by every Static that serves the same bytes.
+//
+// Once per file per process, rather than once per Static. A test suite starts
+// an App per test, and every App warms the same embedded files. Sharing it
+// cannot serve the wrong bytes, because the key is the content: two Statics
+// share a copy only when they hold the same file.
+//
+// It also closes a race inside one Static. Warm runs in the background at
+// Listen, and the first page's request for the wasm arrives while it is still
+// at it, so that request compressed the file a second time; the Once makes the
+// later of the two wait for the first.
+//
+// Measured on factory's browser suite, 45 flows and an App each, over an
+// 11.2 MB views.wasm at 979 ms of CPU a time: 90 compressions a run — exactly
+// two per App — became 10, one per test binary. The suite went from 280 to 106
+// CPU-seconds and from 32 s to 21 s on 16 cores.
+//
+// A Static that reloads keeps its compression to itself (compress, not this).
+// Its files change, and this table is never emptied, so every edit to a
+// watched file would be held for the life of the process. Without Reload a
+// Static reads each file once and keeps it for its own life anyway, which
+// bounds this table by the bytes those Statics serve — for an application,
+// the files compiled into it.
+var compressions sync.Map // [sha256.Size]byte → *compression
+
+type compression struct {
+	once sync.Once
+	gz   []byte // nil when compression did not pay
+}
+
+func compressOnce(sum [sha256.Size]byte, raw []byte) []byte {
+	v, _ := compressions.LoadOrStore(sum, new(compression))
+	c := v.(*compression)
+	c.once.Do(func() { c.gz = compress(raw) })
+	return c.gz
+}
+
+// compress is raw at gzip's best compression, or nil when the result is not
+// smaller: a file that does not shrink is served as it is.
+func compress(raw []byte) []byte {
+	var buf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if _, err := zw.Write(raw); err != nil || zw.Close() != nil || buf.Len() >= len(raw) {
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // Warm reads and compresses every file up front, so no request pays for it.
