@@ -1,7 +1,10 @@
 package app
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -321,6 +325,85 @@ func TestWarmCompressesEverythingUpFront(t *testing.T) {
 	static.mu.RUnlock()
 	if !cached || entry.gz == nil {
 		t.Fatal("warm did not leave a compressed entry behind, so the first request still pays for it")
+	}
+}
+
+// Every App in a process serves the same embedded files, so a file is
+// compressed once for all of them — and once when they all ask at the same
+// moment, which is what a test suite starting an App per test does. Before
+// this, factory's 45 browser flows gzipped one 11.2 MB wasm binary 90 times a
+// run: twice per App, since a page's request raced Warm to it.
+func TestStaticsShareOneCompressedCopy(t *testing.T) {
+	// Content no other test serves, so the shared table has not seen it.
+	fsys := fstest.MapFS{"views.wasm": {Data: []byte(strings.Repeat(t.Name()+" ", 400))}}
+
+	const apps = 8
+	got := make([][]byte, apps)
+	var wg sync.WaitGroup
+	for i := range apps {
+		wg.Go(func() {
+			e, err := (&Static{FS: fsys}).load("views.wasm")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			got[i] = e.gz
+		})
+	}
+	wg.Wait()
+	if len(got[0]) == 0 {
+		t.Fatal("the file was not compressed at all")
+	}
+	// The same backing array and not merely equal bytes: equal bytes are also
+	// what eight separate compressions produce.
+	for i, gz := range got[1:] {
+		if &gz[0] != &got[0][0] {
+			t.Fatalf("static %d compressed the file again rather than sharing the copy", i+1)
+		}
+	}
+}
+
+// Two Statics share a copy only when they hold the same bytes: the key is the
+// content, so a different file under the same name is compressed on its own.
+func TestStaticsWithDifferentFilesDoNotShare(t *testing.T) {
+	a := fstest.MapFS{"app.css": {Data: []byte(strings.Repeat("a{color:red}", 100))}}
+	b := fstest.MapFS{"app.css": {Data: []byte(strings.Repeat("a{color:blue}", 100))}}
+	ea, err := (&Static{FS: a}).load("app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eb, err := (&Static{FS: b}).load("app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := gzip.NewReader(bytes.NewReader(eb.gz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(plain)
+	if &ea.gz[0] == &eb.gz[0] || !strings.Contains(string(body), "blue") {
+		t.Fatal("a Static was handed another file's compressed bytes")
+	}
+}
+
+// A Static that reloads keeps its compression to itself. Its files change, and
+// the shared table is never emptied: sharing would hold every version of a
+// watched file for the life of the process.
+func TestAReloadingStaticDoesNotShare(t *testing.T) {
+	dir := t.TempDir()
+	raw := []byte(strings.Repeat(t.Name()+" ", 400))
+	if err := os.WriteFile(filepath.Join(dir, "app.css"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e, err := (&Static{FS: os.DirFS(dir), Reload: true}).load("app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.gz == nil {
+		t.Fatal("a reloading Static stopped compressing")
+	}
+	if _, shared := compressions.Load(sha256.Sum256(raw)); shared {
+		t.Fatal("a reloading Static put its file in the table every Static shares")
 	}
 }
 
