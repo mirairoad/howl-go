@@ -591,7 +591,12 @@ func lintReactivity(root string, files []sourceFile) []Diagnostic {
 		// Anything here that only exists on a server takes the whole browser
 		// build down with it — at link time, in a message about a package the
 		// author never mentioned.
-		if inStore {
+		//
+		// Not its tests. go build never compiles a _test.go file, for wasm or
+		// anything else, so a test that reads a stylesheet off disk with os is
+		// exactly as portable as the store it tests — and reporting it taught
+		// the one application that tripped it to ignore the rule.
+		if inStore && !strings.HasSuffix(f.Rel, "_test.go") {
 			if line, ok := findLine(f.Body, notPortableRe); ok {
 				out = append(out, Diagnostic{
 					File: f.Rel, Line: line, Rule: "store-not-portable", Level: "warning",
@@ -1037,11 +1042,12 @@ func lintPerformance(root string, files []sourceFile) []Diagnostic {
 			continue
 		}
 		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, f.Rel, body, parser.SkipObjectResolution)
+		file, err := parser.ParseFile(fset, f.Rel, body, parser.SkipObjectResolution|parser.ParseComments)
 		if err != nil {
 			continue // mid-edit; the compiler will say so more precisely
 		}
 		usesDB := importDBRe.Match(f.Body)
+		marks := queryMarks(fset, file)
 
 		ast.Inspect(file, func(n ast.Node) bool {
 			fn, ok := n.(*ast.FuncDecl)
@@ -1075,7 +1081,7 @@ func lintPerformance(root string, files []sourceFile) []Diagnostic {
 				if !isLoop {
 					return true
 				}
-				out = append(out, loopDiagnostics(f.Rel, body, at, usesDB)...)
+				out = append(out, loopDiagnostics(f.Rel, body, at, usesDB, marks)...)
 				return true
 			})
 			return false // the outer Inspect already reached every function
@@ -1085,8 +1091,8 @@ func lintPerformance(root string, files []sourceFile) []Diagnostic {
 }
 
 // loopDiagnostics reports the things that are only a problem because they are
-// inside a loop.
-func loopDiagnostics(rel string, body *ast.BlockStmt, at func(token.Pos) int, usesDB bool) []Diagnostic {
+// inside a loop. marks is the file's //howl:query-in-loop marks (queryMarks).
+func loopDiagnostics(rel string, body *ast.BlockStmt, at func(token.Pos) int, usesDB bool, marks map[int]string) []Diagnostic {
 	var out []Diagnostic
 	declared := declaredIn(body)
 
@@ -1131,11 +1137,29 @@ func loopDiagnostics(rel string, body *ast.BlockStmt, at func(token.Pos) int, us
 					Fix:     "ask for the whole set in one request, or run them concurrently and collect the results",
 				})
 			case usesDB && isDocumentRead(node):
-				out = append(out, Diagnostic{
-					File: rel, Line: at(node.Pos()), Rule: "query-in-loop", Level: "warning",
-					Message: "one query per iteration — the N+1 the filter grammar exists to avoid",
-					Fix:     `Find(ctx, db.Query{Where: db.In("id", ids)}) once, then index the result by id`,
-				})
+				line := at(node.Pos())
+				reason, marked := marks[line]
+				if !marked {
+					reason, marked = marks[line-1]
+				}
+				switch {
+				case marked && reason != "":
+					// Somebody has written down why each item is its own
+					// statement; the mark is where the next reader finds it.
+				case marked:
+					out = append(out, Diagnostic{
+						File: rel, Line: line, Rule: "query-in-loop", Level: "warning",
+						Message: queryMark + " with no reason: the mark is where the next reader learns why this loop cannot be one query",
+						Fix:     queryMark + " <why each item has to be its own statement>",
+					})
+				default:
+					out = append(out, Diagnostic{
+						File: rel, Line: line, Rule: "query-in-loop", Level: "warning",
+						Message: "one query per iteration — the N+1 the filter grammar exists to avoid",
+						Fix: `Find(ctx, db.Query{Where: db.In("id", ids)}) once, then index the result by id. ` +
+							`When every item really is its own statement, say why: ` + queryMark + ` <reason> on the line above`,
+					})
+				}
 			}
 		}
 		return true
@@ -1266,6 +1290,33 @@ func isHTTPRequest(call *ast.CallExpr) bool {
 	// with that name and one argument.
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "Do" && len(call.Args) == 1
+}
+
+// queryMark is written above, or at the end of, a query that has to run once
+// per item — a hard delete DeleteWhere will not do in bulk, a patch whose value
+// differs per row, a write whose Validate derives a field.
+//
+// A reason is required, and a mark without one is reported rather than obeyed:
+// the rule is a warning precisely so it can be argued with, and the argument is
+// what the mark is for. Without the reason it is a way to switch the rule off.
+const queryMark = "//howl:query-in-loop"
+
+// queryMarks is every queryMark in a file, by the line it stands on, with the
+// reason written after it — "" for a mark that gives none. Read from the parsed
+// comments rather than the text, so a string that happens to spell the mark is
+// not one.
+func queryMarks(fset *token.FileSet, file *ast.File) map[int]string {
+	marks := map[int]string{}
+	for _, group := range file.Comments {
+		for _, c := range group.List {
+			rest, ok := strings.CutPrefix(c.Text, queryMark)
+			if !ok || (rest != "" && rest[0] != ' ' && rest[0] != '\t') {
+				continue
+			}
+			marks[fset.Position(c.Pos()).Line] = strings.TrimSpace(rest)
+		}
+	}
+	return marks
 }
 
 // isDocumentRead spots a db.Service call by its shape: a method with a name
